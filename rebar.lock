@@ -1,0 +1,8 @@
+[{<<"erlang_h2">>,
+  {git,"https://github.com/benoitc/erlang_h2.git",
+       {ref,"65f3a750b94f3339c42210000d647af77c74086b"}},
+  0},
+ {<<"quic">>,
+  {git,"https://github.com/benoitc/erlang_quic.git",
+       {ref,"fb16f3be79901c015f08c05091beec835b92c5be"}},
+  0}].
