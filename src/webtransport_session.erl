@@ -351,13 +351,17 @@ do_open_stream(bidi, #data{streams = Streams, next_bidi_id = NextId,
     CurrentCount = count_streams(bidi, Streams),
     case CurrentCount < MaxStreams of
         true ->
-            Stream = webtransport_stream:new(NextId, bidi, ?DEFAULT_MAX_STREAM_DATA),
-            ok = transport_open_stream(NextId, bidi, StateData),
-            Streams1 = Streams#{NextId => Stream},
-            {ok, NextId, StateData#data{
-                streams = Streams1,
-                next_bidi_id = NextId + 4
-            }};
+            case transport_open_stream(NextId, bidi, StateData) of
+                {ok, StreamId} ->
+                    Stream = webtransport_stream:new(StreamId, bidi, ?DEFAULT_MAX_STREAM_DATA),
+                    Streams1 = Streams#{StreamId => Stream},
+                    {ok, StreamId, StateData#data{
+                        streams = Streams1,
+                        next_bidi_id = NextId + 4
+                    }};
+                {error, _} = Err ->
+                    Err
+            end;
         false ->
             {error, stream_limit_reached}
     end;
@@ -367,13 +371,17 @@ do_open_stream(uni, #data{streams = Streams, next_uni_id = NextId,
     CurrentCount = count_streams(uni, Streams),
     case CurrentCount < MaxStreams of
         true ->
-            Stream = webtransport_stream:new(NextId, uni, ?DEFAULT_MAX_STREAM_DATA),
-            ok = transport_open_stream(NextId, uni, StateData),
-            Streams1 = Streams#{NextId => Stream},
-            {ok, NextId, StateData#data{
-                streams = Streams1,
-                next_uni_id = NextId + 4
-            }};
+            case transport_open_stream(NextId, uni, StateData) of
+                {ok, StreamId} ->
+                    Stream = webtransport_stream:new(StreamId, uni, ?DEFAULT_MAX_STREAM_DATA),
+                    Streams1 = Streams#{StreamId => Stream},
+                    {ok, StreamId, StateData#data{
+                        streams = Streams1,
+                        next_uni_id = NextId + 4
+                    }};
+                {error, _} = Err ->
+                    Err
+            end;
         false ->
             {error, stream_limit_reached}
     end.
@@ -535,13 +543,20 @@ transport_send_datagram(Data, #data{transport = h3, transport_state = H3State}) 
     webtransport_h3:send_datagram(H3State, Data).
 
 transport_open_stream(StreamId, Type, #data{transport = h2, transport_state = H2State}) ->
-    webtransport_h2:open_stream(H2State, StreamId, Type);
+    case webtransport_h2:open_stream(H2State, StreamId, Type) of
+        ok -> {ok, StreamId};
+        {error, _} = Err -> Err
+    end;
 transport_open_stream(_StreamId, bidi, #data{transport = h3, transport_state = H3State}) ->
-    {ok, _, _} = webtransport_h3:open_bidi_stream(H3State),
-    ok;
+    case webtransport_h3:open_bidi_stream(H3State) of
+        {ok, RealId, _} -> {ok, RealId};
+        {error, _} = Err -> Err
+    end;
 transport_open_stream(_StreamId, uni, #data{transport = h3, transport_state = H3State}) ->
-    {ok, _, _} = webtransport_h3:open_uni_stream(H3State),
-    ok.
+    case webtransport_h3:open_uni_stream(H3State) of
+        {ok, RealId, _} -> {ok, RealId};
+        {error, _} = Err -> Err
+    end.
 
 transport_reset_stream(StreamId, ErrorCode, #data{transport = h2, transport_state = H2State}) ->
     webtransport_h2:reset_stream(H2State, StreamId, ErrorCode);

@@ -4,5 +4,5 @@
   0},
  {<<"quic">>,
   {git,"https://github.com/benoitc/erlang_quic.git",
-       {ref,"fb16f3be79901c015f08c05091beec835b92c5be"}},
+       {ref,"c8583235bf96676467db441605b2b76cd235524a"}},
   0}].

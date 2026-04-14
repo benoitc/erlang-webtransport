@@ -1,11 +1,11 @@
 %% @doc Minimal runtime wrapper for an HTTP/3 WebTransport session.
 %%
-%% The HTTP/3 CONNECT stream is managed through quic_h3, while native
-%% WebTransport streams and datagrams use the underlying QUIC connection.
+%% The HTTP/3 CONNECT stream is managed through quic_h3. Native WebTransport
+%% streams and datagrams use the underlying QUIC connection.
 %%
 -module(webtransport_h3).
 
--export([new/3, with_peer_settings/2]).
+-export([new/2, with_peer_settings/2]).
 -export([session_id/1, h3_conn/1, quic_conn/1, peer_settings/1]).
 -export([open_bidi_stream/1, open_uni_stream/1]).
 -export([send/4, send_datagram/2]).
@@ -28,8 +28,9 @@
 %% Lifecycle
 %% ============================================================================
 
--spec new(pid(), pid(), non_neg_integer()) -> state().
-new(H3Conn, QuicConn, SessionId) ->
+-spec new(pid(), non_neg_integer()) -> state().
+new(H3Conn, SessionId) ->
+    QuicConn = quic_h3:get_quic_conn(H3Conn),
     PeerSettings =
         case quic_h3:get_peer_settings(H3Conn) of
             undefined -> #{};
@@ -66,35 +67,53 @@ peer_settings(#state{peer_settings = PeerSettings}) ->
 %% Native WebTransport Streams
 %% ============================================================================
 
+%% Native WebTransport streams use the underlying QUIC connection directly.
+%% Each stream starts with a header identifying the WebTransport session:
+%% - Bidirectional streams: Session ID (varint)
+%% - Unidirectional streams: Stream Type 0x54 (varint) + Session ID (varint)
+
 -spec open_bidi_stream(state()) -> {ok, non_neg_integer(), state()} | {error, term()}.
 open_bidi_stream(#state{quic_conn = QuicConn, session_id = SessionId} = State) ->
     case quic:open_stream(QuicConn) of
         {ok, StreamId} ->
+            %% Send WebTransport bidi stream header (session ID)
             Header = wt_h3_capsule:encode_bidi_stream_header(SessionId),
             case quic:send_data(QuicConn, StreamId, Header, false) of
-                ok -> {ok, StreamId, State};
-                {error, _} = Err -> Err
+                ok ->
+                    {ok, StreamId, State};
+                {error, _} = Error ->
+                    Error
             end;
-        {error, _} = Err ->
-            Err
+        {error, _} = Error ->
+            Error
     end.
 
 -spec open_uni_stream(state()) -> {ok, non_neg_integer(), state()} | {error, term()}.
 open_uni_stream(#state{quic_conn = QuicConn, session_id = SessionId} = State) ->
     case quic:open_unidirectional_stream(QuicConn) of
         {ok, StreamId} ->
+            %% Send WebTransport uni stream header (type 0x54 + session ID)
             Header = wt_h3_capsule:encode_uni_stream_header(SessionId),
             case quic:send_data(QuicConn, StreamId, Header, false) of
-                ok -> {ok, StreamId, State};
-                {error, _} = Err -> Err
+                ok ->
+                    {ok, StreamId, State};
+                {error, _} = Error ->
+                    Error
             end;
-        {error, _} = Err ->
-            Err
+        {error, _} = Error ->
+            Error
     end.
 
 -spec send(state(), non_neg_integer(), iodata(), boolean()) -> ok | {error, term()}.
-send(#state{quic_conn = QuicConn}, StreamId, Data, Fin) ->
-    quic:send_data(QuicConn, StreamId, Data, Fin).
+send(#state{quic_conn = QuicConn, h3_conn = H3Conn, session_id = SessionId}, StreamId, Data, Fin) ->
+    case StreamId =:= SessionId of
+        true ->
+            %% CONNECT stream - use H3 connection
+            quic_h3:send_data(H3Conn, StreamId, iolist_to_binary(Data), Fin);
+        false ->
+            %% Native WebTransport stream - use QUIC connection directly
+            quic:send_data(QuicConn, StreamId, iolist_to_binary(Data), Fin)
+    end.
 
 %% ============================================================================
 %% HTTP Datagrams
@@ -102,7 +121,9 @@ send(#state{quic_conn = QuicConn}, StreamId, Data, Fin) ->
 
 -spec send_datagram(state(), binary()) -> ok | {error, term()}.
 send_datagram(#state{quic_conn = QuicConn, session_id = SessionId}, Data) ->
-    quic:send_datagram(QuicConn, wt_h3_capsule:encode_datagram(SessionId, Data)).
+    %% Encode datagram with quarter stream ID prefix
+    Datagram = wt_h3_capsule:encode_datagram(SessionId, Data),
+    quic:send_datagram(QuicConn, Datagram).
 
 -spec decode_datagram(binary()) ->
     {ok, non_neg_integer(), binary()} | {more, pos_integer()} | {error, term()}.
@@ -115,11 +136,15 @@ decode_datagram(Bin) ->
 
 -spec close_session(state(), non_neg_integer(), binary()) -> ok | {error, term()}.
 close_session(#state{h3_conn = H3Conn, session_id = SessionId}, ErrorCode, Reason) ->
-    wt_h3:close_session(H3Conn, SessionId, ErrorCode, Reason).
+    %% Send CLOSE_WEBTRANSPORT_SESSION capsule
+    Capsule = wt_h3_capsule:encode(wt_h3_capsule:close_session(ErrorCode, Reason)),
+    quic_h3:send_data(H3Conn, SessionId, Capsule, true).
 
 -spec drain_session(state()) -> ok | {error, term()}.
 drain_session(#state{h3_conn = H3Conn, session_id = SessionId}) ->
-    wt_h3:drain_session(H3Conn, SessionId).
+    %% Send DRAIN_WEBTRANSPORT_SESSION capsule
+    Capsule = wt_h3_capsule:encode(wt_h3_capsule:drain_session()),
+    quic_h3:send_data(H3Conn, SessionId, Capsule, false).
 
 %% ============================================================================
 %% Stream Control
@@ -127,12 +152,26 @@ drain_session(#state{h3_conn = H3Conn, session_id = SessionId}) ->
 
 -spec reset_stream(state(), non_neg_integer(), non_neg_integer(), non_neg_integer()) ->
     ok | {error, term()}.
-reset_stream(#state{quic_conn = QuicConn}, StreamId, ErrorCode, ReliableSize) ->
-    quic:reset_stream_at(QuicConn, StreamId, ErrorCode, ReliableSize).
+reset_stream(#state{quic_conn = QuicConn, h3_conn = H3Conn, session_id = SessionId}, StreamId, ErrorCode, _ReliableSize) ->
+    case StreamId =:= SessionId of
+        true ->
+            %% CONNECT stream - use H3 connection
+            quic_h3:cancel(H3Conn, StreamId, ErrorCode);
+        false ->
+            %% Native WebTransport stream - use QUIC connection directly
+            quic:reset_stream(QuicConn, StreamId, ErrorCode)
+    end.
 
 -spec stop_sending(state(), non_neg_integer(), non_neg_integer()) -> ok | {error, term()}.
-stop_sending(#state{quic_conn = QuicConn}, StreamId, ErrorCode) ->
-    quic:stop_sending(QuicConn, StreamId, ErrorCode).
+stop_sending(#state{quic_conn = QuicConn, h3_conn = H3Conn, session_id = SessionId}, StreamId, ErrorCode) ->
+    case StreamId =:= SessionId of
+        true ->
+            %% CONNECT stream - use H3 connection
+            quic_h3:cancel(H3Conn, StreamId, ErrorCode);
+        false ->
+            %% Native WebTransport stream - use QUIC connection directly
+            quic:stop_sending(QuicConn, StreamId, ErrorCode)
+    end.
 
 %% ============================================================================
 %% Incoming Data Helpers

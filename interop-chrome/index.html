@@ -1,0 +1,273 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WebTransport Interop Tests</title>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            max-width: 800px;
+            margin: 50px auto;
+            padding: 20px;
+        }
+        h1 {
+            color: #333;
+        }
+        .test-section {
+            margin: 20px 0;
+            padding: 15px;
+            background: #f5f5f5;
+            border-radius: 8px;
+        }
+        .test-result {
+            padding: 10px;
+            margin: 5px 0;
+            border-radius: 4px;
+        }
+        .pass {
+            background: #d4edda;
+            color: #155724;
+        }
+        .fail {
+            background: #f8d7da;
+            color: #721c24;
+        }
+        .running {
+            background: #fff3cd;
+            color: #856404;
+        }
+        button {
+            padding: 10px 20px;
+            font-size: 16px;
+            cursor: pointer;
+            background: #007bff;
+            color: white;
+            border: none;
+            border-radius: 4px;
+            margin: 5px;
+        }
+        button:hover {
+            background: #0056b3;
+        }
+        button:disabled {
+            background: #ccc;
+            cursor: not-allowed;
+        }
+        #log {
+            background: #1e1e1e;
+            color: #d4d4d4;
+            padding: 15px;
+            border-radius: 4px;
+            font-family: monospace;
+            font-size: 12px;
+            height: 200px;
+            overflow-y: auto;
+            white-space: pre-wrap;
+        }
+        input {
+            padding: 8px;
+            font-size: 14px;
+            border: 1px solid #ccc;
+            border-radius: 4px;
+            width: 200px;
+        }
+    </style>
+</head>
+<body>
+    <h1>WebTransport Interop Tests</h1>
+
+    <div class="test-section">
+        <h3>Server Configuration</h3>
+        <label>
+            Server URL:
+            <input type="text" id="serverUrl" value="https://localhost:4433/test">
+        </label>
+    </div>
+
+    <div class="test-section">
+        <h3>Run Tests</h3>
+        <button onclick="runAllTests()">Run All Tests</button>
+        <button onclick="runTest('handshake')">Handshake</button>
+        <button onclick="runTest('bidiStream')">Bidi Stream</button>
+        <button onclick="runTest('uniStream')">Uni Stream</button>
+        <button onclick="runTest('datagram')">Datagram</button>
+    </div>
+
+    <div class="test-section">
+        <h3>Test Results</h3>
+        <div id="results"></div>
+    </div>
+
+    <div class="test-section">
+        <h3>Log</h3>
+        <div id="log"></div>
+    </div>
+
+    <script>
+        const log = (msg) => {
+            const logEl = document.getElementById('log');
+            const timestamp = new Date().toISOString().substr(11, 12);
+            logEl.textContent += `[${timestamp}] ${msg}\n`;
+            logEl.scrollTop = logEl.scrollHeight;
+        };
+
+        const setResult = (testName, status, message) => {
+            const resultsEl = document.getElementById('results');
+            let el = document.getElementById(`result-${testName}`);
+            if (!el) {
+                el = document.createElement('div');
+                el.id = `result-${testName}`;
+                el.className = 'test-result';
+                resultsEl.appendChild(el);
+            }
+            el.className = `test-result ${status}`;
+            el.textContent = `${testName}: ${message}`;
+        };
+
+        const getServerUrl = () => document.getElementById('serverUrl').value;
+
+        async function runTest(testName) {
+            setResult(testName, 'running', 'Running...');
+            log(`Starting test: ${testName}`);
+
+            try {
+                const result = await tests[testName]();
+                setResult(testName, 'pass', result);
+                log(`Test ${testName} PASSED: ${result}`);
+            } catch (error) {
+                setResult(testName, 'fail', error.message);
+                log(`Test ${testName} FAILED: ${error.message}`);
+            }
+        }
+
+        async function runAllTests() {
+            for (const testName of Object.keys(tests)) {
+                await runTest(testName);
+                await new Promise(r => setTimeout(r, 500));
+            }
+        }
+
+        const tests = {
+            handshake: async () => {
+                const url = getServerUrl();
+                log(`Connecting to ${url}...`);
+
+                const transport = new WebTransport(url);
+                await transport.ready;
+
+                log('Connection established');
+                log(`Datagrams: ${transport.datagrams ? 'supported' : 'not supported'}`);
+
+                transport.close();
+                log('Connection closed');
+
+                return 'Connected and closed successfully';
+            },
+
+            bidiStream: async () => {
+                const url = getServerUrl();
+                const transport = new WebTransport(url);
+                await transport.ready;
+
+                log('Opening bidirectional stream...');
+                const stream = await transport.createBidirectionalStream();
+
+                const writer = stream.writable.getWriter();
+                const testData = new TextEncoder().encode('Hello, WebTransport!');
+
+                log('Sending data...');
+                await writer.write(testData);
+                await writer.close();
+
+                log('Reading response...');
+                const reader = stream.readable.getReader();
+                const { value, done } = await reader.read();
+
+                if (done) {
+                    throw new Error('Stream closed before receiving data');
+                }
+
+                const received = new TextDecoder().decode(value);
+                log(`Received: ${received}`);
+
+                transport.close();
+
+                if (received.includes('Hello')) {
+                    return `Echo received: ${received.length} bytes`;
+                } else {
+                    throw new Error(`Unexpected response: ${received}`);
+                }
+            },
+
+            uniStream: async () => {
+                const url = getServerUrl();
+                const transport = new WebTransport(url);
+                await transport.ready;
+
+                log('Opening unidirectional stream...');
+                const stream = await transport.createUnidirectionalStream();
+
+                const writer = stream.getWriter();
+                const testData = new TextEncoder().encode('Hello from uni stream!');
+
+                log('Sending data...');
+                await writer.write(testData);
+                await writer.close();
+
+                log('Data sent on uni stream');
+
+                // Wait a bit for server processing
+                await new Promise(r => setTimeout(r, 200));
+
+                transport.close();
+                return 'Unidirectional stream sent successfully';
+            },
+
+            datagram: async () => {
+                const url = getServerUrl();
+                const transport = new WebTransport(url);
+                await transport.ready;
+
+                if (!transport.datagrams) {
+                    throw new Error('Datagrams not supported');
+                }
+
+                const writer = transport.datagrams.writable.getWriter();
+                const testData = new TextEncoder().encode('ping');
+
+                log('Sending datagram...');
+                await writer.write(testData);
+                writer.releaseLock();
+
+                log('Waiting for echo...');
+                const reader = transport.datagrams.readable.getReader();
+
+                const timeout = new Promise((_, reject) =>
+                    setTimeout(() => reject(new Error('Timeout')), 2000)
+                );
+
+                const read = reader.read().then(({ value }) => {
+                    reader.releaseLock();
+                    return value;
+                });
+
+                try {
+                    const value = await Promise.race([read, timeout]);
+                    const received = new TextDecoder().decode(value);
+                    log(`Received datagram: ${received}`);
+                    transport.close();
+                    return `Datagram echo received: ${received}`;
+                } catch (e) {
+                    transport.close();
+                    throw new Error(`Datagram test failed: ${e.message}`);
+                }
+            }
+        };
+
+        // Log initial state
+        log('WebTransport Interop Test Page loaded');
+        log(`WebTransport API available: ${typeof WebTransport !== 'undefined'}`);
+    </script>
+</body>
+</html>

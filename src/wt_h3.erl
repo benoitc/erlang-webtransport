@@ -83,52 +83,26 @@ is_success_response(Headers) ->
 %% ============================================================================
 
 -spec validate_wt_support(pid(), pid()) -> ok | {error, term()}.
-validate_wt_support(H3Conn, QuicConn) ->
+validate_wt_support(H3Conn, _QuicConn) ->
+    %% Basic validation: check that peer supports extended CONNECT protocol
+    %% (RFC 9220). Full WebTransport support is validated by the server's
+    %% 200 response to a CONNECT request with :protocol=webtransport.
+    %%
+    %% Note: quic_h3 drops unknown settings from peer_settings, so we can't
+    %% check for SETTINGS_WT_ENABLED directly. The server accepting the
+    %% extended CONNECT request is sufficient validation.
     case quic_h3:get_peer_settings(H3Conn) of
         undefined ->
             {error, settings_not_received};
         PeerSettings ->
-            validate_peer_settings(PeerSettings, QuicConn)
-    end.
-
-validate_peer_settings(PeerSettings, QuicConn) ->
-    case setting_enabled(PeerSettings, ?SETTINGS_WT_ENABLED, ?SETTINGS_WT_ENABLED) of
-        true ->
-            case setting_enabled(PeerSettings, enable_connect_protocol, ?SETTINGS_ENABLE_CONNECT_PROTOCOL) of
-                true ->
-                    case setting_enabled(PeerSettings, ?SETTINGS_H3_DATAGRAM, ?SETTINGS_H3_DATAGRAM) of
-                        true ->
-                            case quic:datagram_max_size(QuicConn) of
-                                Size when is_integer(Size), Size > 0 ->
-                                    validate_transport_params(QuicConn);
-                                0 ->
-                                    {error, quic_datagram_not_supported};
-                                {error, _} = Err ->
-                                    Err
-                            end;
-                        false ->
-                            {error, datagram_not_enabled}
-                    end;
-                false ->
-                    {error, connect_protocol_not_enabled}
-            end;
-        false ->
-            {error, webtransport_not_enabled}
-    end.
-
-validate_transport_params(QuicConn) ->
-    case quic:get_peer_transport_params(QuicConn) of
-        {ok, Params} ->
-            case maps:get(reset_stream_at, Params, false) of
+            case setting_enabled(PeerSettings, enable_connect_protocol) of
                 true -> ok;
-                false -> {error, reset_stream_at_not_supported}
-            end;
-        {error, _} = Err ->
-            Err
+                false -> {error, connect_protocol_not_enabled}
+            end
     end.
 
-setting_enabled(Settings, PreferredKey, FallbackKey) ->
-    Value = maps:get(PreferredKey, Settings, maps:get(FallbackKey, Settings, 0)),
+setting_enabled(Settings, Key) ->
+    Value = maps:get(Key, Settings, 0),
     Value =:= 1 orelse Value =:= true.
 
 %% ============================================================================

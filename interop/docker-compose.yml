@@ -1,0 +1,91 @@
+services:
+  server:
+    build:
+      context: ..
+      dockerfile: interop/Dockerfile
+    environment:
+      - ROLE=server
+      - PORT=443
+    ports:
+      - "443:443/udp"
+    networks:
+      - interop
+
+  client-handshake:
+    build:
+      context: ..
+      dockerfile: interop/Dockerfile
+    environment:
+      - ROLE=client
+      - TESTCASE=handshake
+      - SERVER_HOST=server
+      - PORT=443
+    depends_on:
+      - server
+    networks:
+      - interop
+    entrypoint: ["/bin/sh", "-c", "sleep 3 && /app/run_endpoint.sh"]
+
+  client-transfer:
+    build:
+      context: ..
+      dockerfile: interop/Dockerfile
+    environment:
+      - ROLE=client
+      - TESTCASE=transfer
+      - SERVER_HOST=server
+      - PORT=443
+    depends_on:
+      - server
+    networks:
+      - interop
+    entrypoint: ["/bin/sh", "-c", "sleep 3 && /app/run_endpoint.sh"]
+
+  client-bidi:
+    build:
+      context: ..
+      dockerfile: interop/Dockerfile
+    environment:
+      - ROLE=client
+      - TESTCASE=transfer-bidirectional
+      - SERVER_HOST=server
+      - PORT=443
+    depends_on:
+      - server
+    networks:
+      - interop
+    entrypoint: ["/bin/sh", "-c", "sleep 3 && /app/run_endpoint.sh"]
+
+  client-uni:
+    build:
+      context: ..
+      dockerfile: interop/Dockerfile
+    environment:
+      - ROLE=client
+      - TESTCASE=transfer-unidirectional
+      - SERVER_HOST=server
+      - PORT=443
+    depends_on:
+      - server
+    networks:
+      - interop
+    entrypoint: ["/bin/sh", "-c", "sleep 3 && /app/run_endpoint.sh"]
+
+  client-datagram:
+    build:
+      context: ..
+      dockerfile: interop/Dockerfile
+    environment:
+      - ROLE=client
+      - TESTCASE=transfer-datagram
+      - SERVER_HOST=server
+      - PORT=443
+    depends_on:
+      - server
+    networks:
+      - interop
+    entrypoint: ["/bin/sh", "-c", "sleep 3 && /app/run_endpoint.sh"]
+
+networks:
+  interop:
+    driver: bridge
