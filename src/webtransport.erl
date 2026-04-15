@@ -334,15 +334,27 @@ start_h3_listener(Name, Opts) ->
     %% Read and decode certificate and key
     case read_cert_and_key(CertFile, KeyFile) of
         {ok, CertDer, PrivateKey} ->
-            %% Create wrapper handler for H3
-            H3Handler = make_h3_handler(Handler, HandlerOpts, Opts),
+            Claim = wt_stream_type_handler(),
+
+            ConnectionHandler = fun(_QuicConnPid) ->
+                {ok, Router} = webtransport_h3_router:start(undefined),
+                #{
+                    owner => Router,
+                    handler => make_h3_handler(Handler, HandlerOpts, Opts, Router),
+                    stream_type_handler => Claim,
+                    h3_datagram_enabled => true
+                }
+            end,
 
             ServerOpts = #{
                 cert => CertDer,
                 key => PrivateKey,
-                handler => H3Handler,
+                handler => make_h3_handler(Handler, HandlerOpts, Opts, undefined),
                 settings => wt_h3:default_settings(),
-                quic_opts => #{max_datagram_frame_size => 65535}
+                quic_opts => #{max_datagram_frame_size => 65535},
+                stream_type_handler => Claim,
+                h3_datagram_enabled => true,
+                connection_handler => ConnectionHandler
             },
 
             case quic_h3:start_server(Name, Port, ServerOpts) of
@@ -420,7 +432,8 @@ handle_h2_request(Conn, StreamId, _Method, _Path, _Headers, _Handler, _HandlerOp
     h2:send_response(Conn, StreamId, 405, []),
     h2:send_data(Conn, StreamId, <<"Method Not Allowed">>, true).
 
-handle_h3_request(H3Conn, StreamId, <<"CONNECT">>, Path, Headers, Handler, HandlerOpts, Opts) ->
+handle_h3_request(H3Conn, StreamId, <<"CONNECT">>, Path, Headers,
+                  Handler, HandlerOpts, Opts, Router) ->
     case is_webtransport_h3_request(Headers) of
         true ->
             %% Accept the WebTransport session
@@ -453,6 +466,10 @@ handle_h3_request(H3Conn, StreamId, <<"CONNECT">>, Path, Headers, Handler, Handl
                 {ok, Session} ->
                     %% Register to receive stream data for this session
                     quic_h3:set_stream_handler(H3Conn, StreamId, Session),
+                    case Router of
+                        undefined -> ok;
+                        _ -> webtransport_h3_router:register_session(Router, StreamId, Session)
+                    end,
                     ok;
                 {error, Reason} ->
                     quic_h3:send_response(H3Conn, StreamId, 500, []),
@@ -463,7 +480,8 @@ handle_h3_request(H3Conn, StreamId, <<"CONNECT">>, Path, Headers, Handler, Handl
             quic_h3:send_data(H3Conn, StreamId, <<"Bad Request">>, true)
     end;
 
-handle_h3_request(H3Conn, StreamId, _Method, _Path, _Headers, _Handler, _HandlerOpts, _Opts) ->
+handle_h3_request(H3Conn, StreamId, _Method, _Path, _Headers,
+                  _Handler, _HandlerOpts, _Opts, _Router) ->
     quic_h3:send_response(H3Conn, StreamId, 405, []),
     quic_h3:send_data(H3Conn, StreamId, <<"Method Not Allowed">>, true).
 
@@ -544,10 +562,11 @@ connect_h2(Host, Port, Path, Opts, Handler) ->
 
 connect_h3(Host, Port, Path, Opts, Handler) ->
     HostBin = if is_list(Host) -> list_to_binary(Host); true -> Host end,
+    {ok, Router} = webtransport_h3_router:start_link(self()),
     H3ConnOpts = build_h3_connect_opts(Opts),
-    case quic_h3:connect(Host, Port, H3ConnOpts) of
+    case webtransport_h3_router:client_connect(Router, Host, Port, H3ConnOpts) of
         {ok, H3Conn} ->
-            h3_validate_and_request(H3Conn, HostBin, Port, Path, Opts, Handler);
+            h3_validate_and_request(H3Conn, HostBin, Port, Path, Opts, Handler, Router);
         {error, Reason} ->
             {error, Reason}
     end.
@@ -560,7 +579,12 @@ build_h3_connect_opts(Opts) ->
         sync => true,
         connect_timeout => maps:get(timeout, Opts, 30000),
         verify => maps:get(verify, Opts, verify_peer),
-        quic_opts => #{max_datagram_frame_size => 65535}
+        quic_opts => #{max_datagram_frame_size => 65535},
+        stream_type_handler => fun
+            (uni,  _, 16#54) -> claim;
+            (bidi, _, 16#41) -> claim;
+            (_, _, _) -> ignore
+        end
     },
     %% Handle client certificate if provided
     WithCert = case {maps:find(certfile, Opts), maps:find(cert, Opts)} of
@@ -599,31 +623,31 @@ build_h3_connect_opts(Opts) ->
             WithKey
     end.
 
-h3_validate_and_request(H3Conn, HostBin, Port, Path, Opts, Handler) ->
+h3_validate_and_request(H3Conn, HostBin, Port, Path, Opts, Handler, Router) ->
     QuicConn = quic_h3:get_quic_conn(H3Conn),
     case wt_h3:validate_wt_support(H3Conn, QuicConn) of
         ok ->
             Authority = <<HostBin/binary, ":", (integer_to_binary(Port))/binary>>,
-            h3_send_connect(H3Conn, Authority, Path, Opts, Handler);
+            h3_send_connect(H3Conn, Authority, Path, Opts, Handler, Router);
         {error, Reason} ->
             quic_h3:close(H3Conn),
             {error, Reason}
     end.
 
-h3_send_connect(H3Conn, Authority, Path, Opts, Handler) ->
+h3_send_connect(H3Conn, Authority, Path, Opts, Handler, Router) ->
     case wt_h3:request_session(H3Conn, Authority, Path, maps:get(headers, Opts, [])) of
         {ok, SessionId} ->
-            h3_await_response(H3Conn, SessionId, Authority, Path, Opts, Handler);
+            h3_await_response(H3Conn, SessionId, Authority, Path, Opts, Handler, Router);
         {error, Reason} ->
             quic_h3:close(H3Conn),
             {error, Reason}
     end.
 
-h3_await_response(H3Conn, SessionId, Authority, Path, Opts, Handler) ->
+h3_await_response(H3Conn, SessionId, Authority, Path, Opts, Handler, Router) ->
     Timeout = maps:get(timeout, Opts, 30000),
     receive
         {quic_h3, H3Conn, {response, SessionId, Status, Headers}} when Status >= 200, Status < 300 ->
-            h3_start_session(H3Conn, SessionId, Authority, Path, Headers, Handler);
+            h3_start_session(H3Conn, SessionId, Authority, Path, Headers, Handler, Router);
         {quic_h3, H3Conn, {response, SessionId, Status, _Headers}} ->
             quic_h3:close(H3Conn),
             {error, {http_error, Status}};
@@ -634,7 +658,7 @@ h3_await_response(H3Conn, SessionId, Authority, Path, Opts, Handler) ->
         {error, timeout}
     end.
 
-h3_start_session(H3Conn, SessionId, Authority, Path, Headers, Handler) ->
+h3_start_session(H3Conn, SessionId, Authority, Path, Headers, Handler, Router) ->
     TransportState = webtransport_h3:new(H3Conn, SessionId),
     ActualHandler = case Handler of
         undefined -> webtransport_client_handler;
@@ -649,7 +673,13 @@ h3_start_session(H3Conn, SessionId, Authority, Path, Headers, Handler) ->
         request => Request,
         is_server => false
     },
-    webtransport_session:start_link(h3, TransportState, ActualHandler, SessionOpts).
+    case webtransport_session:start_link(h3, TransportState, ActualHandler, SessionOpts) of
+        {ok, Session} ->
+            webtransport_h3_router:register_session(Router, SessionId, Session),
+            {ok, Session};
+        {error, _} = Err ->
+            Err
+    end.
 
 %% ============================================================================
 %% Handler Factories
@@ -660,9 +690,17 @@ make_h2_handler(Handler, HandlerOpts, Opts) ->
         handle_h2_request(Conn, StreamId, Method, Path, Headers, Handler, HandlerOpts, Opts)
     end.
 
-make_h3_handler(Handler, HandlerOpts, Opts) ->
+make_h3_handler(Handler, HandlerOpts, Opts, Router) ->
     fun(H3Conn, StreamId, Method, Path, Headers) ->
-        handle_h3_request(H3Conn, StreamId, Method, Path, Headers, Handler, HandlerOpts, Opts)
+        handle_h3_request(H3Conn, StreamId, Method, Path, Headers,
+                          Handler, HandlerOpts, Opts, Router)
+    end.
+
+wt_stream_type_handler() ->
+    fun
+        (uni,  _StreamId, 16#54) -> claim;
+        (bidi, _StreamId, 16#41) -> claim;
+        (_, _, _) -> ignore
     end.
 
 %% ============================================================================

@@ -24,10 +24,13 @@
 
 -spec default_settings() -> map().
 default_settings() ->
+    %% SETTINGS_H3_DATAGRAM (0x33) is emitted by quic_h3 when
+    %% `h3_datagram_enabled => true' is passed to connect/3 or
+    %% start_server/3; don't duplicate it here (duplicate setting ids are
+    %% an H3_SETTINGS_ERROR per RFC 9114 §7.2.4.1).
     #{
         enable_connect_protocol => 1,
         ?SETTINGS_WT_ENABLED => 1,
-        ?SETTINGS_H3_DATAGRAM => 1,
         ?SETTINGS_WT_INITIAL_MAX_DATA => ?DEFAULT_MAX_DATA,
         ?SETTINGS_WT_INITIAL_MAX_STREAMS_BIDI => ?DEFAULT_MAX_STREAMS_BIDI,
         ?SETTINGS_WT_INITIAL_MAX_STREAMS_UNI => ?DEFAULT_MAX_STREAMS_UNI
