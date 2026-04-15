@@ -45,6 +45,8 @@
 
     %% Round-trip assertion tests
     datagram_round_trip_test/1,
+    action_drain_test/1,
+    action_close_test/1,
     bidi_round_trip_test/1
 ]).
 
@@ -76,7 +78,9 @@ groups() ->
         drain_session_test,
         close_session_with_error_test,
         datagram_round_trip_test,
-        bidi_round_trip_test
+        bidi_round_trip_test,
+        action_drain_test,
+        action_close_test
     ],
     [
         {h3_tests, [sequence], Cases},
@@ -484,6 +488,55 @@ bidi_round_trip_test(Config) ->
     ?assertEqual(Payload, Echoed),
 
     webtransport:close_session(Session).
+
+%% A handler returning the action `drain_session' should drive the session
+%% into the `draining' state. We trigger it via `handle_info' on the
+%% client-side session so the transition is locally observable: subsequent
+%% attempts to open a stream on the session must fail with
+%% `session_draining'.
+action_drain_test(Config) ->
+    Port = proplists:get_value(port, Config),
+    {ok, Session} = webtransport:connect("localhost", Port, <<"/test">>, #{
+        transport => proplists:get_value(transport, Config),
+        verify => verify_none,
+        handler_opts => #{owner => self()}
+    }, wt_trigger_handler),
+
+    Session ! drain_now,
+    wait_for_draining(Session, 2000),
+    ?assertMatch({error, session_draining},
+                 webtransport:open_stream(Session, bidi)),
+
+    webtransport:close_session(Session).
+
+%% A handler returning the action `{close_session, Code, Reason}' should
+%% stop the gen_statem. Asserted by waiting for the session pid to exit.
+action_close_test(Config) ->
+    Port = proplists:get_value(port, Config),
+    {ok, Session} = webtransport:connect("localhost", Port, <<"/test">>, #{
+        transport => proplists:get_value(transport, Config),
+        verify => verify_none,
+        handler_opts => #{owner => self()}
+    }, wt_trigger_handler),
+
+    MRef = erlang:monitor(process, Session),
+    Session ! close_now,
+    receive
+        {'DOWN', MRef, process, Session, _Reason} -> ok
+    after 2000 ->
+        error({session_did_not_stop, Session})
+    end.
+
+wait_for_draining(_Session, Timeout) when Timeout =< 0 ->
+    ok;
+wait_for_draining(Session, Timeout) ->
+    case webtransport:open_stream(Session, bidi) of
+        {error, session_draining} ->
+            ok;
+        _ ->
+            timer:sleep(50),
+            wait_for_draining(Session, Timeout - 50)
+    end.
 
 collect_stream_echo(Session, StreamId, Acc, Timeout) ->
     receive

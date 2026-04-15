@@ -176,11 +176,18 @@ init({Transport, TransportState, Handler, Opts}) ->
         {ok, HandlerState} ->
             {ok, open, Data#data{handler_state = HandlerState}};
         {ok, HandlerState, Actions} ->
-            Data1 = handle_actions(Actions, Data#data{handler_state = HandlerState}),
-            {ok, open, Data1};
+            {Data1, Transition} = handle_actions(Actions, Data#data{handler_state = HandlerState}),
+            init_apply_transition(Transition, Data1);
         {error, Reason} ->
             {stop, Reason}
     end.
+
+init_apply_transition(continue, Data) ->
+    {ok, open, Data};
+init_apply_transition(drain, Data) ->
+    {ok, draining, Data};
+init_apply_transition({stop, Reason}, _Data) ->
+    {stop, Reason}.
 
 %% Open state - normal operation
 open({call, From}, {send, StreamId, Data, Fin}, #data{} = StateData) ->
@@ -240,20 +247,20 @@ open(cast, {capsule, Capsule}, StateData) ->
     {keep_state, StateData1};
 
 open(cast, {stream_data, StreamId, Data, Fin}, StateData) ->
-    StateData1 = handle_incoming_stream_data(StreamId, Data, Fin, StateData),
-    {keep_state, StateData1};
+    {StateData1, Transition} = handle_incoming_stream_data(StreamId, Data, Fin, StateData),
+    open_apply_transition(Transition, StateData1);
 
 open(cast, {datagram_data, Data}, StateData) ->
-    StateData1 = handle_incoming_datagram(Data, StateData),
-    {keep_state, StateData1};
+    {StateData1, Transition} = handle_incoming_datagram(Data, StateData),
+    open_apply_transition(Transition, StateData1);
 
 open(cast, {stream_opened, StreamId, Type}, StateData) ->
     StateData1 = handle_remote_stream_opened(StreamId, Type, StateData),
     {keep_state, StateData1};
 
 open(cast, {stream_closed, StreamId, Reason}, StateData) ->
-    StateData1 = handle_remote_stream_closed(StreamId, Reason, StateData),
-    {keep_state, StateData1};
+    {StateData1, Transition} = handle_remote_stream_closed(StreamId, Reason, StateData),
+    open_apply_transition(Transition, StateData1);
 
 open(cast, drain, StateData) ->
     do_drain(StateData),
@@ -270,14 +277,23 @@ open(info, Msg, #data{handler = Handler, handler_state = HState} = StateData) ->
                 {ok, HState1} ->
                     {keep_state, StateData#data{handler_state = HState1}};
                 {ok, HState1, Actions} ->
-                    StateData1 = handle_actions(Actions, StateData#data{handler_state = HState1}),
-                    {keep_state, StateData1};
-                {stop, _Reason, HState1} ->
-                    {stop, normal, StateData#data{handler_state = HState1}}
+                    {StateData1, Transition} = handle_actions(Actions, StateData#data{handler_state = HState1}),
+                    open_apply_transition(Transition, StateData1);
+                {stop, Reason, HState1} ->
+                    {stop, Reason, StateData#data{handler_state = HState1}}
             end;
         false ->
             {keep_state, StateData}
     end.
+
+%% Translate a `handle_actions' transition into a gen_statem return while
+%% in the `open' state.
+open_apply_transition(continue, StateData) ->
+    {keep_state, StateData};
+open_apply_transition(drain, StateData) ->
+    {next_state, draining, StateData};
+open_apply_transition({stop, Reason}, StateData) ->
+    {stop, Reason, StateData}.
 
 %% Connecting state (for client sessions)
 connecting({call, From}, _, StateData) ->
@@ -310,14 +326,22 @@ draining({call, From}, _, StateData) ->
     {keep_state, StateData, [{reply, From, {error, session_draining}}]};
 
 draining(cast, {stream_data, StreamId, Data, Fin}, StateData) ->
-    StateData1 = handle_incoming_stream_data(StreamId, Data, Fin, StateData),
-    maybe_stop_if_drained(StateData1, []);
+    {StateData1, Transition} = handle_incoming_stream_data(StreamId, Data, Fin, StateData),
+    draining_apply_transition(Transition, StateData1);
 
 draining(cast, {stream_closed, StreamId, Reason}, StateData) ->
-    StateData1 = handle_remote_stream_closed(StreamId, Reason, StateData),
-    maybe_stop_if_drained(StateData1, []);
+    {StateData1, Transition} = handle_remote_stream_closed(StreamId, Reason, StateData),
+    draining_apply_transition(Transition, StateData1);
 
 draining(cast, _, StateData) ->
+    maybe_stop_if_drained(StateData, []).
+
+%% In the draining state we never go backwards: drain stays drain,
+%% a `stop' transition takes immediate effect, and a `continue' just
+%% re-evaluates whether all streams are closed.
+draining_apply_transition({stop, Reason}, StateData) ->
+    {stop, Reason, StateData};
+draining_apply_transition(_Transition, StateData) ->
     maybe_stop_if_drained(StateData, []).
 
 terminate(Reason, _State, #data{handler = Handler, handler_state = HState}) ->
@@ -466,44 +490,39 @@ handle_incoming_stream_data(StreamId, Data, Fin,
                         false ->
                             Stream1
                     end,
-                    %% Callback to handler
                     Callback = case Fin andalso erlang:function_exported(Handler, handle_stream_fin, 4) of
                         true -> fun() -> Handler:handle_stream_fin(StreamId, Type, Data, HState) end;
                         false -> fun() -> Handler:handle_stream(StreamId, Type, Data, HState) end
                     end,
-                    case Callback() of
-                        {ok, HState1} ->
-                            StateData#data{
-                                streams = Streams#{StreamId => Stream2},
-                                handler_state = HState1
-                            };
-                        {ok, HState1, Actions} ->
-                            StateData1 = StateData#data{
-                                streams = Streams#{StreamId => Stream2},
-                                handler_state = HState1
-                            },
-                            handle_actions(Actions, StateData1);
-                        {stop, _Reason, HState1} ->
-                            StateData#data{
-                                streams = Streams#{StreamId => Stream2},
-                                handler_state = HState1
-                            }
-                    end;
+                    apply_stream_callback(Callback(), StreamId, Stream2, Streams, StateData);
                 {error, _Reason} ->
-                    StateData
+                    {StateData, continue}
             end;
         error ->
-            StateData
+            {StateData, continue}
     end.
+
+apply_stream_callback({ok, HState1}, StreamId, Stream2, Streams, StateData) ->
+    {StateData#data{streams = Streams#{StreamId => Stream2},
+                    handler_state = HState1},
+     continue};
+apply_stream_callback({ok, HState1, Actions}, StreamId, Stream2, Streams, StateData) ->
+    StateData1 = StateData#data{streams = Streams#{StreamId => Stream2},
+                                handler_state = HState1},
+    handle_actions(Actions, StateData1);
+apply_stream_callback({stop, Reason, HState1}, StreamId, Stream2, Streams, StateData) ->
+    {StateData#data{streams = Streams#{StreamId => Stream2},
+                    handler_state = HState1},
+     {stop, Reason}}.
 
 handle_incoming_datagram(Data, #data{handler = Handler, handler_state = HState} = StateData) ->
     case Handler:handle_datagram(Data, HState) of
         {ok, HState1} ->
-            StateData#data{handler_state = HState1};
+            {StateData#data{handler_state = HState1}, continue};
         {ok, HState1, Actions} ->
             handle_actions(Actions, StateData#data{handler_state = HState1});
-        {stop, _Reason, HState1} ->
-            StateData#data{handler_state = HState1}
+        {stop, Reason, HState1} ->
+            {StateData#data{handler_state = HState1}, {stop, Reason}}
     end.
 
 handle_remote_stream_opened(StreamId, Type, #data{streams = Streams} = StateData) ->
@@ -523,54 +542,68 @@ handle_remote_stream_closed(StreamId, Reason,
             Stream1 = webtransport_stream:close(Stream),
             case Handler:handle_stream_closed(StreamId, Reason, HState) of
                 {ok, HState1} ->
-                    StateData#data{
-                        streams = Streams#{StreamId => Stream1},
-                        handler_state = HState1
-                    };
-                {stop, _Reason, HState1} ->
-                    StateData#data{
-                        streams = Streams#{StreamId => Stream1},
-                        handler_state = HState1
-                    }
+                    {StateData#data{streams = Streams#{StreamId => Stream1},
+                                    handler_state = HState1},
+                     continue};
+                {stop, StopReason, HState1} ->
+                    {StateData#data{streams = Streams#{StreamId => Stream1},
+                                    handler_state = HState1},
+                     {stop, StopReason}}
             end;
         error ->
-            StateData
+            {StateData, continue}
     end.
 
 %% Execute handler-returned actions inline on the session's own state.
 %% Runs inside the gen_statem callback so we cannot round-trip through the
 %% public API — that would self-call and crash with `calling_self`.
-%% `drain_session` does NOT perform the {next_state, draining, ...} transition
-%% here; handlers that need to enter draining should do so via explicit
-%% {stop, Reason, _} or by driving webtransport:drain_session/1 off-process.
-handle_actions([], StateData) ->
-    StateData;
-handle_actions([Action | Rest], StateData) ->
-    handle_actions(Rest, dispatch_action(Action, StateData)).
+%%
+%% Returns `{NewStateData, Transition}' where Transition is:
+%%   `continue'          — stay in current state
+%%   `drain'             — caller must enter the `draining' state
+%%   `{stop, Reason}'    — caller must stop the gen_statem
+%% The strongest transition wins (stop > drain > continue) so an action list
+%% like `[drain_session, {close_session, 0, <<>>}]' produces `{stop, normal}'.
+-spec handle_actions([webtransport_handler:action()], #data{}) ->
+    {#data{}, continue | drain | {stop, term()}}.
+handle_actions(Actions, StateData) ->
+    handle_actions(Actions, StateData, continue).
+
+handle_actions([], StateData, Transition) ->
+    {StateData, Transition};
+handle_actions([Action | Rest], StateData, Transition) ->
+    {StateData1, NewTrans} = dispatch_action(Action, StateData),
+    handle_actions(Rest, StateData1, strongest_transition(Transition, NewTrans)).
+
+strongest_transition(continue, New) -> New;
+strongest_transition(Old, continue) -> Old;
+strongest_transition({stop, _} = Stop, _) -> Stop;
+strongest_transition(_, {stop, _} = Stop) -> Stop;
+strongest_transition(drain, drain) -> drain.
 
 dispatch_action({send, Stream, Data}, StateData) ->
-    apply_do_result(do_send(Stream, iolist_to_binary(Data), false, StateData), StateData, {send, Stream});
+    {apply_do_result(do_send(Stream, iolist_to_binary(Data), false, StateData), StateData, {send, Stream}), continue};
 dispatch_action({send, Stream, Data, fin}, StateData) ->
-    apply_do_result(do_send(Stream, iolist_to_binary(Data), true, StateData), StateData, {send, Stream, fin});
+    {apply_do_result(do_send(Stream, iolist_to_binary(Data), true, StateData), StateData, {send, Stream, fin}), continue};
 dispatch_action({send_datagram, Data}, StateData) ->
-    apply_do_result(do_send_datagram(iolist_to_binary(Data), StateData), StateData, send_datagram);
+    {apply_do_result(do_send_datagram(iolist_to_binary(Data), StateData), StateData, send_datagram), continue};
 dispatch_action({open_stream, Type}, StateData) ->
     case do_open_stream(Type, StateData) of
-        {ok, _StreamId, StateData1} -> StateData1;
-        {error, Reason} -> warn_action({open_stream, Type}, Reason), StateData
+        {ok, _StreamId, StateData1} -> {StateData1, continue};
+        {error, Reason} -> warn_action({open_stream, Type}, Reason), {StateData, continue}
     end;
 dispatch_action({close_stream, Stream}, StateData) ->
-    apply_do_result(do_close_stream(Stream, StateData), StateData, {close_stream, Stream});
+    {apply_do_result(do_close_stream(Stream, StateData), StateData, {close_stream, Stream}), continue};
 dispatch_action({reset_stream, Stream, Code}, StateData) ->
-    apply_do_result(do_reset_stream(Stream, Code, StateData), StateData, {reset_stream, Stream});
+    {apply_do_result(do_reset_stream(Stream, Code, StateData), StateData, {reset_stream, Stream}), continue};
 dispatch_action({stop_sending, Stream, Code}, StateData) ->
-    apply_do_result(do_stop_sending(Stream, Code, StateData), StateData, {stop_sending, Stream});
+    {apply_do_result(do_stop_sending(Stream, Code, StateData), StateData, {stop_sending, Stream}), continue};
 dispatch_action(drain_session, StateData) ->
     do_drain(StateData),
-    StateData;
+    {StateData, drain};
 dispatch_action({close_session, ErrorCode, Reason}, StateData) ->
     do_close(ErrorCode, Reason, StateData),
-    StateData#data{close_info = {ErrorCode, Reason}}.
+    {StateData#data{close_info = {ErrorCode, Reason}}, {stop, normal}}.
 
 apply_do_result({ok, StateData1}, _OldState, _Action) ->
     StateData1;
