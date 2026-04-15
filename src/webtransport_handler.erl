@@ -4,19 +4,24 @@
 %% The callbacks are invoked by the session process when events occur.
 %%
 %% == Example Handler ==
+%% Prefer `init/3' — it receives the `handler_opts' map from the connection
+%% / listener options, which is the only way to plumb things like an owner
+%% pid, a request-id, or application configuration into the handler. The
+%% 2-arity `init/2' is kept only as a back-compat shim and is called when
+%% the handler does not export `init/3'.
 %% ```
 %% -module(my_wt_handler).
 %% -behaviour(webtransport_handler).
 %%
-%% -export([init/2, handle_stream/4, handle_datagram/2,
+%% -export([init/3, handle_stream/4, handle_datagram/2,
 %%          handle_stream_closed/3, terminate/2]).
 %%
-%% init(_Session, _Req) ->
-%%     {ok, #{}}.
+%% init(Session, _Req, Opts) ->
+%%     Owner = maps:get(owner, Opts, undefined),
+%%     {ok, #{session => Session, owner => Owner}}.
 %%
 %% handle_stream(Stream, Type, Data, State) ->
-%%     webtransport:send(Stream, <<"echo: ", Data/binary>>),
-%%     {ok, State}.
+%%     {ok, State, [{send, Stream, <<"echo: ", Data/binary>>}]}.
 %%
 %% handle_datagram(Data, State) ->
 %%     {ok, State}.
@@ -92,8 +97,10 @@
     Reason :: normal | {error, term()} | term(),
     State :: term().
 
-%% Optional callbacks
--optional_callbacks([init/3, handle_stream_fin/4, handle_info/2]).
+%% Optional callbacks. `init/3' is preferred; `init/2' is a back-compat
+%% shim that only gets called when the handler module does not export
+%% `init/3'.
+-optional_callbacks([init/2, init/3, handle_stream_fin/4, handle_info/2]).
 
 %% Types
 -type action() ::

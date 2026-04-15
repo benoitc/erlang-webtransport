@@ -163,15 +163,25 @@ init({Transport, TransportState, Handler, Opts}) ->
         remote_max_streams_uni = maps:get(max_streams_uni, Opts, ?DEFAULT_MAX_STREAMS_UNI)
     },
 
-    %% Initialize handler. code:ensure_loaded/1 is required because
-    %% erlang:function_exported/3 returns false for modules that haven't been
-    %% loaded yet — which silently demotes init/3 callers to init/2 and
-    %% throws handler_opts away.
+    %% Initialize handler. `code:ensure_loaded/1' is required because
+    %% `erlang:function_exported/3' returns false for modules that haven't
+    %% been loaded yet — which would silently demote init/3 callers to
+    %% init/2 and throw handler_opts away.
+    %%
+    %% Preference order: `init/3' > `init/2'. Handlers that export neither
+    %% are a configuration error and we stop immediately with a clear
+    %% reason so the user sees it in the crash log.
     _ = code:ensure_loaded(Handler),
-    InitResult = case erlang:function_exported(Handler, init, 3) of
-        true -> Handler:init(self(), Request, HandlerOpts);
-        false -> Handler:init(self(), Request)
-    end,
+    InitResult =
+        case erlang:function_exported(Handler, init, 3) of
+            true ->
+                Handler:init(self(), Request, HandlerOpts);
+            false ->
+                case erlang:function_exported(Handler, init, 2) of
+                    true -> Handler:init(self(), Request);
+                    false -> {error, {no_init_callback, Handler}}
+                end
+        end,
     case InitResult of
         {ok, HandlerState} ->
             {ok, open, Data#data{handler_state = HandlerState}};

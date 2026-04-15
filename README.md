@@ -60,11 +60,13 @@ Implement the `webtransport_handler` behaviour to handle WebTransport sessions:
 -module(my_wt_handler).
 -behaviour(webtransport_handler).
 
--export([init/2, handle_stream/4, handle_datagram/2,
+-export([init/3, handle_stream/4, handle_datagram/2,
          handle_stream_closed/3, terminate/2]).
 
-init(Session, Req) ->
-    %% Session established
+init(Session, Req, Opts) ->
+    %% Session established. `Opts' is the `handler_opts' map supplied at
+    %% listener start or at `webtransport:connect/4,5' — use it to receive
+    %% an owner pid, configuration, etc.
     {ok, #{}}.
 
 handle_stream(Stream, Type, Data, State) ->
@@ -87,7 +89,8 @@ terminate(Reason, State) ->
 
 | Callback | Required | Description |
 |----------|----------|-------------|
-| `init/2` | Yes | Session initialization |
+| `init/3` | Yes (preferred) | Session initialization; receives `handler_opts` as the 3rd argument |
+| `init/2` | Back-compat | Shim called only when `init/3` is not exported; loses `handler_opts` |
 | `handle_stream/4` | Yes | Stream data received |
 | `handle_stream_fin/4` | No | Stream data with FIN flag |
 | `handle_datagram/2` | Yes | Datagram received |
@@ -148,7 +151,7 @@ webtransport:listener_info(Name) -> {ok, Info} | {error, not_found}
 | `certfile` | Yes | TLS certificate path |
 | `keyfile` | Yes | TLS private key path |
 | `handler` | Yes | Handler module |
-| `handler_opts` | No | Options passed to `init/2` |
+| `handler_opts` | No | Map passed to `init/3` as the 3rd argument |
 | `max_data` | No | Session data limit (default: 1MB) |
 | `max_streams_bidi` | No | Max bidi streams (default: 100) |
 | `max_streams_uni` | No | Max uni streams (default: 100) |

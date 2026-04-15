@@ -9,7 +9,7 @@
 -export([start/0]).
 
 %% Handler callbacks
--export([init/2, handle_stream/4, handle_stream_fin/4,
+-export([init/3, handle_stream/4, handle_stream_fin/4,
          handle_datagram/2, handle_stream_closed/3,
          terminate/2]).
 
@@ -75,7 +75,7 @@ get_arg(Key, Args, Default) ->
 %% Handler Callbacks
 %% ============================================================================
 
-init(Session, _Request) ->
+init(Session, _Request, _Opts) ->
     WwwDir = persistent_term:get(interop_www_dir, "/app/www"),
     {ok, #state{session = Session, www_dir = WwwDir}}.
 

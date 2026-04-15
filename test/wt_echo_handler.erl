@@ -6,7 +6,7 @@
 -module(wt_echo_handler).
 -behaviour(webtransport_handler).
 
--export([init/2, handle_stream/4, handle_stream_fin/4,
+-export([init/3, handle_stream/4, handle_stream_fin/4,
          handle_datagram/2, handle_stream_closed/3,
          terminate/2]).
 
@@ -15,8 +15,9 @@
     streams = #{} :: #{non_neg_integer() => binary()}
 }).
 
-%% @doc Initialize the handler.
-init(Session, _Request) ->
+%% @doc Initialize the handler. `Opts' is ignored — the echo handler
+%% does not need an owner pid.
+init(Session, _Request, _Opts) ->
     {ok, #state{session = Session}}.
 
 %% @doc Handle data on a stream - buffer until FIN.
