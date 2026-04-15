@@ -591,23 +591,25 @@ strongest_transition({stop, _} = Stop, _) -> Stop;
 strongest_transition(_, {stop, _} = Stop) -> Stop;
 strongest_transition(drain, drain) -> drain.
 
-dispatch_action({send, Stream, Data}, StateData) ->
-    {apply_do_result(do_send(Stream, iolist_to_binary(Data), false, StateData), StateData, {send, Stream}), continue};
-dispatch_action({send, Stream, Data, fin}, StateData) ->
-    {apply_do_result(do_send(Stream, iolist_to_binary(Data), true, StateData), StateData, {send, Stream, fin}), continue};
-dispatch_action({send_datagram, Data}, StateData) ->
-    {apply_do_result(do_send_datagram(iolist_to_binary(Data), StateData), StateData, send_datagram), continue};
-dispatch_action({open_stream, Type}, StateData) ->
+dispatch_action({send, Stream, Data} = Action, StateData) ->
+    apply_do_result(do_send(Stream, iolist_to_binary(Data), false, StateData), StateData, Action);
+dispatch_action({send, Stream, Data, fin} = Action, StateData) ->
+    apply_do_result(do_send(Stream, iolist_to_binary(Data), true, StateData), StateData, Action);
+dispatch_action({send_datagram, Data} = Action, StateData) ->
+    apply_do_result(do_send_datagram(iolist_to_binary(Data), StateData), StateData, Action);
+dispatch_action({open_stream, Type} = Action, StateData) ->
     case do_open_stream(Type, StateData) of
-        {ok, _StreamId, StateData1} -> {StateData1, continue};
-        {error, Reason} -> warn_action({open_stream, Type}, Reason), {StateData, continue}
+        {ok, _StreamId, StateData1} ->
+            {StateData1, continue};
+        {error, Reason} ->
+            handle_action_failure(Action, Reason, StateData)
     end;
-dispatch_action({close_stream, Stream}, StateData) ->
-    {apply_do_result(do_close_stream(Stream, StateData), StateData, {close_stream, Stream}), continue};
-dispatch_action({reset_stream, Stream, Code}, StateData) ->
-    {apply_do_result(do_reset_stream(Stream, Code, StateData), StateData, {reset_stream, Stream}), continue};
-dispatch_action({stop_sending, Stream, Code}, StateData) ->
-    {apply_do_result(do_stop_sending(Stream, Code, StateData), StateData, {stop_sending, Stream}), continue};
+dispatch_action({close_stream, _Stream} = Action, StateData) ->
+    apply_do_result(do_close_stream(element(2, Action), StateData), StateData, Action);
+dispatch_action({reset_stream, Stream, Code} = Action, StateData) ->
+    apply_do_result(do_reset_stream(Stream, Code, StateData), StateData, Action);
+dispatch_action({stop_sending, Stream, Code} = Action, StateData) ->
+    apply_do_result(do_stop_sending(Stream, Code, StateData), StateData, Action);
 dispatch_action(drain_session, StateData) ->
     do_drain(StateData),
     {StateData, drain};
@@ -616,13 +618,27 @@ dispatch_action({close_session, ErrorCode, Reason}, StateData) ->
     {StateData#data{close_info = {ErrorCode, Reason}}, {stop, normal}}.
 
 apply_do_result({ok, StateData1}, _OldState, _Action) ->
-    StateData1;
+    {StateData1, continue};
 apply_do_result({error, Reason}, OldState, Action) ->
-    warn_action(Action, Reason),
-    OldState.
+    handle_action_failure(Action, Reason, OldState).
 
-warn_action(Action, Reason) ->
-    logger:warning("webtransport action ~p failed: ~p", [Action, Reason]).
+%% Invoke the handler's optional `handle_action_failed/3' callback with the
+%% action and the underlying error reason. If the callback is not exported,
+%% log a warning and keep the session running (pre-callback behaviour).
+handle_action_failure(Action, Reason,
+                      #data{handler = Handler, handler_state = HState} = StateData) ->
+    case erlang:function_exported(Handler, handle_action_failed, 3) of
+        true ->
+            case Handler:handle_action_failed(Action, Reason, HState) of
+                {ok, HState1} ->
+                    {StateData#data{handler_state = HState1}, continue};
+                {stop, StopReason, HState1} ->
+                    {StateData#data{handler_state = HState1}, {stop, StopReason}}
+            end;
+        false ->
+            logger:warning("webtransport action ~p failed: ~p", [Action, Reason]),
+            {StateData, continue}
+    end.
 
 %% Transport abstraction
 transport_send(StreamId, Data, Fin, #data{transport = h2, transport_state = H2State}) ->

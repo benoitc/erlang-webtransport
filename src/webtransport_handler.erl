@@ -93,6 +93,19 @@
     Actions :: [action()],
     Reason :: term().
 
+%% Invoked when a handler-returned action fails at dispatch time
+%% (e.g. `{send, UnknownStream, _}' returns `{error, unknown_stream}').
+%% The default behaviour — when this callback is not exported — is to
+%% log the failure via `logger:warning/2' and continue. Implement this
+%% callback to observe failures, emit metrics, or stop the session.
+-callback handle_action_failed(Action, Reason, State) -> Result when
+    Action :: action(),
+    Reason :: term(),
+    State :: term(),
+    Result :: {ok, NewState} | {stop, StopReason, NewState},
+    NewState :: term(),
+    StopReason :: term().
+
 -callback terminate(Reason, State) -> term() when
     Reason :: normal | {error, term()} | term(),
     State :: term().
@@ -100,7 +113,8 @@
 %% Optional callbacks. `init/3' is preferred; `init/2' is a back-compat
 %% shim that only gets called when the handler module does not export
 %% `init/3'.
--optional_callbacks([init/2, init/3, handle_stream_fin/4, handle_info/2]).
+-optional_callbacks([init/2, init/3, handle_stream_fin/4, handle_info/2,
+                     handle_action_failed/3]).
 
 %% Types
 -type action() ::

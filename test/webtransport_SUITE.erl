@@ -47,6 +47,9 @@
     datagram_round_trip_test/1,
     action_drain_test/1,
     action_close_test/1,
+    action_failure_continue_test/1,
+    action_failure_forward_test/1,
+    action_failure_stop_test/1,
     bidi_round_trip_test/1
 ]).
 
@@ -80,7 +83,10 @@ groups() ->
         datagram_round_trip_test,
         bidi_round_trip_test,
         action_drain_test,
-        action_close_test
+        action_close_test,
+        action_failure_continue_test,
+        action_failure_forward_test,
+        action_failure_stop_test
     ],
     [
         {h3_tests, [sequence], Cases},
@@ -537,6 +543,69 @@ wait_for_draining(Session, Timeout) ->
             timer:sleep(50),
             wait_for_draining(Session, Timeout - 50)
     end.
+
+%% A handler exporting `handle_action_failed/3' that returns `{ok, State}'
+%% keeps the session running and lets subsequent actions succeed.
+action_failure_continue_test(Config) ->
+    Port = proplists:get_value(port, Config),
+    {ok, Session} = webtransport:connect("localhost", Port, <<"/test">>, #{
+        transport => proplists:get_value(transport, Config),
+        verify => verify_none,
+        handler_opts => #{owner => self(), failure_mode => continue}
+    }, wt_trigger_handler),
+
+    %% Trigger a send on an unknown stream → do_send returns
+    %% {error, unknown_stream} → handle_action_failed/3 returns {ok, _}.
+    Session ! send_bad_stream,
+    timer:sleep(100),
+    ?assert(is_process_alive(Session)),
+
+    %% And the session is still usable.
+    {ok, _StreamId} = webtransport:open_stream(Session, bidi),
+    webtransport:close_session(Session).
+
+%% `forward' mode relays the failure to the owner pid so the test can
+%% observe the exact {Action, Reason} that failed.
+action_failure_forward_test(Config) ->
+    Port = proplists:get_value(port, Config),
+    {ok, Session} = webtransport:connect("localhost", Port, <<"/test">>, #{
+        transport => proplists:get_value(transport, Config),
+        verify => verify_none,
+        handler_opts => #{owner => self(), failure_mode => forward}
+    }, wt_trigger_handler),
+
+    Session ! send_bad_stream,
+    receive
+        {webtransport, Session, {action_failed, {send, 99999, <<"nope">>, fin}, Reason}} ->
+            ?assertEqual(unknown_stream, Reason)
+    after 1000 ->
+        error(action_failure_not_forwarded)
+    end,
+    webtransport:close_session(Session).
+
+%% `stop' mode returns `{stop, _}' from the callback; the session
+%% gen_statem terminates. We trap exits because `webtransport:connect/4,5'
+%% uses `start_link' — otherwise the abnormal session exit propagates
+%% here and kills the CT runner before the monitor message arrives.
+action_failure_stop_test(Config) ->
+    process_flag(trap_exit, true),
+    Port = proplists:get_value(port, Config),
+    {ok, Session} = webtransport:connect("localhost", Port, <<"/test">>, #{
+        transport => proplists:get_value(transport, Config),
+        verify => verify_none,
+        handler_opts => #{owner => self(), failure_mode => stop}
+    }, wt_trigger_handler),
+
+    MRef = erlang:monitor(process, Session),
+    Session ! send_bad_stream,
+    receive
+        {'DOWN', MRef, process, Session, _Reason} -> ok
+    after 2000 ->
+        error({session_did_not_stop, Session})
+    end,
+    %% Drain the linked-exit signal so it doesn't leak into the next case.
+    receive {'EXIT', Session, _} -> ok after 100 -> ok end,
+    process_flag(trap_exit, false).
 
 collect_stream_echo(Session, StreamId, Acc, Timeout) ->
     receive
