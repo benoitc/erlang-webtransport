@@ -83,14 +83,10 @@ init(Session, _Request) ->
 handle_stream(StreamId, Type, Data, #state{buffers = Buffers} = State) ->
     Existing = maps:get(StreamId, Buffers, <<>>),
     NewData = <<Existing/binary, Data/binary>>,
-
-    %% Check if we have a complete request (ends with newline)
     case binary:match(NewData, <<"\n">>) of
         nomatch ->
-            %% Not complete yet, buffer it
             {ok, State#state{buffers = Buffers#{StreamId => NewData}}};
         _ ->
-            %% We have a complete request, process it
             process_request(StreamId, Type, NewData, State)
     end.
 
@@ -100,7 +96,6 @@ handle_stream_fin(StreamId, Type, Data, #state{buffers = Buffers} = State) ->
     process_request(StreamId, Type, FullData, State).
 
 handle_datagram(Data, State) ->
-    %% Echo datagrams back
     {ok, State, [{send_datagram, Data}]}.
 
 handle_stream_closed(_StreamId, _Reason, State) ->
@@ -115,37 +110,37 @@ terminate(_Reason, _State) ->
 
 process_request(StreamId, Type, Data, #state{www_dir = WwwDir, buffers = Buffers} = State) ->
     State1 = State#state{buffers = maps:remove(StreamId, Buffers)},
-
     case interop:parse_request(Data) of
         {ok, Path} ->
-            FilePath = filename:join(WwwDir, binary_to_list(Path)),
+            FilePath = filename:join(WwwDir, strip_leading_slash(binary_to_list(Path))),
             case file:read_file(FilePath) of
                 {ok, Content} ->
                     Filename = filename:basename(FilePath),
                     Response = interop:format_response(list_to_binary(Filename), Content),
-                    case Type of
-                        bidi ->
-                            {ok, State1, [{send, StreamId, Response, fin}]};
-                        uni ->
-                            %% For uni streams, we can't reply on the same stream
-                            %% Open a new stream to send the response
-                            {ok, State1, [{open_stream, uni, Response}]}
-                    end;
+                    respond(StreamId, Type, Response, State1);
                 {error, _Reason} ->
-                    ErrorResponse = <<"ERROR: File not found\n">>,
-                    case Type of
-                        bidi ->
-                            {ok, State1, [{send, StreamId, ErrorResponse, fin}]};
-                        uni ->
-                            {ok, State1}
-                    end
+                    respond(StreamId, Type, <<"ERROR: File not found\n">>, State1)
             end;
         {error, _Reason} ->
-            ErrorResponse = <<"ERROR: Invalid request\n">>,
-            case Type of
-                bidi ->
-                    {ok, State1, [{send, StreamId, ErrorResponse, fin}]};
-                uni ->
-                    {ok, State1}
-            end
+            respond(StreamId, Type, <<"ERROR: Invalid request\n">>, State1)
     end.
+
+respond(StreamId, bidi, Response, State) ->
+    {ok, State, [{send, StreamId, Response, fin}]};
+respond(_StreamId, uni, Response, #state{session = Session} = State) ->
+    %% Uni streams are one-way; reply on a fresh peer-initiated uni stream.
+    %% Spawn so we don't self-call the session gen_statem from inside a
+    %% handler callback.
+    Self = self(),
+    spawn(fun() ->
+        case webtransport:open_stream(Session, uni) of
+            {ok, NewStreamId} ->
+                _ = webtransport:send(Session, NewStreamId, Response, fin);
+            {error, Reason} ->
+                Self ! {interop_uni_reply_error, Reason}
+        end
+    end),
+    {ok, State}.
+
+strip_leading_slash([$/ | Rest]) -> Rest;
+strip_leading_slash(Path) -> Path.

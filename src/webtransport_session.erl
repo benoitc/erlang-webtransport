@@ -163,7 +163,11 @@ init({Transport, TransportState, Handler, Opts}) ->
         remote_max_streams_uni = maps:get(max_streams_uni, Opts, ?DEFAULT_MAX_STREAMS_UNI)
     },
 
-    %% Initialize handler
+    %% Initialize handler. code:ensure_loaded/1 is required because
+    %% erlang:function_exported/3 returns false for modules that haven't been
+    %% loaded yet — which silently demotes init/3 callers to init/2 and
+    %% throws handler_opts away.
+    _ = code:ensure_loaded(Handler),
     InitResult = case erlang:function_exported(Handler, init, 3) of
         true -> Handler:init(self(), Request, HandlerOpts);
         false -> Handler:init(self(), Request)
