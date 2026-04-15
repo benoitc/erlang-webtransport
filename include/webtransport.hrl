@@ -114,4 +114,21 @@
 -define(DEFAULT_MAX_STREAMS_BIDI, 100).
 -define(DEFAULT_MAX_STREAMS_UNI, 100).
 
+%% ============================================================================
+%% Datagram size ceilings
+%% ============================================================================
+%%
+%% H2 datagrams travel as capsules over the CONNECT stream, bounded by the
+%% HTTP/2 default initial stream window (65535 bytes). The capsule header
+%% (type varint + length varint) consumes a few bytes; we reserve 64 bytes
+%% of headroom to leave room for the RFC 9297 DATAGRAM capsule framing and
+%% any intermediate HTTP/2 framing overhead.
+-define(WT_H2_DATAGRAM_MAX, 65471).  %% 65535 - 64
+
+%% H3 datagrams are QUIC datagrams prefixed with a quarter-stream-id varint.
+%% The peer-advertised `max_datagram_frame_size' (we set 65535) caps the
+%% whole encoded datagram — payload + session-id varint — so we reserve
+%% 8 bytes for the worst-case varint encoding of the session id.
+-define(WT_H3_DATAGRAM_MAX, 65527).  %% 65535 - 8
+
 -endif.

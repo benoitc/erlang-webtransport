@@ -138,6 +138,8 @@ send(#state{quic_conn = QuicConn, h3_conn = H3Conn, session_id = SessionId}, Str
 %% ============================================================================
 
 -spec send_datagram(state(), binary()) -> ok | {error, term()}.
+send_datagram(_State, Data) when byte_size(Data) > ?WT_H3_DATAGRAM_MAX ->
+    {error, datagram_too_large};
 send_datagram(#state{quic_conn = QuicConn, session_id = SessionId}, Data) ->
     %% Encode datagram with quarter stream ID prefix
     Datagram = wt_h3_capsule:encode_datagram(SessionId, Data),

@@ -159,6 +159,8 @@ send(#state{h2_conn = H2Conn, connect_stream_id = ConnectStreamId}, StreamId, Da
     h2:send_data(H2Conn, ConnectStreamId, wt_h2_capsule:encode(Capsule), false).
 
 -spec send_datagram(state(), binary()) -> ok | {error, term()}.
+send_datagram(_State, Data) when byte_size(Data) > ?WT_H2_DATAGRAM_MAX ->
+    {error, datagram_too_large};
 send_datagram(#state{h2_conn = H2Conn, connect_stream_id = ConnectStreamId}, Data) ->
     Capsule = wt_h2_capsule:datagram(Data),
     h2:send_data(H2Conn, ConnectStreamId, wt_h2_capsule:encode(Capsule), false).

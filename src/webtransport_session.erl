@@ -385,8 +385,10 @@ do_send(StreamId, Data, Fin, #data{streams = Streams} = StateData) ->
     end.
 
 do_send_datagram(Data, StateData) ->
-    ok = transport_send_datagram(Data, StateData),
-    {ok, StateData}.
+    case transport_send_datagram(Data, StateData) of
+        ok -> {ok, StateData};
+        {error, _} = Err -> Err
+    end.
 
 do_open_stream(bidi, #data{streams = Streams, next_bidi_id = NextId,
                            remote_max_streams_bidi = MaxStreams} = StateData) ->

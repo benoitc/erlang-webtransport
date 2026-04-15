@@ -7,6 +7,7 @@
 
 -include_lib("common_test/include/ct.hrl").
 -include_lib("stdlib/include/assert.hrl").
+-include("webtransport.hrl").
 
 %% CT callbacks
 -export([all/0, groups/0]).
@@ -50,6 +51,8 @@
     action_failure_continue_test/1,
     action_failure_forward_test/1,
     action_failure_stop_test/1,
+    datagram_oversize_test/1,
+    datagram_boundary_test/1,
     bidi_round_trip_test/1
 ]).
 
@@ -86,7 +89,9 @@ groups() ->
         action_close_test,
         action_failure_continue_test,
         action_failure_forward_test,
-        action_failure_stop_test
+        action_failure_stop_test,
+        datagram_oversize_test,
+        datagram_boundary_test
     ],
     [
         {h3_tests, [sequence], Cases},
@@ -606,6 +611,37 @@ action_failure_stop_test(Config) ->
     %% Drain the linked-exit signal so it doesn't leak into the next case.
     receive {'EXIT', Session, _} -> ok after 100 -> ok end,
     process_flag(trap_exit, false).
+
+%% Oversize payload must return `{error, datagram_too_large}' synchronously
+%% on both transports, not stall on flow control or crash the session.
+datagram_oversize_test(Config) ->
+    Port = proplists:get_value(port, Config),
+    {ok, Session} = webtransport:connect("localhost", Port, <<"/test">>, #{
+        transport => proplists:get_value(transport, Config),
+        verify => verify_none
+    }),
+    Huge = test_helpers:random_data(128 * 1024),
+    ?assertEqual({error, datagram_too_large},
+                 webtransport:send_datagram(Session, Huge)),
+    webtransport:close_session(Session).
+
+%% h2 ceiling is deterministic (65471 bytes fit under HTTP/2 stream window
+%% minus capsule framing). h3 is PMTU-bounded and varies per path, so we
+%% only exercise the h2 boundary exactly; h3 uses a modest MTU-safe size.
+datagram_boundary_test(Config) ->
+    Transport = proplists:get_value(transport, Config),
+    Port = proplists:get_value(port, Config),
+    {ok, Session} = webtransport:connect("localhost", Port, <<"/test">>, #{
+        transport => Transport,
+        verify => verify_none
+    }),
+    Size = case Transport of
+               h2 -> ?WT_H2_DATAGRAM_MAX;
+               h3 -> 1200
+           end,
+    Payload = test_helpers:random_data(Size),
+    ?assertEqual(ok, webtransport:send_datagram(Session, Payload)),
+    webtransport:close_session(Session).
 
 collect_stream_echo(Session, StreamId, Acc, Timeout) ->
     receive
