@@ -41,7 +41,11 @@
 
     %% Session management tests
     drain_session_test/1,
-    close_session_with_error_test/1
+    close_session_with_error_test/1,
+
+    %% Round-trip assertion tests
+    datagram_round_trip_test/1,
+    bidi_round_trip_test/1
 ]).
 
 %% ============================================================================
@@ -50,28 +54,33 @@
 
 all() ->
     [
-        {group, h3_tests}
+        {group, h3_tests},
+        {group, h2_tests}
     ].
 
 groups() ->
+    Cases = [
+        connect_disconnect_test,
+        session_info_test,
+        open_bidi_stream_test,
+        open_uni_stream_test,
+        bidi_echo_test,
+        bidi_large_data_test,
+        multi_stream_test,
+        close_stream_test,
+        datagram_echo_test,
+        datagram_large_test,
+        stream_limit_test,
+        reset_stream_test,
+        stop_sending_test,
+        drain_session_test,
+        close_session_with_error_test,
+        datagram_round_trip_test,
+        bidi_round_trip_test
+    ],
     [
-        {h3_tests, [sequence], [
-            connect_disconnect_test,
-            session_info_test,
-            open_bidi_stream_test,
-            open_uni_stream_test,
-            bidi_echo_test,
-            bidi_large_data_test,
-            multi_stream_test,
-            close_stream_test,
-            datagram_echo_test,
-            datagram_large_test,
-            stream_limit_test,
-            reset_stream_test,
-            stop_sending_test,
-            drain_session_test,
-            close_session_with_error_test
-        ]}
+        {h3_tests, [sequence], Cases},
+        {h2_tests, [sequence], Cases}
     ].
 
 init_per_suite(Config) ->
@@ -93,35 +102,39 @@ end_per_suite(_Config) ->
     ok.
 
 init_per_group(h3_tests, Config) ->
-    %% Start H3 listener
+    start_listener_group(h3, test_h3_listener, Config);
+init_per_group(h2_tests, Config) ->
+    start_listener_group(h2, test_h2_listener, Config);
+init_per_group(_Group, Config) ->
+    Config.
+
+end_per_group(h3_tests, _Config) ->
+    webtransport:stop_listener(test_h3_listener),
+    ok;
+end_per_group(h2_tests, _Config) ->
+    webtransport:stop_listener(test_h2_listener),
+    ok;
+end_per_group(_Group, _Config) ->
+    ok.
+
+start_listener_group(Transport, Name, Config) ->
     Port = test_helpers:find_free_port(),
     CertFile = proplists:get_value(certfile, Config),
     KeyFile = proplists:get_value(keyfile, Config),
-
     ListenerOpts = #{
-        transport => h3,
+        transport => Transport,
         port => Port,
         certfile => CertFile,
         keyfile => KeyFile,
         handler => wt_echo_handler
     },
-
-    case webtransport:start_listener(test_listener, ListenerOpts) of
+    case webtransport:start_listener(Name, ListenerOpts) of
         {ok, _Pid} ->
-            %% Give the listener time to start
             timer:sleep(100),
-            [{port, Port}, {transport, h3} | Config];
+            [{port, Port}, {transport, Transport} | Config];
         {error, Reason} ->
             {skip, {listener_start_failed, Reason}}
-    end;
-init_per_group(_Group, Config) ->
-    Config.
-
-end_per_group(h3_tests, _Config) ->
-    webtransport:stop_listener(test_listener),
-    ok;
-end_per_group(_Group, _Config) ->
-    ok.
+    end.
 
 init_per_testcase(_TestCase, Config) ->
     Config.
@@ -138,7 +151,7 @@ connect_disconnect_test(Config) ->
 
     %% Connect
     {ok, Session} = webtransport:connect("localhost", Port, <<"/test">>, #{
-        transport => h3,
+        transport => proplists:get_value(transport, Config),
         verify => verify_none
     }),
 
@@ -156,7 +169,7 @@ session_info_test(Config) ->
     Port = proplists:get_value(port, Config),
 
     {ok, Session} = webtransport:connect("localhost", Port, <<"/test">>, #{
-        transport => h3,
+        transport => proplists:get_value(transport, Config),
         verify => verify_none
     }),
 
@@ -164,7 +177,7 @@ session_info_test(Config) ->
     {ok, Info} = webtransport:session_info(Session),
 
     ?assert(is_map(Info)),
-    ?assertEqual(h3, maps:get(transport, Info)),
+    ?assertEqual(proplists:get_value(transport, Config), maps:get(transport, Info)),
     ?assert(maps:is_key(stream_count, Info)),
     ?assert(maps:is_key(local_max_data, Info)),
     ?assert(maps:is_key(remote_max_data, Info)),
@@ -179,7 +192,7 @@ open_bidi_stream_test(Config) ->
     Port = proplists:get_value(port, Config),
 
     {ok, Session} = webtransport:connect("localhost", Port, <<"/test">>, #{
-        transport => h3,
+        transport => proplists:get_value(transport, Config),
         verify => verify_none
     }),
 
@@ -195,7 +208,7 @@ open_uni_stream_test(Config) ->
     Port = proplists:get_value(port, Config),
 
     {ok, Session} = webtransport:connect("localhost", Port, <<"/test">>, #{
-        transport => h3,
+        transport => proplists:get_value(transport, Config),
         verify => verify_none
     }),
 
@@ -211,7 +224,7 @@ bidi_echo_test(Config) ->
     Port = proplists:get_value(port, Config),
 
     {ok, Session} = webtransport:connect("localhost", Port, <<"/test">>, #{
-        transport => h3,
+        transport => proplists:get_value(transport, Config),
         verify => verify_none
     }),
 
@@ -231,7 +244,7 @@ bidi_large_data_test(Config) ->
     Port = proplists:get_value(port, Config),
 
     {ok, Session} = webtransport:connect("localhost", Port, <<"/test">>, #{
-        transport => h3,
+        transport => proplists:get_value(transport, Config),
         verify => verify_none
     }),
 
@@ -250,7 +263,7 @@ multi_stream_test(Config) ->
     Port = proplists:get_value(port, Config),
 
     {ok, Session} = webtransport:connect("localhost", Port, <<"/test">>, #{
-        transport => h3,
+        transport => proplists:get_value(transport, Config),
         verify => verify_none
     }),
 
@@ -275,7 +288,7 @@ close_stream_test(Config) ->
     Port = proplists:get_value(port, Config),
 
     {ok, Session} = webtransport:connect("localhost", Port, <<"/test">>, #{
-        transport => h3,
+        transport => proplists:get_value(transport, Config),
         verify => verify_none
     }),
 
@@ -300,7 +313,7 @@ datagram_echo_test(Config) ->
     Port = proplists:get_value(port, Config),
 
     {ok, Session} = webtransport:connect("localhost", Port, <<"/test">>, #{
-        transport => h3,
+        transport => proplists:get_value(transport, Config),
         verify => verify_none
     }),
 
@@ -317,7 +330,7 @@ datagram_large_test(Config) ->
     Port = proplists:get_value(port, Config),
 
     {ok, Session} = webtransport:connect("localhost", Port, <<"/test">>, #{
-        transport => h3,
+        transport => proplists:get_value(transport, Config),
         verify => verify_none
     }),
 
@@ -337,7 +350,7 @@ stream_limit_test(Config) ->
     Port = proplists:get_value(port, Config),
 
     {ok, Session} = webtransport:connect("localhost", Port, <<"/test">>, #{
-        transport => h3,
+        transport => proplists:get_value(transport, Config),
         verify => verify_none
     }),
 
@@ -358,7 +371,7 @@ reset_stream_test(Config) ->
     Port = proplists:get_value(port, Config),
 
     {ok, Session} = webtransport:connect("localhost", Port, <<"/test">>, #{
-        transport => h3,
+        transport => proplists:get_value(transport, Config),
         verify => verify_none
     }),
 
@@ -378,7 +391,7 @@ stop_sending_test(Config) ->
     Port = proplists:get_value(port, Config),
 
     {ok, Session} = webtransport:connect("localhost", Port, <<"/test">>, #{
-        transport => h3,
+        transport => proplists:get_value(transport, Config),
         verify => verify_none
     }),
 
@@ -399,7 +412,7 @@ drain_session_test(Config) ->
     Port = proplists:get_value(port, Config),
 
     {ok, Session} = webtransport:connect("localhost", Port, <<"/test">>, #{
-        transport => h3,
+        transport => proplists:get_value(transport, Config),
         verify => verify_none
     }),
 
@@ -420,7 +433,7 @@ close_session_with_error_test(Config) ->
     Port = proplists:get_value(port, Config),
 
     {ok, Session} = webtransport:connect("localhost", Port, <<"/test">>, #{
-        transport => h3,
+        transport => proplists:get_value(transport, Config),
         verify => verify_none
     }),
 
@@ -429,3 +442,55 @@ close_session_with_error_test(Config) ->
 
     timer:sleep(100),
     ?assertNot(is_process_alive(Session)).
+
+%% ============================================================================
+%% Round-Trip Assertion Tests
+%% ============================================================================
+
+datagram_round_trip_test(Config) ->
+    Port = proplists:get_value(port, Config),
+
+    {ok, Session} = webtransport:connect("localhost", Port, <<"/test">>, #{
+        transport => proplists:get_value(transport, Config),
+        verify => verify_none,
+        handler_opts => #{owner => self()}
+    }),
+
+    Payload = <<"datagram-ping">>,
+    ok = webtransport:send_datagram(Session, Payload),
+
+    receive
+        {webtransport, Session, {datagram, Payload}} -> ok
+    after 2000 ->
+        error(no_datagram_echo)
+    end,
+
+    webtransport:close_session(Session).
+
+bidi_round_trip_test(Config) ->
+    Port = proplists:get_value(port, Config),
+
+    {ok, Session} = webtransport:connect("localhost", Port, <<"/test">>, #{
+        transport => proplists:get_value(transport, Config),
+        verify => verify_none,
+        handler_opts => #{owner => self()}
+    }),
+
+    {ok, StreamId} = webtransport:open_stream(Session, bidi),
+    Payload = <<"ping">>,
+    ok = webtransport:send(Session, StreamId, Payload, fin),
+
+    Echoed = collect_stream_echo(Session, StreamId, <<>>, 2000),
+    ?assertEqual(Payload, Echoed),
+
+    webtransport:close_session(Session).
+
+collect_stream_echo(Session, StreamId, Acc, Timeout) ->
+    receive
+        {webtransport, Session, {stream, StreamId, _Type, Data}} ->
+            collect_stream_echo(Session, StreamId, <<Acc/binary, Data/binary>>, Timeout);
+        {webtransport, Session, {stream_fin, StreamId, _Type, Data}} ->
+            <<Acc/binary, Data/binary>>
+    after Timeout ->
+        error({no_stream_echo, Acc})
+    end.

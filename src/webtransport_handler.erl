@@ -37,6 +37,14 @@
     Actions :: [action()],
     Reason :: term().
 
+-callback init(Session, Req, Opts) -> {ok, State} | {ok, State, Actions} | {error, Reason} when
+    Session :: webtransport:session(),
+    Req :: webtransport:request(),
+    Opts :: map(),
+    State :: term(),
+    Actions :: [action()],
+    Reason :: term().
+
 -callback handle_stream(Stream, Type, Data, State) -> Result when
     Stream :: webtransport:stream(),
     Type :: bidi | uni,
@@ -85,7 +93,7 @@
     State :: term().
 
 %% Optional callbacks
--optional_callbacks([handle_stream_fin/4, handle_info/2]).
+-optional_callbacks([init/3, handle_stream_fin/4, handle_info/2]).
 
 %% Types
 -type action() ::
@@ -100,37 +108,3 @@
     {close_session, non_neg_integer(), binary()}.
 
 -export_type([action/0]).
-
-%% Utility exports
--export([execute_actions/2]).
-
-%% @doc Execute a list of actions on a session.
-%% Called internally by webtransport_session after callback returns.
--spec execute_actions(webtransport:session(), [action()]) -> ok | {error, term()}.
-execute_actions(_Session, []) ->
-    ok;
-execute_actions(Session, [Action | Rest]) ->
-    case execute_action(Session, Action) of
-        ok -> execute_actions(Session, Rest);
-        {ok, _} -> execute_actions(Session, Rest);
-        {error, _} = Err -> Err
-    end.
-
-execute_action(Session, {send, Stream, Data}) ->
-    webtransport_session:send(Session, Stream, Data, false);
-execute_action(Session, {send, Stream, Data, fin}) ->
-    webtransport_session:send(Session, Stream, Data, true);
-execute_action(Session, {send_datagram, Data}) ->
-    webtransport_session:send_datagram(Session, Data);
-execute_action(Session, {open_stream, Type}) ->
-    webtransport_session:open_stream(Session, Type);
-execute_action(Session, {close_stream, Stream}) ->
-    webtransport_session:close_stream(Session, Stream);
-execute_action(Session, {reset_stream, Stream, ErrorCode}) ->
-    webtransport_session:reset_stream(Session, Stream, ErrorCode);
-execute_action(Session, {stop_sending, Stream, ErrorCode}) ->
-    webtransport_session:stop_sending(Session, Stream, ErrorCode);
-execute_action(Session, drain_session) ->
-    webtransport_session:drain(Session);
-execute_action(Session, {close_session, ErrorCode, Reason}) ->
-    webtransport_session:close(Session, ErrorCode, Reason).

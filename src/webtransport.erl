@@ -302,23 +302,58 @@ start_h2_listener(Name, Opts) ->
         cert => CertFile,
         key => KeyFile,
         handler => H2Handler,
+        enable_connect_protocol => true,
         settings => #{enable_connect_protocol => 1}
     },
 
-    case h2:start_server(Port, ServerOpts) of
-        {ok, ServerRef} ->
-            %% Register the listener
-            Pid = spawn_link(fun() -> listener_loop(Name) end),
-            register(Name, Pid),
+    %% h2:start_server spawn_link's acceptor/manager processes to its caller.
+    %% Delegating to a persistent owner process keeps those links on a
+    %% long-lived pid so the listener survives after the caller returns.
+    case start_h2_server_owner(Name, Port, Handler, ServerOpts) of
+        {ok, OwnerPid, ServerRef} ->
             persistent_term:put({webtransport_listener, Name}, #{
                 transport => h2,
                 port => Port,
                 handler => Handler,
                 server_ref => ServerRef
             }),
-            {ok, Pid};
+            {ok, OwnerPid};
         {error, Reason} ->
             {error, Reason}
+    end.
+
+start_h2_server_owner(Name, Port, _Handler, ServerOpts) ->
+    Parent = self(),
+    Ref = make_ref(),
+    OwnerPid = spawn(fun() -> h2_owner_init(Parent, Ref, Name, Port, ServerOpts) end),
+    receive
+        {Ref, {ok, ServerRef}} ->
+            {ok, OwnerPid, ServerRef};
+        {Ref, {error, Reason}} ->
+            {error, Reason}
+    after 5000 ->
+        exit(OwnerPid, kill),
+        {error, h2_listener_start_timeout}
+    end.
+
+h2_owner_init(Parent, Ref, Name, Port, ServerOpts) ->
+    case h2:start_server(Port, ServerOpts) of
+        {ok, ServerRef} ->
+            try register(Name, self()) catch _:_ -> ok end,
+            Parent ! {Ref, {ok, ServerRef}},
+            h2_owner_loop(Name, ServerRef);
+        {error, Reason} ->
+            Parent ! {Ref, {error, Reason}}
+    end.
+
+h2_owner_loop(Name, ServerRef) ->
+    receive
+        {stop, _From} ->
+            h2:stop_server(ServerRef),
+            persistent_term:erase({webtransport_listener, Name}),
+            ok;
+        _ ->
+            h2_owner_loop(Name, ServerRef)
     end.
 
 start_h3_listener(Name, Opts) ->
@@ -409,6 +444,7 @@ handle_h2_request(Conn, StreamId, <<"CONNECT">>, Path, Headers, Handler, Handler
             SessionOpts = maps:merge(HandlerOpts, #{
                 request => Request,
                 is_server => true,
+                handler_opts => HandlerOpts,
                 max_data => maps:get(max_data, Opts, ?DEFAULT_MAX_DATA),
                 max_streams_bidi => maps:get(max_streams_bidi, Opts, ?DEFAULT_MAX_STREAMS_BIDI),
                 max_streams_uni => maps:get(max_streams_uni, Opts, ?DEFAULT_MAX_STREAMS_UNI)
@@ -416,8 +452,8 @@ handle_h2_request(Conn, StreamId, <<"CONNECT">>, Path, Headers, Handler, Handler
 
             case webtransport_session:start_link(h2, TransportState, Handler, SessionOpts) of
                 {ok, Session} ->
-                    %% Start receiving data
-                    spawn(fun() -> h2_data_loop(Conn, StreamId, Session) end);
+                    LoopPid = spawn(fun() -> h2_data_loop(Conn, StreamId, Session) end),
+                    _ = h2:set_stream_handler(Conn, StreamId, LoopPid);
                 {error, Reason} ->
                     h2:send_response(Conn, StreamId, 500, []),
                     h2:send_data(Conn, StreamId, iolist_to_binary(io_lib:format("~p", [Reason])), true)
@@ -443,7 +479,7 @@ handle_h3_request(H3Conn, StreamId, <<"CONNECT">>, Path, Headers,
             quic_h3:send_response(H3Conn, StreamId, 200, []),
 
             %% Create transport state (H3Conn handles underlying QUIC)
-            TransportState = webtransport_h3:new(H3Conn, StreamId),
+            TransportState = webtransport_h3:new(H3Conn, StreamId, Router),
 
             %% Build request info
             Authority = proplists:get_value(<<":authority">>, Headers, <<>>),
@@ -457,6 +493,7 @@ handle_h3_request(H3Conn, StreamId, <<"CONNECT">>, Path, Headers,
             SessionOpts = maps:merge(HandlerOpts, #{
                 request => Request,
                 is_server => true,
+                handler_opts => HandlerOpts,
                 max_data => maps:get(max_data, Opts, ?DEFAULT_MAX_DATA),
                 max_streams_bidi => maps:get(max_streams_bidi, Opts, ?DEFAULT_MAX_STREAMS_BIDI),
                 max_streams_uni => maps:get(max_streams_uni, Opts, ?DEFAULT_MAX_STREAMS_UNI)
@@ -524,8 +561,13 @@ h2_data_loop(Conn, StreamId, Session) ->
     end.
 
 dispatch_h2_capsule(Session, {wt_stream, WtStreamId, Data}) ->
+    %% h2 multiplexes WT streams over CONNECT; peer-opened streams don't get
+    %% a separate open signal, so we seed the session's stream map on first
+    %% data (handle_stream_opened is idempotent).
+    webtransport_session:handle_stream_opened(Session, WtStreamId, bidi),
     webtransport_session:handle_stream_data(Session, WtStreamId, Data, false);
 dispatch_h2_capsule(Session, {wt_stream_fin, WtStreamId, Data}) ->
+    webtransport_session:handle_stream_opened(Session, WtStreamId, bidi),
     webtransport_session:handle_stream_data(Session, WtStreamId, Data, true);
 dispatch_h2_capsule(Session, {datagram, Data}) ->
     webtransport_session:handle_datagram_data(Session, Data);
@@ -539,7 +581,11 @@ dispatch_h2_capsule(Session, Capsule) ->
 %% ============================================================================
 
 connect_h2(Host, Port, Path, Opts, Handler) ->
-    case webtransport_h2:connect(Host, Port, Path, Opts) of
+    Caller = self(),
+    UserHandlerOpts = maps:get(handler_opts, Opts, #{}),
+    HandlerOpts = maps:merge(#{owner => Caller}, UserHandlerOpts),
+    Opts1 = Opts#{ssl_opts => build_h2_ssl_opts(Opts)},
+    case webtransport_h2:connect(Host, Port, Path, Opts1) of
         {ok, TransportState} ->
             %% Default handler for client
             ActualHandler = case Handler of
@@ -553,22 +599,65 @@ connect_h2(Host, Port, Path, Opts, Handler) ->
             },
             SessionOpts = #{
                 request => Request,
-                is_server => false
+                is_server => false,
+                handler_opts => HandlerOpts
             },
-            webtransport_session:start_link(h2, TransportState, ActualHandler, SessionOpts);
+            case webtransport_session:start_link(h2, TransportState, ActualHandler, SessionOpts) of
+                {ok, Session} ->
+                    H2Conn = webtransport_h2:h2_conn(TransportState),
+                    StreamId = webtransport_h2:connect_stream_id(TransportState),
+                    LoopPid = spawn_link(fun() -> h2_data_loop(H2Conn, StreamId, Session) end),
+                    _ = h2:set_stream_handler(H2Conn, StreamId, LoopPid),
+                    {ok, Session};
+                {error, _} = Err ->
+                    Err
+            end;
         {error, Reason} ->
             {error, Reason}
     end.
 
-connect_h3(Host, Port, Path, Opts, Handler) ->
+connect_h3(Host, Port, Path, Opts0, Handler) ->
+    Caller = self(),
+    UserHandlerOpts = maps:get(handler_opts, Opts0, #{}),
+    HandlerOpts = maps:merge(#{owner => Caller}, UserHandlerOpts),
+    Opts = Opts0#{handler_opts => HandlerOpts},
     HostBin = if is_list(Host) -> list_to_binary(Host); true -> Host end,
-    {ok, Router} = webtransport_h3_router:start_link(self()),
+    {ok, Router} = webtransport_h3_router:start_link(Caller),
     H3ConnOpts = build_h3_connect_opts(Opts),
     case webtransport_h3_router:client_connect(Router, Host, Port, H3ConnOpts) of
         {ok, H3Conn} ->
             h3_validate_and_request(H3Conn, HostBin, Port, Path, Opts, Handler, Router);
         {error, Reason} ->
             {error, Reason}
+    end.
+
+build_h2_ssl_opts(Opts) ->
+    Base = maps:get(ssl_opts, Opts, []),
+    WithVerify =
+        case maps:get(verify, Opts, verify_peer) of
+            verify_none -> [{verify, verify_none} | Base];
+            verify_peer -> [{verify, verify_peer} | Base]
+        end,
+    WithCACerts =
+        case {maps:find(cacertfile, Opts), maps:find(cacerts, Opts)} of
+            {{ok, CAFile}, _} ->
+                case read_cacerts_file(CAFile) of
+                    {ok, CACerts} -> [{cacerts, CACerts} | WithVerify];
+                    _ -> WithVerify
+                end;
+            {_, {ok, CACerts}} -> [{cacerts, CACerts} | WithVerify];
+            _ -> WithVerify
+        end,
+    WithCert =
+        case {maps:find(certfile, Opts), maps:find(cert, Opts)} of
+            {{ok, CertFile}, _} -> [{certfile, CertFile} | WithCACerts];
+            {_, {ok, CertDer}} -> [{cert, CertDer} | WithCACerts];
+            _ -> WithCACerts
+        end,
+    case {maps:find(keyfile, Opts), maps:find(key, Opts)} of
+        {{ok, KeyFile}, _} -> [{keyfile, KeyFile} | WithCert];
+        {_, {ok, KeyTerm}} -> [{key, KeyTerm} | WithCert];
+        _ -> WithCert
     end.
 
 build_h3_connect_opts(Opts) ->
@@ -580,6 +669,7 @@ build_h3_connect_opts(Opts) ->
         connect_timeout => maps:get(timeout, Opts, 30000),
         verify => maps:get(verify, Opts, verify_peer),
         quic_opts => #{max_datagram_frame_size => 65535},
+        h3_datagram_enabled => true,
         stream_type_handler => fun
             (uni,  _, 16#54) -> claim;
             (bidi, _, 16#41) -> claim;
@@ -647,7 +737,7 @@ h3_await_response(H3Conn, SessionId, Authority, Path, Opts, Handler, Router) ->
     Timeout = maps:get(timeout, Opts, 30000),
     receive
         {quic_h3, H3Conn, {response, SessionId, Status, Headers}} when Status >= 200, Status < 300 ->
-            h3_start_session(H3Conn, SessionId, Authority, Path, Headers, Handler, Router);
+            h3_start_session(H3Conn, SessionId, Authority, Path, Headers, Opts, Handler, Router);
         {quic_h3, H3Conn, {response, SessionId, Status, _Headers}} ->
             quic_h3:close(H3Conn),
             {error, {http_error, Status}};
@@ -658,8 +748,8 @@ h3_await_response(H3Conn, SessionId, Authority, Path, Opts, Handler, Router) ->
         {error, timeout}
     end.
 
-h3_start_session(H3Conn, SessionId, Authority, Path, Headers, Handler, Router) ->
-    TransportState = webtransport_h3:new(H3Conn, SessionId),
+h3_start_session(H3Conn, SessionId, Authority, Path, Headers, Opts, Handler, Router) ->
+    TransportState = webtransport_h3:new(H3Conn, SessionId, Router),
     ActualHandler = case Handler of
         undefined -> webtransport_client_handler;
         _ -> Handler
@@ -669,9 +759,11 @@ h3_start_session(H3Conn, SessionId, Authority, Path, Headers, Handler, Router) -
         authority => Authority,
         headers => Headers
     },
+    HandlerOpts = maps:get(handler_opts, Opts, #{}),
     SessionOpts = #{
         request => Request,
-        is_server => false
+        is_server => false,
+        handler_opts => HandlerOpts
     },
     case webtransport_session:start_link(h3, TransportState, ActualHandler, SessionOpts) of
         {ok, Session} ->

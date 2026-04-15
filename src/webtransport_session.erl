@@ -139,6 +139,7 @@ callback_mode() -> state_functions.
 init({Transport, TransportState, Handler, Opts}) ->
     IsServer = maps:get(is_server, Opts, true),
     Request = maps:get(request, Opts, #{}),
+    HandlerOpts = maps:get(handler_opts, Opts, #{}),
 
     %% Stream ID assignment depends on role
     {NextBidi, NextUni} = case IsServer of
@@ -163,12 +164,15 @@ init({Transport, TransportState, Handler, Opts}) ->
     },
 
     %% Initialize handler
-    case Handler:init(self(), Request) of
+    InitResult = case erlang:function_exported(Handler, init, 3) of
+        true -> Handler:init(self(), Request, HandlerOpts);
+        false -> Handler:init(self(), Request)
+    end,
+    case InitResult of
         {ok, HandlerState} ->
             {ok, open, Data#data{handler_state = HandlerState}};
         {ok, HandlerState, Actions} ->
-            Data1 = Data#data{handler_state = HandlerState},
-            handle_actions(Actions, Data1),
+            Data1 = handle_actions(Actions, Data#data{handler_state = HandlerState}),
             {ok, open, Data1};
         {error, Reason} ->
             {stop, Reason}
@@ -262,8 +266,8 @@ open(info, Msg, #data{handler = Handler, handler_state = HState} = StateData) ->
                 {ok, HState1} ->
                     {keep_state, StateData#data{handler_state = HState1}};
                 {ok, HState1, Actions} ->
-                    handle_actions(Actions, StateData),
-                    {keep_state, StateData#data{handler_state = HState1}};
+                    StateData1 = handle_actions(Actions, StateData#data{handler_state = HState1}),
+                    {keep_state, StateData1};
                 {stop, _Reason, HState1} ->
                     {stop, normal, StateData#data{handler_state = HState1}}
             end;
@@ -470,11 +474,11 @@ handle_incoming_stream_data(StreamId, Data, Fin,
                                 handler_state = HState1
                             };
                         {ok, HState1, Actions} ->
-                            handle_actions(Actions, StateData),
-                            StateData#data{
+                            StateData1 = StateData#data{
                                 streams = Streams#{StreamId => Stream2},
                                 handler_state = HState1
-                            };
+                            },
+                            handle_actions(Actions, StateData1);
                         {stop, _Reason, HState1} ->
                             StateData#data{
                                 streams = Streams#{StreamId => Stream2},
@@ -493,15 +497,19 @@ handle_incoming_datagram(Data, #data{handler = Handler, handler_state = HState} 
         {ok, HState1} ->
             StateData#data{handler_state = HState1};
         {ok, HState1, Actions} ->
-            handle_actions(Actions, StateData),
-            StateData#data{handler_state = HState1};
+            handle_actions(Actions, StateData#data{handler_state = HState1});
         {stop, _Reason, HState1} ->
             StateData#data{handler_state = HState1}
     end.
 
 handle_remote_stream_opened(StreamId, Type, #data{streams = Streams} = StateData) ->
-    Stream = webtransport_stream:new(StreamId, Type, ?DEFAULT_MAX_STREAM_DATA),
-    StateData#data{streams = Streams#{StreamId => Stream}}.
+    case maps:is_key(StreamId, Streams) of
+        true ->
+            StateData;
+        false ->
+            Stream = webtransport_stream:new(StreamId, Type, ?DEFAULT_MAX_STREAM_DATA),
+            StateData#data{streams = Streams#{StreamId => Stream}}
+    end.
 
 handle_remote_stream_closed(StreamId, Reason,
                              #data{streams = Streams, handler = Handler,
@@ -525,11 +533,49 @@ handle_remote_stream_closed(StreamId, Reason,
             StateData
     end.
 
-handle_actions([], _StateData) ->
-    ok;
+%% Execute handler-returned actions inline on the session's own state.
+%% Runs inside the gen_statem callback so we cannot round-trip through the
+%% public API — that would self-call and crash with `calling_self`.
+%% `drain_session` does NOT perform the {next_state, draining, ...} transition
+%% here; handlers that need to enter draining should do so via explicit
+%% {stop, Reason, _} or by driving webtransport:drain_session/1 off-process.
+handle_actions([], StateData) ->
+    StateData;
 handle_actions([Action | Rest], StateData) ->
-    webtransport_handler:execute_actions(self(), [Action]),
-    handle_actions(Rest, StateData).
+    handle_actions(Rest, dispatch_action(Action, StateData)).
+
+dispatch_action({send, Stream, Data}, StateData) ->
+    apply_do_result(do_send(Stream, iolist_to_binary(Data), false, StateData), StateData, {send, Stream});
+dispatch_action({send, Stream, Data, fin}, StateData) ->
+    apply_do_result(do_send(Stream, iolist_to_binary(Data), true, StateData), StateData, {send, Stream, fin});
+dispatch_action({send_datagram, Data}, StateData) ->
+    apply_do_result(do_send_datagram(iolist_to_binary(Data), StateData), StateData, send_datagram);
+dispatch_action({open_stream, Type}, StateData) ->
+    case do_open_stream(Type, StateData) of
+        {ok, _StreamId, StateData1} -> StateData1;
+        {error, Reason} -> warn_action({open_stream, Type}, Reason), StateData
+    end;
+dispatch_action({close_stream, Stream}, StateData) ->
+    apply_do_result(do_close_stream(Stream, StateData), StateData, {close_stream, Stream});
+dispatch_action({reset_stream, Stream, Code}, StateData) ->
+    apply_do_result(do_reset_stream(Stream, Code, StateData), StateData, {reset_stream, Stream});
+dispatch_action({stop_sending, Stream, Code}, StateData) ->
+    apply_do_result(do_stop_sending(Stream, Code, StateData), StateData, {stop_sending, Stream});
+dispatch_action(drain_session, StateData) ->
+    do_drain(StateData),
+    StateData;
+dispatch_action({close_session, ErrorCode, Reason}, StateData) ->
+    do_close(ErrorCode, Reason, StateData),
+    StateData#data{close_info = {ErrorCode, Reason}}.
+
+apply_do_result({ok, StateData1}, _OldState, _Action) ->
+    StateData1;
+apply_do_result({error, Reason}, OldState, Action) ->
+    warn_action(Action, Reason),
+    OldState.
+
+warn_action(Action, Reason) ->
+    logger:warning("webtransport action ~p failed: ~p", [Action, Reason]).
 
 %% Transport abstraction
 transport_send(StreamId, Data, Fin, #data{transport = h2, transport_state = H2State}) ->

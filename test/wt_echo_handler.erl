@@ -21,12 +21,9 @@ init(Session, _Request) ->
 
 %% @doc Handle data on a stream - buffer until FIN.
 handle_stream(StreamId, Type, Data, #state{streams = Streams} = State) ->
-    %% Accumulate data
     Existing = maps:get(StreamId, Streams, <<>>),
     NewStreams = Streams#{StreamId => <<Existing/binary, Data/binary>>},
     State1 = State#state{streams = NewStreams},
-
-    %% For bidirectional streams, echo immediately
     case Type of
         bidi when Data =/= <<>> ->
             {ok, State1, [{send, StreamId, Data}]};
@@ -36,19 +33,14 @@ handle_stream(StreamId, Type, Data, #state{streams = Streams} = State) ->
 
 %% @doc Handle FIN on a stream - send accumulated data back.
 handle_stream_fin(StreamId, Type, Data, #state{streams = Streams} = State) ->
-    %% Get all accumulated data including this final chunk
     Existing = maps:get(StreamId, Streams, <<>>),
     AllData = <<Existing/binary, Data/binary>>,
-
-    %% For unidirectional streams from client, we can't echo back on the same stream
-    %% For bidirectional streams, send FIN with remaining data
+    State1 = State#state{streams = maps:remove(StreamId, Streams)},
     case Type of
         bidi ->
-            Actions = [{send, StreamId, AllData, fin}],
-            {ok, State#state{streams = maps:remove(StreamId, Streams)}, Actions};
+            {ok, State1, [{send, StreamId, AllData, fin}]};
         uni ->
-            %% Can't echo on incoming uni stream, just acknowledge
-            {ok, State#state{streams = maps:remove(StreamId, Streams)}}
+            {ok, State1}
     end.
 
 %% @doc Handle datagram - echo it back.

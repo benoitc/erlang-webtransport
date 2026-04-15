@@ -5,8 +5,10 @@
 %%
 -module(webtransport_h3).
 
--export([new/2, with_peer_settings/2]).
--export([session_id/1, h3_conn/1, quic_conn/1, peer_settings/1]).
+-include("webtransport.hrl").
+
+-export([new/2, new/3, with_peer_settings/2, with_router/2]).
+-export([session_id/1, h3_conn/1, quic_conn/1, peer_settings/1, router/1]).
 -export([open_bidi_stream/1, open_uni_stream/1]).
 -export([send/4, send_datagram/2]).
 -export([close_session/3, drain_session/1]).
@@ -17,7 +19,8 @@
     h3_conn :: pid(),
     quic_conn :: pid(),
     session_id :: non_neg_integer(),
-    peer_settings = #{} :: map()
+    peer_settings = #{} :: map(),
+    router :: undefined | pid()
 }).
 
 -opaque state() :: #state{}.
@@ -30,6 +33,10 @@
 
 -spec new(pid(), non_neg_integer()) -> state().
 new(H3Conn, SessionId) ->
+    new(H3Conn, SessionId, undefined).
+
+-spec new(pid(), non_neg_integer(), undefined | pid()) -> state().
+new(H3Conn, SessionId, Router) ->
     QuicConn = quic_h3:get_quic_conn(H3Conn),
     PeerSettings =
         case quic_h3:get_peer_settings(H3Conn) of
@@ -40,12 +47,21 @@ new(H3Conn, SessionId) ->
         h3_conn = H3Conn,
         quic_conn = QuicConn,
         session_id = SessionId,
-        peer_settings = PeerSettings
+        peer_settings = PeerSettings,
+        router = Router
     }.
 
 -spec with_peer_settings(state(), map()) -> state().
 with_peer_settings(State, PeerSettings) ->
     State#state{peer_settings = PeerSettings}.
+
+-spec with_router(state(), undefined | pid()) -> state().
+with_router(State, Router) ->
+    State#state{router = Router}.
+
+-spec router(state()) -> undefined | pid().
+router(#state{router = Router}) ->
+    Router.
 
 -spec session_id(state()) -> non_neg_integer().
 session_id(#state{session_id = SessionId}) ->
@@ -73,16 +89,21 @@ peer_settings(#state{peer_settings = PeerSettings}) ->
 %% - Unidirectional streams: Stream Type 0x54 (varint) + Session ID (varint)
 
 -spec open_bidi_stream(state()) -> {ok, non_neg_integer(), state()} | {error, term()}.
-open_bidi_stream(#state{quic_conn = QuicConn, session_id = SessionId} = State) ->
-    case quic:open_stream(QuicConn) of
+open_bidi_stream(#state{router = Router, session_id = SessionId} = State) when is_pid(Router) ->
+    %% Route through the H3 router so stream_type_open for our own local open
+    %% is ignored (no varint-decode misparse on echoed data).
+    case webtransport_h3_router:open_bidi_stream(Router, SessionId) of
+        {ok, StreamId} -> {ok, StreamId, State};
+        {error, _} = Error -> Error
+    end;
+open_bidi_stream(#state{h3_conn = H3Conn, quic_conn = QuicConn, session_id = SessionId} = State) ->
+    %% No router (e.g., tests): fall back to direct quic_h3 + send.
+    case quic_h3:open_bidi_stream(H3Conn, ?WT_BIDI_SIGNAL) of
         {ok, StreamId} ->
-            %% Send WebTransport bidi stream header (session ID)
             Header = wt_h3_capsule:encode_bidi_stream_header(SessionId),
             case quic:send_data(QuicConn, StreamId, Header, false) of
-                ok ->
-                    {ok, StreamId, State};
-                {error, _} = Error ->
-                    Error
+                ok -> {ok, StreamId, State};
+                {error, _} = Error -> Error
             end;
         {error, _} = Error ->
             Error
@@ -92,13 +113,10 @@ open_bidi_stream(#state{quic_conn = QuicConn, session_id = SessionId} = State) -
 open_uni_stream(#state{quic_conn = QuicConn, session_id = SessionId} = State) ->
     case quic:open_unidirectional_stream(QuicConn) of
         {ok, StreamId} ->
-            %% Send WebTransport uni stream header (type 0x54 + session ID)
             Header = wt_h3_capsule:encode_uni_stream_header(SessionId),
             case quic:send_data(QuicConn, StreamId, Header, false) of
-                ok ->
-                    {ok, StreamId, State};
-                {error, _} = Error ->
-                    Error
+                ok -> {ok, StreamId, State};
+                {error, _} = Error -> Error
             end;
         {error, _} = Error ->
             Error

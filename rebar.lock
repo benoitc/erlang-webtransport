@@ -1,8 +1,8 @@
 [{<<"erlang_h2">>,
   {git,"https://github.com/benoitc/erlang_h2.git",
-       {ref,"65f3a750b94f3339c42210000d647af77c74086b"}},
+       {ref,"5bb306dbd2836c98a680d15c28957c4a2cc499dd"}},
   0},
  {<<"quic">>,
   {git,"https://github.com/benoitc/erlang_quic.git",
-       {ref,"ae65cd08e8dfd0b04fbea678424156cd80e0e904"}},
+       {ref,"1121d62ac4769b12e565c0326282f71f9785834f"}},
   0}].

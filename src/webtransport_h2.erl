@@ -77,8 +77,7 @@ connect(Host, Port, Path, Opts) ->
     HostBin = if is_list(Host) -> list_to_binary(Host); true -> Host end,
     SSLOpts = maps:get(ssl_opts, Opts, []),
     H2Opts = #{
-        ssl_opts => [{alpn_advertised_protocols, [<<"h2">>]} | SSLOpts],
-        settings => #{enable_connect_protocol => 1}
+        ssl_opts => [{alpn_advertised_protocols, [<<"h2">>]} | SSLOpts]
     },
     case h2:connect(Host, Port, H2Opts) of
         {ok, H2Conn} ->
@@ -118,11 +117,13 @@ request_headers(Authority, Path) ->
 
 -spec request_headers(binary(), binary(), [{binary(), binary()}]) -> [{binary(), binary()}].
 request_headers(Authority, Path, ExtraHeaders) ->
+    %% h2_connection derives :authority from the "host" header and rejects
+    %% duplicate :authority pseudo-headers, so we only send "host" here.
     BaseHeaders = [
         {<<":protocol">>, <<"webtransport">>},
         {<<":scheme">>, <<"https">>},
-        {<<":authority">>, Authority},
-        {<<":path">>, Path}
+        {<<":path">>, Path},
+        {<<"host">>, Authority}
     ],
     BaseHeaders ++ strip_reserved_headers(ExtraHeaders).
 
@@ -238,7 +239,8 @@ extract_peer_settings(State, Headers) ->
 request_headers_test() ->
     Headers = request_headers(<<"example.com:443">>, <<"/wt">>),
     ?assertEqual({<<":protocol">>, <<"webtransport">>}, lists:nth(1, Headers)),
-    ?assertEqual({<<":authority">>, <<"example.com:443">>}, lists:nth(3, Headers)).
+    ?assertEqual({<<"host">>, <<"example.com:443">>},
+                 lists:keyfind(<<"host">>, 1, Headers)).
 
 strip_reserved_headers_test() ->
     Input = [

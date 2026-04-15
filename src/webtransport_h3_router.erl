@@ -13,6 +13,8 @@
 -export([register_session/3, unregister_session/2]).
 -export([client_connect/4]).
 -export([set_passthrough/2]).
+-export([open_bidi_stream/2]).
+-export([get_h3_conn/1]).
 
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
 
@@ -20,6 +22,10 @@
     sessions = #{} :: #{non_neg_integer() => pid()},
     monitors = #{} :: #{reference() => non_neg_integer()},
     pending = #{} :: #{non_neg_integer() => {bidi | uni, binary()}},
+    %% Streams opened locally (by us) — StreamId => SessionPid.
+    %% Data on these streams is delivered straight to the session, skipping
+    %% the session-id varint decode that peer-initiated streams go through.
+    local_streams = #{} :: #{non_neg_integer() => pid()},
     passthrough :: undefined | pid(),
     h3_conn :: undefined | pid(),
     h3_monitor :: undefined | reference()
@@ -60,6 +66,19 @@ unregister_session(Router, SessionId) ->
 client_connect(Router, Host, Port, H3Opts) ->
     gen_server:call(Router, {client_connect, Host, Port, H3Opts}, infinity).
 
+%% Atomically open a client-initiated WT bidi stream: pre-claim on quic_h3
+%% with the WT bidi signal, register the new StreamId against the session,
+%% send the session-id header, all before any inbound stream_type_* events
+%% on that stream can be processed from our mailbox.
+-spec open_bidi_stream(pid(), non_neg_integer()) ->
+    {ok, non_neg_integer()} | {error, term()}.
+open_bidi_stream(Router, SessionId) ->
+    gen_server:call(Router, {open_bidi_stream, SessionId}, infinity).
+
+-spec get_h3_conn(pid()) -> undefined | pid().
+get_h3_conn(Router) ->
+    gen_server:call(Router, get_h3_conn).
+
 %% ============================================================================
 %% gen_server callbacks
 %% ============================================================================
@@ -76,29 +95,25 @@ handle_call({register, SessionId, SessionPid}, _From, State) ->
 handle_call({unregister, SessionId}, _From, State) ->
     {reply, ok, drop_session(SessionId, State)};
 handle_call({client_connect, Host, Port, H3Opts}, _From, State) ->
-    {reply, quic_h3:connect(Host, Port, H3Opts), State};
+    case quic_h3:connect(Host, Port, H3Opts) of
+        {ok, H3Conn} = OK ->
+            Ref = erlang:monitor(process, H3Conn),
+            {reply, OK, State#state{h3_conn = H3Conn, h3_monitor = Ref}};
+        Err ->
+            {reply, Err, State}
+    end;
+handle_call({open_bidi_stream, SessionId}, _From, State) ->
+    do_open_local_bidi(SessionId, State);
+handle_call(get_h3_conn, _From, State) ->
+    {reply, State#state.h3_conn, State};
 handle_call({set_passthrough, Pid}, _From, State) ->
     {reply, ok, State#state{passthrough = Pid}}.
 
 handle_cast(_Msg, State) ->
     {noreply, State}.
 
-handle_info({quic_h3, Conn, {stream_type_open, Direction, StreamId, _Type}}, State0) ->
-    State = ensure_h3_monitor(Conn, State0),
-    Pending = (State#state.pending)#{StreamId => {Direction, <<>>}},
-    {noreply, State#state{pending = Pending}};
-handle_info({quic_h3, Conn, {stream_type_data, _Direction, StreamId, Data, Fin}}, State0) ->
-    State = ensure_h3_monitor(Conn, State0),
-    {noreply, route_stream_data(StreamId, Data, Fin, State)};
-handle_info({quic_h3, _Conn, {stream_type_closed, _Direction, StreamId}}, State) ->
-    {noreply, route_stream_closed(StreamId, normal, State)};
-handle_info({quic_h3, _Conn, {stream_type_reset, _Direction, StreamId, ErrorCode}}, State) ->
-    {noreply, route_stream_closed(StreamId, {reset, ErrorCode}, State)};
-handle_info({quic_h3, _Conn, {stream_type_stop_sending, _Direction, StreamId, ErrorCode}}, State) ->
-    {noreply, route_stream_closed(StreamId, {stop_sending, ErrorCode}, State)};
-handle_info({quic_h3, Conn, {datagram, StreamId, Payload}}, State0) ->
-    State = ensure_h3_monitor(Conn, State0),
-    {noreply, route_datagram(StreamId, Payload, State)};
+handle_info({quic_h3, _, _} = Msg, State) ->
+    handle_quic_h3(Msg, State);
 handle_info({'DOWN', Ref, process, _Pid, _Reason}, #state{h3_monitor = Ref} = State) ->
     {stop, normal, State};
 handle_info({'DOWN', Ref, process, _Pid, _Reason}, #state{monitors = Monitors} = State) ->
@@ -108,10 +123,34 @@ handle_info({'DOWN', Ref, process, _Pid, _Reason}, #state{monitors = Monitors} =
         error ->
             {noreply, State}
     end;
-handle_info({quic_h3, _, _} = Msg, #state{passthrough = Pid} = State) when is_pid(Pid) ->
+handle_info(_Msg, State) ->
+    {noreply, State}.
+
+handle_quic_h3({quic_h3, Conn, {stream_type_open, Direction, StreamId, _Type}}, State0) ->
+    State = ensure_h3_monitor(Conn, State0),
+    case maps:is_key(StreamId, State#state.local_streams) of
+        true ->
+            {noreply, State};
+        false ->
+            Pending = (State#state.pending)#{StreamId => {Direction, <<>>}},
+            {noreply, State#state{pending = Pending}}
+    end;
+handle_quic_h3({quic_h3, Conn, {stream_type_data, _Direction, StreamId, Data, Fin}}, State0) ->
+    State = ensure_h3_monitor(Conn, State0),
+    {noreply, route_stream_data(StreamId, Data, Fin, State)};
+handle_quic_h3({quic_h3, _Conn, {stream_type_closed, _Direction, StreamId}}, State) ->
+    {noreply, route_stream_closed(StreamId, normal, State)};
+handle_quic_h3({quic_h3, _Conn, {stream_type_reset, _Direction, StreamId, ErrorCode}}, State) ->
+    {noreply, route_stream_closed(StreamId, {reset, ErrorCode}, State)};
+handle_quic_h3({quic_h3, _Conn, {stream_type_stop_sending, _Direction, StreamId, ErrorCode}}, State) ->
+    {noreply, route_stream_closed(StreamId, {stop_sending, ErrorCode}, State)};
+handle_quic_h3({quic_h3, Conn, {datagram, StreamId, Payload}}, State0) ->
+    State = ensure_h3_monitor(Conn, State0),
+    {noreply, route_datagram(StreamId, Payload, State)};
+handle_quic_h3({quic_h3, _, _} = Msg, #state{passthrough = Pid} = State) when is_pid(Pid) ->
     Pid ! Msg,
     {noreply, State};
-handle_info(_Msg, State) ->
+handle_quic_h3(_Msg, State) ->
     {noreply, State}.
 
 terminate(_Reason, _State) ->
@@ -127,7 +166,40 @@ ensure_h3_monitor(Conn, #state{h3_conn = undefined} = State) ->
 ensure_h3_monitor(_Conn, State) ->
     State.
 
-route_stream_data(StreamId, Data, Fin, #state{pending = Pending} = State) ->
+do_open_local_bidi(SessionId, State) ->
+    case maps:find(SessionId, State#state.sessions) of
+        {ok, SessionPid} ->
+            case State#state.h3_conn of
+                undefined ->
+                    {reply, {error, no_h3_conn}, State};
+                H3Conn ->
+                    case quic_h3:open_bidi_stream(H3Conn, ?WT_BIDI_SIGNAL) of
+                        {ok, StreamId} ->
+                            Header = wt_h3_capsule:encode_bidi_stream_header(SessionId),
+                            QuicConn = quic_h3:get_quic_conn(H3Conn),
+                            _ = quic:send_data(QuicConn, StreamId, Header, false),
+                            Local = (State#state.local_streams)#{StreamId => SessionPid},
+                            State1 = ensure_h3_monitor(H3Conn, State),
+                            {reply, {ok, StreamId},
+                             State1#state{local_streams = Local}};
+                        {error, _} = Err ->
+                            {reply, Err, State}
+                    end
+            end;
+        error ->
+            {reply, {error, unknown_session}, State}
+    end.
+
+route_stream_data(StreamId, Data, Fin, #state{local_streams = Local} = State) ->
+    case maps:find(StreamId, Local) of
+        {ok, Session} ->
+            webtransport_session:handle_stream_data(Session, StreamId, Data, Fin),
+            State;
+        error ->
+            route_peer_stream_data(StreamId, Data, Fin, State)
+    end.
+
+route_peer_stream_data(StreamId, Data, Fin, #state{pending = Pending} = State) ->
     case maps:find(StreamId, Pending) of
         {ok, {Direction, Buffered}} ->
             Combined = <<Buffered/binary, Data/binary>>,
@@ -177,7 +249,10 @@ route_stream_closed(StreamId, Reason, State) ->
         error ->
             ok
     end,
-    State#state{pending = maps:remove(StreamId, State#state.pending)}.
+    State#state{
+        pending = maps:remove(StreamId, State#state.pending),
+        local_streams = maps:remove(StreamId, State#state.local_streams)
+    }.
 
 route_datagram(QuarterOrStreamId, Payload, State) ->
     %% quic_h3 already strips the quarter-stream-id varint and gives us the
@@ -191,9 +266,15 @@ route_datagram(QuarterOrStreamId, Payload, State) ->
     end,
     State.
 
-find_session_for_stream(_StreamId, #state{sessions = Sessions}) when map_size(Sessions) =:= 0 ->
+find_session_for_stream(StreamId, #state{local_streams = Local} = State) ->
+    case maps:find(StreamId, Local) of
+        {ok, _} = Found -> Found;
+        error -> find_session_for_peer_stream(StreamId, State)
+    end.
+
+find_session_for_peer_stream(_StreamId, #state{sessions = Sessions}) when map_size(Sessions) =:= 0 ->
     error;
-find_session_for_stream(StreamId, #state{sessions = Sessions}) ->
+find_session_for_peer_stream(StreamId, #state{sessions = Sessions}) ->
     %% A native WT stream id is always > the session-id of the CONNECT
     %% stream that opened it, and below the next session's CONNECT id.
     %% With one session per H3 connection (the common case) this is a

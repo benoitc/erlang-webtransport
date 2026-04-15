@@ -10,7 +10,7 @@
 -module(webtransport_client_handler).
 -behaviour(webtransport_handler).
 
--export([init/2, handle_stream/4, handle_stream_fin/4]).
+-export([init/2, init/3, handle_stream/4, handle_stream_fin/4]).
 -export([handle_datagram/2, handle_stream_closed/3, terminate/2]).
 
 -record(state, {
@@ -18,8 +18,12 @@
     session :: webtransport:session()
 }).
 
-init(Session, _Req) ->
-    {ok, #state{owner = self(), session = Session}}.
+init(Session, Req) ->
+    init(Session, Req, #{}).
+
+init(Session, _Req, Opts) ->
+    Owner = maps:get(owner, Opts, self()),
+    {ok, #state{owner = Owner, session = Session}}.
 
 handle_stream(StreamId, Type, Data, #state{owner = Owner, session = Session} = State) ->
     Owner ! {webtransport, Session, {stream, StreamId, Type, Data}},
