@@ -73,7 +73,10 @@ streams_blocked_uni(Limit) ->
 close_session(ErrorCode) ->
     {close_session, ErrorCode, <<>>}.
 
--spec close_session(non_neg_integer(), binary()) -> capsule().
+%% draft-15 §5: the Reason field MUST be at most 1024 UTF-8 bytes.
+-spec close_session(non_neg_integer(), binary()) -> capsule() | {error, reason_too_long}.
+close_session(_ErrorCode, Reason) when byte_size(Reason) > 1024 ->
+    {error, reason_too_long};
 close_session(ErrorCode, Reason) ->
     {close_session, ErrorCode, Reason}.
 
@@ -136,8 +139,12 @@ decode_payload(?WT_STREAMS_BLOCKED_UNI, Payload) ->
     decode_limit(streams_blocked_uni, Payload);
 decode_payload(?WT_CLOSE_SESSION_H3, Payload) ->
     case h2_varint:decode(Payload) of
-        {ok, ErrorCode, Reason} -> {ok, {close_session, ErrorCode, Reason}};
-        {error, _} = Err -> Err
+        {ok, _ErrorCode, Reason} when byte_size(Reason) > 1024 ->
+            {error, reason_too_long};
+        {ok, ErrorCode, Reason} ->
+            {ok, {close_session, ErrorCode, Reason}};
+        {error, _} = Err ->
+            Err
     end;
 decode_payload(?WT_DRAIN_SESSION_H3, <<>>) ->
     {ok, {drain_session}};
@@ -286,5 +293,18 @@ datagram_roundtrip_test() ->
 
 invalid_session_id_test() ->
     ?assertError({invalid_session_id, 3}, encode_bidi_stream_header(3)).
+
+close_session_reason_length_test_() ->
+    Boundary = binary:copy(<<"x">>, 1024),
+    TooLong = <<Boundary/binary, "!">>,
+    [
+        ?_assertMatch({close_session, 1, _}, close_session(1, Boundary)),
+        ?_assertEqual({error, reason_too_long}, close_session(1, TooLong))
+    ].
+
+close_session_decode_reason_too_long_test() ->
+    Payload = <<(h2_varint:encode(7))/binary, (binary:copy(<<"z">>, 2048))/binary>>,
+    Encoded = h2_capsule:encode(?WT_CLOSE_SESSION_H3, Payload),
+    ?assertEqual({error, reason_too_long}, decode(Encoded)).
 
 -endif.

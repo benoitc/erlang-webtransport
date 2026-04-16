@@ -120,7 +120,10 @@ streams_blocked_uni(Limit) ->
 close_session(ErrorCode) ->
     {close_session, ErrorCode, <<>>}.
 
--spec close_session(error_code(), binary()) -> capsule().
+%% draft-14 §4.6: the Reason field MUST be at most 1024 UTF-8 bytes.
+-spec close_session(error_code(), binary()) -> capsule() | {error, reason_too_long}.
+close_session(_ErrorCode, Reason) when byte_size(Reason) > 1024 ->
+    {error, reason_too_long};
 close_session(ErrorCode, Reason) ->
     {close_session, ErrorCode, Reason}.
 
@@ -317,8 +320,12 @@ decode_payload(?WT_STREAMS_BLOCKED_UNI, Payload) ->
 
 decode_payload(?WT_CLOSE_SESSION, Payload) ->
     case h2_varint:decode(Payload) of
-        {ok, ErrorCode, Reason} -> {ok, {close_session, ErrorCode, Reason}};
-        {error, _} = Err -> Err
+        {ok, _ErrorCode, Reason} when byte_size(Reason) > 1024 ->
+            {error, reason_too_long};
+        {ok, ErrorCode, Reason} ->
+            {ok, {close_session, ErrorCode, Reason}};
+        {error, _} = Err ->
+            Err
     end;
 
 decode_payload(?WT_DRAIN_SESSION, <<>>) ->

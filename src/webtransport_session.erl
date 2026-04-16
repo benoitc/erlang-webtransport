@@ -254,7 +254,7 @@ open({call, From}, get_info, StateData) ->
 
 open(cast, {capsule, Capsule}, StateData) ->
     StateData1 = handle_incoming_capsule(Capsule, StateData),
-    {keep_state, StateData1};
+    apply_capsule_transition(Capsule, StateData1);
 
 open(cast, {stream_data, StreamId, Data, Fin}, StateData) ->
     {StateData1, Transition} = handle_incoming_stream_data(StreamId, Data, Fin, StateData),
@@ -280,6 +280,27 @@ open(cast, {close, ErrorCode, Reason}, StateData) ->
     do_close(ErrorCode, Reason, StateData),
     {stop, normal, StateData#data{close_info = {ErrorCode, Reason}}};
 
+%% On h3 the CONNECT stream is registered with quic_h3:set_stream_handler,
+%% so session-management capsules (CLOSE_SESSION, DRAIN_SESSION) arrive as
+%% raw bytes in `{quic_h3, _, {data, StreamId, Data, Fin}}'. Decode and
+%% dispatch them through the same handle_incoming_capsule path as h2.
+open(info, {quic_h3, _Conn, {data, StreamId, Data, _Fin}},
+     #data{transport = h3, transport_state = H3State} = StateData) ->
+    %% draft-15 §5: session-management capsules ride the CONNECT stream.
+    %% Decode and dispatch like the h2 capsule path; non-CONNECT streams
+    %% are handled by the h3 router and never reach us here.
+    case webtransport_h3:session_id(H3State) of
+        StreamId ->
+            case wt_h3_capsule:decode_all(Data) of
+                {ok, Capsules, _} ->
+                    apply_capsule_list(Capsules, StateData);
+                {error, _} ->
+                    {keep_state, StateData}
+            end;
+        _ ->
+            {keep_state, StateData}
+    end;
+
 open(info, Msg, #data{handler = Handler, handler_state = HState} = StateData) ->
     case erlang:function_exported(Handler, handle_info, 2) of
         true ->
@@ -296,6 +317,17 @@ open(info, Msg, #data{handler = Handler, handler_state = HState} = StateData) ->
             {keep_state, StateData}
     end.
 
+apply_capsule_list([], StateData) ->
+    {keep_state, StateData};
+apply_capsule_list([Capsule | Rest], StateData) ->
+    StateData1 = handle_incoming_capsule(Capsule, StateData),
+    case apply_capsule_transition(Capsule, StateData1) of
+        {keep_state, StateData2} ->
+            apply_capsule_list(Rest, StateData2);
+        Stop ->
+            Stop
+    end.
+
 %% Translate a `handle_actions' transition into a gen_statem return while
 %% in the `open' state.
 open_apply_transition(continue, StateData) ->
@@ -304,6 +336,16 @@ open_apply_transition(drain, StateData) ->
     {next_state, draining, StateData};
 open_apply_transition({stop, Reason}, StateData) ->
     {stop, Reason, StateData}.
+
+%% Peer-sent control capsules influence the state machine.
+%% draft-14 §4.6 / draft-15 §5: CLOSE_SESSION is terminal.
+%% draft-14 §4.7 / draft-15 §5.1: DRAIN_SESSION moves us to draining.
+apply_capsule_transition({close_session, _Code, _Reason}, StateData) ->
+    {stop, normal, StateData};
+apply_capsule_transition({drain_session}, StateData) ->
+    {next_state, draining, StateData};
+apply_capsule_transition(_Capsule, StateData) ->
+    {keep_state, StateData}.
 
 %% Connecting state (for client sessions)
 connecting({call, From}, _, StateData) ->
@@ -354,9 +396,16 @@ draining_apply_transition({stop, Reason}, StateData) ->
 draining_apply_transition(_Transition, StateData) ->
     maybe_stop_if_drained(StateData, []).
 
-terminate(Reason, _State, #data{handler = Handler, handler_state = HState}) ->
-    Handler:terminate(Reason, HState),
+terminate(Reason, _State, #data{handler = Handler, handler_state = HState,
+                                close_info = CloseInfo}) ->
+    %% Surface close_info to the handler so it can distinguish a clean
+    %% local/remote close (with error code + reason) from an abnormal exit.
+    Handler:terminate(augment_reason(Reason, CloseInfo), HState),
     ok.
+
+augment_reason(Reason, undefined) -> Reason;
+augment_reason(normal, {Code, Msg}) -> {closed, Code, Msg};
+augment_reason(Reason, {Code, Msg}) -> {Reason, {closed, Code, Msg}}.
 
 %% ============================================================================
 %% Internal functions
@@ -784,8 +833,9 @@ maybe_stop_if_drained(#data{streams = Streams} = StateData, Actions) ->
 build_info(#data{transport = Transport, streams = Streams,
                   local_max_data = LocalMaxData, remote_max_data = RemoteMaxData,
                   local_max_streams_bidi = LocalMaxBidi, local_max_streams_uni = LocalMaxUni,
-                  remote_max_streams_bidi = RemoteMaxBidi, remote_max_streams_uni = RemoteMaxUni}) ->
-    #{
+                  remote_max_streams_bidi = RemoteMaxBidi, remote_max_streams_uni = RemoteMaxUni,
+                  bytes_sent = Sent, bytes_received = Received, close_info = Close}) ->
+    Base = #{
         transport => Transport,
         stream_count => maps:size(Streams),
         local_max_data => LocalMaxData,
@@ -793,8 +843,14 @@ build_info(#data{transport = Transport, streams = Streams,
         local_max_streams_bidi => LocalMaxBidi,
         local_max_streams_uni => LocalMaxUni,
         remote_max_streams_bidi => RemoteMaxBidi,
-        remote_max_streams_uni => RemoteMaxUni
-    }.
+        remote_max_streams_uni => RemoteMaxUni,
+        bytes_sent => Sent,
+        bytes_received => Received
+    },
+    case Close of
+        undefined -> Base;
+        _ -> Base#{close_info => Close}
+    end.
 
 %% ============================================================================
 %% Eunit (internal helpers)
@@ -845,5 +901,31 @@ handle_incoming_capsule_stop_sending_test() ->
     #{4 := Stream1} = Data1#data.streams,
     ?assertNot(webtransport_stream:is_writable(Stream1)),
     ok.
+
+augment_reason_test_() ->
+    [
+        ?_assertEqual(normal, augment_reason(normal, undefined)),
+        ?_assertEqual(shutdown, augment_reason(shutdown, undefined)),
+        ?_assertEqual({closed, 7, <<"bye">>},
+                      augment_reason(normal, {7, <<"bye">>})),
+        ?_assertEqual({{shutdown, x}, {closed, 0, <<>>}},
+                      augment_reason({shutdown, x}, {0, <<>>}))
+    ].
+
+apply_capsule_transition_test_() ->
+    Data = #data{streams = #{}, transport = h2,
+                 remote_max_data = 0, remote_max_streams_bidi = 0,
+                 remote_max_streams_uni = 0, local_max_data = 0,
+                 local_max_streams_bidi = 0, local_max_streams_uni = 0,
+                 is_server = false, next_bidi_id = 0, next_uni_id = 2,
+                 request = #{}, handler = undefined, handler_state = undefined},
+    [
+        ?_assertMatch({stop, normal, _},
+                      apply_capsule_transition({close_session, 1, <<>>}, Data)),
+        ?_assertMatch({next_state, draining, _},
+                      apply_capsule_transition({drain_session}, Data)),
+        ?_assertMatch({keep_state, _},
+                      apply_capsule_transition({max_data, 1000}, Data))
+    ].
 
 -endif.

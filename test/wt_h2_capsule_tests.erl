@@ -4,6 +4,20 @@
 -include_lib("eunit/include/eunit.hrl").
 -include("webtransport.hrl").
 
+close_session_reason_length_test_() ->
+    Boundary = binary:copy(<<"x">>, 1024),
+    TooLong = <<Boundary/binary, "!">>,
+    [
+        ?_assertMatch({close_session, 1, _}, wt_h2_capsule:close_session(1, Boundary)),
+        ?_assertEqual({error, reason_too_long}, wt_h2_capsule:close_session(1, TooLong))
+    ].
+
+close_session_reason_decode_too_long_test() ->
+    %% Manually craft a close_session capsule with 2048 bytes of reason.
+    Payload = <<(h2_varint:encode(1))/binary, (binary:copy(<<"y">>, 2048))/binary>>,
+    Encoded = h2_capsule:encode(?WT_CLOSE_SESSION, Payload),
+    ?assertEqual({error, reason_too_long}, wt_h2_capsule:decode(Encoded)).
+
 roundtrip_test_() ->
     Capsules = [
         wt_h2_capsule:padding(10),

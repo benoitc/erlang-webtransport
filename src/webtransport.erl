@@ -264,7 +264,10 @@ close_session(Session, ErrorCode) ->
     close_session(Session, ErrorCode, <<>>).
 
 %% @doc Close the session with an error code and reason.
--spec close_session(session(), non_neg_integer(), binary()) -> ok.
+%% draft-14 §4.6 / draft-15 §5: Reason must be at most 1024 UTF-8 bytes.
+-spec close_session(session(), non_neg_integer(), binary()) -> ok | {error, reason_too_long}.
+close_session(_Session, _ErrorCode, Reason) when byte_size(Reason) > 1024 ->
+    {error, reason_too_long};
 close_session(Session, ErrorCode, Reason) ->
     webtransport_session:close(Session, ErrorCode, Reason).
 

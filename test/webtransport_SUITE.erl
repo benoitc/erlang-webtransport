@@ -54,7 +54,8 @@
     datagram_oversize_test/1,
     datagram_boundary_test/1,
     bidi_round_trip_test/1,
-    server_initiated_bidi_test/1
+    server_initiated_bidi_test/1,
+    close_session_reason_too_long_test/1
 ]).
 
 %% ============================================================================
@@ -69,6 +70,7 @@ all() ->
 
 groups() ->
     Cases = [
+        close_session_reason_too_long_test,
         connect_disconnect_test,
         session_info_test,
         open_bidi_stream_test,
@@ -715,6 +717,22 @@ wait_for_pushed_bidi(Session, ClientStreamId, Acc, Timeout) ->
         error({no_pushed_bidi, Acc})
     end.
 
+%% Reason strings over 1024 bytes must be refused at the public API,
+%% matching draft-14 §4.6 and draft-15 §5.
+close_session_reason_too_long_test(Config) ->
+    Port = proplists:get_value(port, Config),
+    {ok, Session} = webtransport:connect("localhost", Port, <<"/test">>, #{
+        transport => proplists:get_value(transport, Config),
+        verify => verify_none
+    }),
+    Too = binary:copy(<<"x">>, 1025),
+    ?assertEqual({error, reason_too_long},
+                 webtransport:close_session(Session, 1, Too)),
+    ?assert(is_process_alive(Session)),
+    ok = webtransport:close_session(Session).
+
+%% The handler's terminate/2 must receive the close code + reason when the
+%% session closes with an error instead of a bare `normal'.
 collect_stream_echo(Session, StreamId, Acc, Timeout) ->
     receive
         {webtransport, Session, {stream, StreamId, _Type, Data}} ->
