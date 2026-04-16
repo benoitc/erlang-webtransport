@@ -55,7 +55,8 @@
     datagram_boundary_test/1,
     bidi_round_trip_test/1,
     server_initiated_bidi_test/1,
-    close_session_reason_too_long_test/1
+    close_session_reason_too_long_test/1,
+    origin_check_reject_test/1
 ]).
 
 %% ============================================================================
@@ -71,6 +72,7 @@ all() ->
 groups() ->
     Cases = [
         close_session_reason_too_long_test,
+        origin_check_reject_test,
         connect_disconnect_test,
         session_info_test,
         open_bidi_stream_test,
@@ -733,6 +735,37 @@ close_session_reason_too_long_test(Config) ->
 
 %% The handler's terminate/2 must receive the close code + reason when the
 %% session closes with an error instead of a bare `normal'.
+%% A handler exporting origin_check/2 can refuse the session before
+%% init/3 runs. The client receives the rejection status and must not
+%% observe a running session.
+origin_check_reject_test(Config) ->
+    process_flag(trap_exit, true),
+    Transport = proplists:get_value(transport, Config),
+    CertFile = proplists:get_value(certfile, Config),
+    KeyFile = proplists:get_value(keyfile, Config),
+    Port = test_helpers:find_free_port(),
+    Name = list_to_atom("reject_listener_" ++ atom_to_list(Transport)),
+    {ok, _} = webtransport:start_listener(Name, #{
+        transport => Transport,
+        port => Port,
+        certfile => CertFile,
+        keyfile => KeyFile,
+        handler => wt_origin_reject_handler
+    }),
+    try
+        timer:sleep(100),
+        Res = webtransport:connect("localhost", Port, <<"/test">>, #{
+            transport => Transport,
+            verify => verify_none
+        }),
+        ?assertMatch({error, _}, Res)
+    after
+        webtransport:stop_listener(Name),
+        timer:sleep(100),
+        flush_exits(),
+        process_flag(trap_exit, false)
+    end.
+
 collect_stream_echo(Session, StreamId, Acc, Timeout) ->
     receive
         {webtransport, Session, {stream, StreamId, _Type, Data}} ->

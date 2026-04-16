@@ -110,11 +110,21 @@
     Reason :: normal | {error, term()} | term(),
     State :: term().
 
+%% Optional pre-session origin / request filter. Invoked before
+%% `init/3' is called on the accepted CONNECT request; returning
+%% `{reject, Status, Reason}' causes the server to respond with the
+%% given HTTP status (403, 404, or similar) instead of accepting the
+%% session. Defaults to accept when not exported.
+-callback origin_check(Headers, Opts) -> Result when
+    Headers :: [{binary(), binary()}],
+    Opts :: map(),
+    Result :: accept | {reject, Status :: 400..599, Reason :: binary()}.
+
 %% Optional callbacks. `init/3' is preferred; `init/2' is a back-compat
 %% shim that only gets called when the handler module does not export
 %% `init/3'.
 -optional_callbacks([init/2, init/3, handle_stream_fin/4, handle_info/2,
-                     handle_action_failed/3]).
+                     handle_action_failed/3, origin_check/2]).
 
 %% Types
 -type action() ::
