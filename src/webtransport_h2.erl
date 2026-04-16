@@ -20,6 +20,7 @@
 -export([open_stream/3]).
 -export([send/4, send_datagram/2]).
 -export([close_session/3, drain_session/1]).
+-export([send_capsule/2]).
 -export([reset_stream/3, stop_sending/3]).
 -export([decode_capsule/1, decode_capsules/1]).
 
@@ -191,6 +192,13 @@ reset_stream(#state{h2_conn = H2Conn, connect_stream_id = ConnectStreamId}, Stre
 -spec stop_sending(state(), non_neg_integer(), non_neg_integer()) -> ok | {error, term()}.
 stop_sending(#state{h2_conn = H2Conn, connect_stream_id = ConnectStreamId}, StreamId, ErrorCode) ->
     Capsule = wt_h2_capsule:stop_sending(StreamId, ErrorCode),
+    h2:send_data(H2Conn, ConnectStreamId, wt_h2_capsule:encode(Capsule), false).
+
+%% Write an already-constructed capsule on the CONNECT stream. Used by the
+%% session to emit flow-control signalling (WT_DATA_BLOCKED etc.) without
+%% each call site having to know the h2 connection / stream id pair.
+-spec send_capsule(state(), wt_h2_capsule:capsule()) -> ok | {error, term()}.
+send_capsule(#state{h2_conn = H2Conn, connect_stream_id = ConnectStreamId}, Capsule) ->
     h2:send_data(H2Conn, ConnectStreamId, wt_h2_capsule:encode(Capsule), false).
 
 %% ============================================================================

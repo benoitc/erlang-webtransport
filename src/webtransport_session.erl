@@ -362,27 +362,61 @@ terminate(Reason, _State, #data{handler = Handler, handler_state = HState}) ->
 %% Internal functions
 %% ============================================================================
 
-do_send(StreamId, Data, Fin, #data{streams = Streams} = StateData) ->
+do_send(StreamId, Data, Fin,
+        #data{streams = Streams, transport = Transport,
+              bytes_sent = SessSent, remote_max_data = SessMax} = StateData) ->
     case maps:find(StreamId, Streams) of
         {ok, Stream} ->
-            case webtransport_stream:send(Stream, Data) of
-                {ok, ToSend, Stream1} ->
-                    %% Actually send the data
-                    ok = transport_send(StreamId, ToSend, Fin, StateData),
-                    Stream2 = case Fin of
-                        true ->
-                            {ok, S} = webtransport_stream:close_local(Stream1),
-                            S;
-                        false ->
-                            Stream1
-                    end,
-                    {ok, StateData#data{streams = Streams#{StreamId => Stream2}}};
-                {error, _} = Err ->
-                    Err
+            DataSize = byte_size(Data),
+            case Transport =:= h2 andalso SessSent + DataSize > SessMax of
+                true ->
+                    %% draft-14 §6.1: peer would overrun session window.
+                    %% Signal backpressure before refusing.
+                    _ = emit_data_blocked(StateData, SessMax),
+                    {error, flow_control_blocked};
+                false ->
+                    case webtransport_stream:send(Stream, Data) of
+                        {ok, ToSend, Stream1} ->
+                            maybe_emit_stream_data_blocked(Transport, StreamId, Stream1, StateData),
+                            ok = transport_send(StreamId, ToSend, Fin, StateData),
+                            Stream2 = case Fin of
+                                          true ->
+                                              {ok, S} = webtransport_stream:close_local(Stream1),
+                                              S;
+                                          false ->
+                                              Stream1
+                                      end,
+                            {ok, StateData#data{
+                                   streams = Streams#{StreamId => Stream2},
+                                   bytes_sent = SessSent + byte_size(ToSend)}};
+                        {error, _} = Err ->
+                            Err
+                    end
             end;
         error ->
             {error, unknown_stream}
     end.
+
+%% h2 peers learn about local backpressure via DATA_BLOCKED / STREAM_DATA_BLOCKED
+%% capsules. h3 uses native QUIC flow control; the drafts don't define these
+%% capsules for h3, so we only emit on h2.
+emit_data_blocked(#data{transport = h2, transport_state = H2State}, Limit) ->
+    webtransport_h2:send_capsule(H2State, wt_h2_capsule:data_blocked(Limit));
+emit_data_blocked(_StateData, _Limit) ->
+    ok.
+
+maybe_emit_stream_data_blocked(h2, StreamId, Stream, #data{transport_state = H2State}) ->
+    Window = webtransport_stream:send_window(Stream),
+    Sent = webtransport_stream:bytes_sent(Stream),
+    case Window - Sent of
+        0 ->
+            webtransport_h2:send_capsule(H2State,
+                                         wt_h2_capsule:stream_data_blocked(StreamId, Window));
+        _ ->
+            ok
+    end;
+maybe_emit_stream_data_blocked(_Transport, _StreamId, _Stream, _StateData) ->
+    ok.
 
 do_send_datagram(Data, StateData) ->
     case transport_send_datagram(Data, StateData) of
@@ -474,22 +508,69 @@ do_close(ErrorCode, Reason, #data{transport = h2, transport_state = H2State}) ->
 do_close(ErrorCode, Reason, #data{transport = h3, transport_state = H3State}) ->
     webtransport_h3:close_session(H3State, ErrorCode, Reason).
 
-handle_incoming_capsule({max_data, Limit}, #data{} = StateData) ->
-    StateData#data{remote_max_data = Limit};
-handle_incoming_capsule({max_streams_bidi, Limit}, #data{} = StateData) ->
-    StateData#data{remote_max_streams_bidi = Limit};
-handle_incoming_capsule({max_streams_uni, Limit}, #data{} = StateData) ->
-    StateData#data{remote_max_streams_uni = Limit};
+handle_incoming_capsule({max_data, Limit}, #data{remote_max_data = Prev} = StateData) ->
+    %% draft-14 §6.1: peer raises our session-wide send allowance.
+    StateData#data{remote_max_data = max(Prev, Limit)};
+handle_incoming_capsule({max_stream_data, StreamId, Limit},
+                        #data{streams = Streams} = StateData) ->
+    %% draft-14 §6.2: peer raises the per-stream send window.
+    case maps:find(StreamId, Streams) of
+        {ok, Stream} ->
+            Current = webtransport_stream:send_window(Stream),
+            Stream1 = webtransport_stream:update_send_window(Stream, max(Current, Limit)),
+            StateData#data{streams = Streams#{StreamId => Stream1}};
+        error ->
+            StateData
+    end;
+handle_incoming_capsule({max_streams_bidi, Limit}, #data{remote_max_streams_bidi = Prev} = StateData) ->
+    StateData#data{remote_max_streams_bidi = max(Prev, Limit)};
+handle_incoming_capsule({max_streams_uni, Limit}, #data{remote_max_streams_uni = Prev} = StateData) ->
+    StateData#data{remote_max_streams_uni = max(Prev, Limit)};
+handle_incoming_capsule({data_blocked, Limit}, StateData) ->
+    logger:debug("peer data_blocked at ~p", [Limit]),
+    StateData;
+handle_incoming_capsule({stream_data_blocked, StreamId, Limit}, StateData) ->
+    logger:debug("peer stream_data_blocked stream=~p limit=~p", [StreamId, Limit]),
+    StateData;
+handle_incoming_capsule({streams_blocked_bidi, Limit}, StateData) ->
+    logger:debug("peer streams_blocked_bidi at ~p", [Limit]),
+    StateData;
+handle_incoming_capsule({streams_blocked_uni, Limit}, StateData) ->
+    logger:debug("peer streams_blocked_uni at ~p", [Limit]),
+    StateData;
+handle_incoming_capsule({stop_sending, StreamId, ErrorCode},
+                        #data{streams = Streams} = StateData) ->
+    %% Peer asked us to stop sending on this stream: block our write side.
+    case maps:find(StreamId, Streams) of
+        {ok, Stream} ->
+            Stream1 = webtransport_stream:peer_stop_sending(Stream, ErrorCode),
+            StateData#data{streams = Streams#{StreamId => Stream1}};
+        error ->
+            StateData
+    end;
+handle_incoming_capsule({reset_stream, StreamId, ErrorCode},
+                        #data{streams = Streams} = StateData) ->
+    case maps:find(StreamId, Streams) of
+        {ok, Stream} ->
+            Stream1 = webtransport_stream:reset(Stream, ErrorCode),
+            StateData#data{streams = Streams#{StreamId => Stream1}};
+        error ->
+            StateData
+    end;
+handle_incoming_capsule({padding, _}, StateData) ->
+    StateData;
 handle_incoming_capsule({close_session, ErrorCode, Reason}, #data{} = StateData) ->
     StateData#data{close_info = {ErrorCode, Reason}};
 handle_incoming_capsule({drain_session}, #data{} = StateData) ->
     StateData;
-handle_incoming_capsule(_Capsule, StateData) ->
+handle_incoming_capsule(Unknown, StateData) ->
+    logger:warning("webtransport: dropping unknown capsule ~p", [Unknown]),
     StateData.
 
 handle_incoming_stream_data(StreamId, Data, Fin,
                              #data{streams = Streams, handler = Handler,
-                                   handler_state = HState} = StateData) ->
+                                   handler_state = HState,
+                                   bytes_received = SessRecv} = StateData) ->
     case maps:find(StreamId, Streams) of
         {ok, Stream} ->
             Type = webtransport_stream:type(Stream),
@@ -506,7 +587,8 @@ handle_incoming_stream_data(StreamId, Data, Fin,
                         true -> fun() -> Handler:handle_stream_fin(StreamId, Type, Data, HState) end;
                         false -> fun() -> Handler:handle_stream(StreamId, Type, Data, HState) end
                     end,
-                    apply_stream_callback(Callback(), StreamId, Stream2, Streams, StateData);
+                    StateData1 = StateData#data{bytes_received = SessRecv + byte_size(Data)},
+                    apply_stream_callback(Callback(), StreamId, Stream2, Streams, StateData1);
                 {error, _Reason} ->
                     {StateData, continue}
             end;
@@ -713,3 +795,55 @@ build_info(#data{transport = Transport, streams = Streams,
         remote_max_streams_bidi => RemoteMaxBidi,
         remote_max_streams_uni => RemoteMaxUni
     }.
+
+%% ============================================================================
+%% Eunit (internal helpers)
+%% ============================================================================
+
+-ifdef(TEST).
+-include_lib("eunit/include/eunit.hrl").
+
+handle_incoming_capsule_max_stream_data_test() ->
+    Stream = webtransport_stream:new(4, bidi, 1024),
+    Data = #data{streams = #{4 => Stream}, transport = h2,
+                 remote_max_data = 0, remote_max_streams_bidi = 0,
+                 remote_max_streams_uni = 0,
+                 local_max_data = 0, local_max_streams_bidi = 0,
+                 local_max_streams_uni = 0, is_server = false,
+                 next_bidi_id = 0, next_uni_id = 2,
+                 request = #{}, handler = undefined,
+                 handler_state = undefined},
+    Data1 = handle_incoming_capsule({max_stream_data, 4, 65536}, Data),
+    #{4 := Stream1} = Data1#data.streams,
+    ?assertEqual(65536, webtransport_stream:send_window(Stream1)),
+    %% Lower value is ignored (windows are monotonic).
+    Data2 = handle_incoming_capsule({max_stream_data, 4, 100}, Data1),
+    #{4 := Stream2} = Data2#data.streams,
+    ?assertEqual(65536, webtransport_stream:send_window(Stream2)),
+    ok.
+
+handle_incoming_capsule_max_data_monotonic_test() ->
+    Data = #data{streams = #{}, transport = h2,
+                 remote_max_data = 1000, remote_max_streams_bidi = 0,
+                 remote_max_streams_uni = 0, local_max_data = 0,
+                 local_max_streams_bidi = 0, local_max_streams_uni = 0,
+                 is_server = false, next_bidi_id = 0, next_uni_id = 2,
+                 request = #{}, handler = undefined, handler_state = undefined},
+    ?assertEqual(1000, (handle_incoming_capsule({max_data, 500}, Data))#data.remote_max_data),
+    ?assertEqual(2000, (handle_incoming_capsule({max_data, 2000}, Data))#data.remote_max_data),
+    ok.
+
+handle_incoming_capsule_stop_sending_test() ->
+    Stream = webtransport_stream:new(4, bidi, 1024),
+    Data = #data{streams = #{4 => Stream}, transport = h2,
+                 remote_max_data = 0, remote_max_streams_bidi = 0,
+                 remote_max_streams_uni = 0, local_max_data = 0,
+                 local_max_streams_bidi = 0, local_max_streams_uni = 0,
+                 is_server = false, next_bidi_id = 0, next_uni_id = 2,
+                 request = #{}, handler = undefined, handler_state = undefined},
+    Data1 = handle_incoming_capsule({stop_sending, 4, 42}, Data),
+    #{4 := Stream1} = Data1#data.streams,
+    ?assertNot(webtransport_stream:is_writable(Stream1)),
+    ok.
+
+-endif.

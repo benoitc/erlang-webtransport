@@ -559,16 +559,21 @@ h2_data_loop(Conn, StreamId, Session) ->
 dispatch_h2_capsule(Session, {wt_stream, WtStreamId, Data}) ->
     %% h2 multiplexes WT streams over CONNECT; peer-opened streams don't get
     %% a separate open signal, so we seed the session's stream map on first
-    %% data (handle_stream_opened is idempotent).
-    webtransport_session:handle_stream_opened(Session, WtStreamId, bidi),
+    %% data (handle_stream_opened is idempotent). Direction follows the QUIC
+    %% stream-id rule (bit 1 = 0 bidi, 1 = uni) per draft-14.
+    webtransport_session:handle_stream_opened(Session, WtStreamId,
+                                              webtransport_stream:stream_type(WtStreamId)),
     webtransport_session:handle_stream_data(Session, WtStreamId, Data, false);
 dispatch_h2_capsule(Session, {wt_stream_fin, WtStreamId, Data}) ->
-    webtransport_session:handle_stream_opened(Session, WtStreamId, bidi),
+    webtransport_session:handle_stream_opened(Session, WtStreamId,
+                                              webtransport_stream:stream_type(WtStreamId)),
     webtransport_session:handle_stream_data(Session, WtStreamId, Data, true);
 dispatch_h2_capsule(Session, {datagram, Data}) ->
     webtransport_session:handle_datagram_data(Session, Data);
 dispatch_h2_capsule(Session, {reset_stream, WtStreamId, ErrorCode}) ->
     webtransport_session:handle_stream_closed(Session, WtStreamId, {reset, ErrorCode});
+dispatch_h2_capsule(Session, {stop_sending, WtStreamId, ErrorCode}) ->
+    webtransport_session:handle_stream_closed(Session, WtStreamId, {stop_sending, ErrorCode});
 dispatch_h2_capsule(Session, Capsule) ->
     webtransport_session:handle_capsule(Session, Capsule).
 

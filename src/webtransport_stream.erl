@@ -21,12 +21,13 @@
 -export([id/1, type/1, state/1]).
 -export([is_open/1, is_writable/1, is_readable/1]).
 -export([send_window/1, recv_window/1]).
+-export([bytes_sent/1, bytes_received/1]).
 -export([send_buffer/1, recv_buffer/1]).
 
 %% State transitions
 -export([send/2, receive_data/2, receive_fin/1]).
 -export([close_local/1, close_remote/1, close/1]).
--export([reset/2, stop_sending/2]).
+-export([reset/2, stop_sending/2, peer_stop_sending/2]).
 -export([update_send_window/2, update_recv_window/2]).
 
 %% Buffer management
@@ -54,7 +55,10 @@
     local_fin = false :: boolean(),
     remote_fin = false :: boolean(),
     reset_code :: undefined | non_neg_integer(),
-    stop_sending_code :: undefined | non_neg_integer()
+    %% We sent STOP_SENDING to the peer: our read side is finished.
+    local_stop_sending_code :: undefined | non_neg_integer(),
+    %% Peer sent us STOP_SENDING: our write side must stop.
+    peer_stop_sending_code :: undefined | non_neg_integer()
 }).
 
 -opaque stream() :: #stream{}.
@@ -98,13 +102,15 @@ is_open(#stream{state = State}) ->
     State =:= open orelse State =:= half_closed_local orelse State =:= half_closed_remote.
 
 -spec is_writable(stream()) -> boolean().
-is_writable(#stream{state = State, local_fin = Fin, reset_code = Reset}) ->
-    Reset =:= undefined andalso not Fin andalso
+is_writable(#stream{state = State, local_fin = Fin, reset_code = Reset,
+                    peer_stop_sending_code = PeerStop}) ->
+    Reset =:= undefined andalso PeerStop =:= undefined andalso not Fin andalso
     (State =:= open orelse State =:= half_closed_remote).
 
 -spec is_readable(stream()) -> boolean().
-is_readable(#stream{state = State, remote_fin = Fin, stop_sending_code = Stop}) ->
-    Stop =:= undefined andalso not Fin andalso
+is_readable(#stream{state = State, remote_fin = Fin,
+                    local_stop_sending_code = LocalStop}) ->
+    LocalStop =:= undefined andalso not Fin andalso
     (State =:= open orelse State =:= half_closed_local).
 
 -spec send_window(stream()) -> non_neg_integer().
@@ -112,6 +118,12 @@ send_window(#stream{send_window = W}) -> W.
 
 -spec recv_window(stream()) -> non_neg_integer().
 recv_window(#stream{recv_window = W}) -> W.
+
+-spec bytes_sent(stream()) -> non_neg_integer().
+bytes_sent(#stream{bytes_sent = B}) -> B.
+
+-spec bytes_received(stream()) -> non_neg_integer().
+bytes_received(#stream{bytes_received = B}) -> B.
 
 -spec send_buffer(stream()) -> binary().
 send_buffer(#stream{send_buffer = B}) -> B.
@@ -211,9 +223,15 @@ reset(Stream, ErrorCode) ->
         send_buffer = <<>>
     }.
 
+%% Our app told the peer to stop sending on this stream: read side shut.
 -spec stop_sending(stream(), non_neg_integer()) -> stream().
 stop_sending(Stream, ErrorCode) ->
-    Stream#stream{stop_sending_code = ErrorCode}.
+    Stream#stream{local_stop_sending_code = ErrorCode}.
+
+%% Peer sent us a STOP_SENDING capsule / frame: our write side must stop.
+-spec peer_stop_sending(stream(), non_neg_integer()) -> stream().
+peer_stop_sending(Stream, ErrorCode) ->
+    Stream#stream{peer_stop_sending_code = ErrorCode}.
 
 -spec update_send_window(stream(), non_neg_integer()) -> stream().
 update_send_window(Stream, NewWindow) ->
