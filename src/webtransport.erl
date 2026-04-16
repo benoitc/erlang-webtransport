@@ -472,24 +472,13 @@ handle_h3_request(H3Conn, StreamId, <<"CONNECT">>, Path, Headers,
                   Handler, HandlerOpts, Opts, Router) ->
     case is_webtransport_h3_request(Headers) of
         true ->
-            %% Accept the WebTransport session
-            %% Note: Don't include :protocol in response - quic_h3 rejects it as
-            %% a request pseudo-header in responses. A 2xx response is sufficient
-            %% to indicate acceptance.
-            quic_h3:send_response(H3Conn, StreamId, 200, []),
-
-            %% Create transport state (H3Conn handles underlying QUIC)
             TransportState = webtransport_h3:new(H3Conn, StreamId, Router),
-
-            %% Build request info
             Authority = proplists:get_value(<<":authority">>, Headers, <<>>),
             Request = #{
                 path => Path,
                 authority => Authority,
                 headers => Headers
             },
-
-            %% Start session
             SessionOpts = maps:merge(HandlerOpts, #{
                 request => Request,
                 is_server => true,
@@ -499,14 +488,21 @@ handle_h3_request(H3Conn, StreamId, <<"CONNECT">>, Path, Headers,
                 max_streams_uni => maps:get(max_streams_uni, Opts, ?DEFAULT_MAX_STREAMS_UNI)
             }),
 
+            %% Register the session with the router BEFORE the 200 goes out.
+            %% Otherwise the client sees 200, opens extension streams, and
+            %% the stream_type_data arrives at the router while sessions is
+            %% still empty. The router then silently drops the data.
             case webtransport_session:start_link(h3, TransportState, Handler, SessionOpts) of
                 {ok, Session} ->
-                    %% Register to receive stream data for this session
                     quic_h3:set_stream_handler(H3Conn, StreamId, Session),
                     case Router of
                         undefined -> ok;
                         _ -> webtransport_h3_router:register_session(Router, StreamId, Session)
                     end,
+                    %% Note: Don't include :protocol in response - quic_h3 rejects it as
+                    %% a request pseudo-header in responses. A 2xx response is sufficient
+                    %% to indicate acceptance.
+                    quic_h3:send_response(H3Conn, StreamId, 200, []),
                     ok;
                 {error, Reason} ->
                     quic_h3:send_response(H3Conn, StreamId, 500, []),

@@ -53,7 +53,8 @@
     action_failure_stop_test/1,
     datagram_oversize_test/1,
     datagram_boundary_test/1,
-    bidi_round_trip_test/1
+    bidi_round_trip_test/1,
+    server_initiated_bidi_test/1
 ]).
 
 %% ============================================================================
@@ -91,7 +92,8 @@ groups() ->
         action_failure_forward_test,
         action_failure_stop_test,
         datagram_oversize_test,
-        datagram_boundary_test
+        datagram_boundary_test,
+        server_initiated_bidi_test
     ],
     [
         {h3_tests, [sequence], Cases},
@@ -642,6 +644,76 @@ datagram_boundary_test(Config) ->
     Payload = test_helpers:random_data(Size),
     ?assertEqual(ok, webtransport:send_datagram(Session, Payload)),
     webtransport:close_session(Session).
+
+%% A server handler can open a bidi stream back to the client. The client
+%% sees it as a peer-initiated bidi and receives the payload through
+%% `webtransport_client_handler' → owner messages. We run this against a
+%% per-case listener so the rest of the suite keeps using the echo handler.
+server_initiated_bidi_test(Config) ->
+    process_flag(trap_exit, true),
+    Transport = proplists:get_value(transport, Config),
+    CertFile = proplists:get_value(certfile, Config),
+    KeyFile = proplists:get_value(keyfile, Config),
+    PushPort = test_helpers:find_free_port(),
+    PushName = list_to_atom("push_listener_" ++ atom_to_list(Transport)),
+    {ok, _} = webtransport:start_listener(PushName, #{
+        transport => Transport,
+        port => PushPort,
+        certfile => CertFile,
+        keyfile => KeyFile,
+        handler => wt_server_push_handler
+    }),
+    try
+        timer:sleep(100),
+        {ok, Session} = webtransport:connect("localhost", PushPort, <<"/test">>, #{
+            transport => Transport,
+            verify => verify_none,
+            handler_opts => #{owner => self()}
+        }),
+        {ok, ClientStreamId} = webtransport:open_stream(Session, bidi),
+        ok = webtransport:send(Session, ClientStreamId, <<"push">>, fin),
+        PushedStreamId = wait_for_pushed_bidi(Session, ClientStreamId, 3000),
+        ?assertNotEqual(ClientStreamId, PushedStreamId),
+        ok = webtransport:close_session(Session)
+    after
+        webtransport:stop_listener(PushName),
+        %% stop_listener races exit signals to linked listener processes;
+        %% let them land before we drain, otherwise one slips past the
+        %% flush and CT reports the case as failed with `{'EXIT', shutdown}'.
+        timer:sleep(100),
+        flush_exits(),
+        process_flag(trap_exit, false)
+    end.
+
+flush_exits() ->
+    receive {'EXIT', _, _} -> flush_exits() after 0 -> ok end.
+
+%% Accumulate bytes per stream id until we see a FIN on a stream that is
+%% not the one the client opened; assert that it carries the expected
+%% pushed payload and return that stream id.
+wait_for_pushed_bidi(Session, ClientStreamId, Timeout) ->
+    wait_for_pushed_bidi(Session, ClientStreamId, #{}, Timeout).
+
+wait_for_pushed_bidi(Session, ClientStreamId, Acc, Timeout) ->
+    receive
+        {webtransport, Session, {stream, StreamId, _Type, Data}} ->
+            Buf = maps:get(StreamId, Acc, <<>>),
+            wait_for_pushed_bidi(Session, ClientStreamId,
+                                 Acc#{StreamId => <<Buf/binary, Data/binary>>},
+                                 Timeout);
+        {webtransport, Session, {stream_fin, StreamId, bidi, Data}}
+          when StreamId =/= ClientStreamId ->
+            Buf = maps:get(StreamId, Acc, <<>>),
+            ?assertEqual(<<"pushed-from-server">>, <<Buf/binary, Data/binary>>),
+            StreamId;
+        {webtransport, Session, {stream_fin, StreamId, _Type, Data}} ->
+            Buf = maps:get(StreamId, Acc, <<>>),
+            wait_for_pushed_bidi(Session, ClientStreamId,
+                                 Acc#{StreamId => <<Buf/binary, Data/binary>>},
+                                 Timeout)
+    after Timeout ->
+        error({no_pushed_bidi, Acc})
+    end.
 
 collect_stream_echo(Session, StreamId, Acc, Timeout) ->
     receive
