@@ -173,24 +173,23 @@ drain_session(#state{h3_conn = H3Conn, session_id = SessionId}) ->
 -spec reset_stream(state(), non_neg_integer(), non_neg_integer(), non_neg_integer()) ->
     ok | {error, term()}.
 reset_stream(#state{quic_conn = QuicConn, h3_conn = H3Conn, session_id = SessionId}, StreamId, ErrorCode, _ReliableSize) ->
+    %% draft-15 §3.3: app error codes are mapped into a reserved QUIC space.
+    QuicCode = wt_error:to_quic(ErrorCode),
     case StreamId =:= SessionId of
         true ->
-            %% CONNECT stream - use H3 connection
-            quic_h3:cancel(H3Conn, StreamId, ErrorCode);
+            quic_h3:cancel(H3Conn, StreamId, QuicCode);
         false ->
-            %% Native WebTransport stream - use QUIC connection directly
-            quic:reset_stream(QuicConn, StreamId, ErrorCode)
+            quic:reset_stream(QuicConn, StreamId, QuicCode)
     end.
 
 -spec stop_sending(state(), non_neg_integer(), non_neg_integer()) -> ok | {error, term()}.
 stop_sending(#state{quic_conn = QuicConn, h3_conn = H3Conn, session_id = SessionId}, StreamId, ErrorCode) ->
+    QuicCode = wt_error:to_quic(ErrorCode),
     case StreamId =:= SessionId of
         true ->
-            %% CONNECT stream - use H3 connection
-            quic_h3:cancel(H3Conn, StreamId, ErrorCode);
+            quic_h3:cancel(H3Conn, StreamId, QuicCode);
         false ->
-            %% Native WebTransport stream - use QUIC connection directly
-            quic:stop_sending(QuicConn, StreamId, ErrorCode)
+            quic:stop_sending(QuicConn, StreamId, QuicCode)
     end.
 
 %% ============================================================================

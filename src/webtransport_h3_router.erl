@@ -141,9 +141,9 @@ handle_quic_h3({quic_h3, Conn, {stream_type_data, _Direction, StreamId, Data, Fi
 handle_quic_h3({quic_h3, _Conn, {stream_type_closed, _Direction, StreamId}}, State) ->
     {noreply, route_stream_closed(StreamId, normal, State)};
 handle_quic_h3({quic_h3, _Conn, {stream_type_reset, _Direction, StreamId, ErrorCode}}, State) ->
-    {noreply, route_stream_closed(StreamId, {reset, ErrorCode}, State)};
+    {noreply, route_stream_closed(StreamId, {reset, map_from_quic(ErrorCode)}, State)};
 handle_quic_h3({quic_h3, _Conn, {stream_type_stop_sending, _Direction, StreamId, ErrorCode}}, State) ->
-    {noreply, route_stream_closed(StreamId, {stop_sending, ErrorCode}, State)};
+    {noreply, route_stream_closed(StreamId, {stop_sending, map_from_quic(ErrorCode)}, State)};
 handle_quic_h3({quic_h3, Conn, {datagram, StreamId, Payload}}, State0) ->
     State = ensure_h3_monitor(Conn, State0),
     {noreply, route_datagram(StreamId, Payload, State)};
@@ -298,3 +298,12 @@ drop_session(SessionId, #state{sessions = Sessions, monitors = Monitors} = State
     Sessions1 = maps:remove(SessionId, Sessions),
     Monitors1 = maps:filter(fun(_Ref, Sid) -> Sid =/= SessionId end, Monitors),
     State#state{sessions = Sessions1, monitors = Monitors1}.
+
+%% draft-15 §3.3: QUIC error codes inside the reserved WebTransport range
+%% map back to app-level codes. Anything outside stays opaque for the
+%% handler (e.g. native HTTP/3 or QUIC-level errors).
+map_from_quic(ErrorCode) ->
+    case wt_error:from_quic(ErrorCode) of
+        {ok, App} -> App;
+        error -> ErrorCode
+    end.
