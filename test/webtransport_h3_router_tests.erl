@@ -59,8 +59,14 @@ unknown_session_dropped_test() ->
     ok = webtransport_h3_router:register_session(Router, 0, Session),
 
     Router ! {quic_h3, self(), {stream_type_open, uni, 14, 16#54}},
+    %% Session-id 4 is NOT registered so the router must reset the stream
+    %% with WT_SESSION_GONE (draft-15 §5) rather than silently dropping.
     Router ! {quic_h3, self(), {stream_type_data, uni, 14, <<4, "nope">>, true}},
 
+    %% We stub the h3_conn with self(); cancel/3 is a gen_statem cast, so
+    %% the test process sees the raw '$gen_cast' with the expected code.
+    ?assertMatch({'$gen_cast', {cancel_stream, 14, ?WT_SESSION_GONE}}, recv(200)),
+    %% Fake session must have received nothing.
     ?assertEqual(timeout, recv(100)),
     Session ! stop,
     gen_server:stop(Router).

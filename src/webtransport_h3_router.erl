@@ -227,7 +227,26 @@ deliver_open_and_data(SessionId, StreamId, Direction, Rest, Fin, State) ->
             end,
             State;
         error ->
-            State
+            %% draft-15 §5: peer-initiated stream references an unknown or
+            %% closed session: reset with WT_SESSION_GONE so the peer sees
+            %% why we dropped it instead of silently stalling.
+            reset_unknown_session_stream(StreamId, State)
+    end.
+
+reset_unknown_session_stream(_StreamId, #state{h3_conn = undefined} = State) ->
+    State;
+reset_unknown_session_stream(StreamId, #state{h3_conn = H3Conn} = State) ->
+    case is_process_alive(H3Conn) of
+        false ->
+            State;
+        true ->
+            try
+                _ = quic_h3:cancel(H3Conn, StreamId, ?WT_SESSION_GONE),
+                State
+            catch
+                exit:_ -> State;
+                error:_ -> State
+            end
     end.
 
 forward_to_session_by_stream(StreamId, Data, Fin, State) ->
