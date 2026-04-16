@@ -34,11 +34,14 @@
 %% HTTP/3 WebTransport (draft-ietf-webtrans-http3-15)
 %% ============================================================================
 
-%% HTTP/3 Settings
--define(SETTINGS_WT_ENABLED,                  16#2c7cf000).
--define(SETTINGS_WT_INITIAL_MAX_STREAMS_UNI,  16#2b64).
--define(SETTINGS_WT_INITIAL_MAX_STREAMS_BIDI, 16#2b65).
--define(SETTINGS_WT_INITIAL_MAX_DATA,         16#2b61).
+%% HTTP/3 Settings.
+%% draft-15 advertises support via SETTINGS_WT_MAX_SESSIONS, whose
+%% value is the max concurrent session count the peer will open.
+%% draft-02 (still what quic-go/webtransport-go v0.9 ships) uses the
+%% boolean SETTINGS_ENABLE_WEBTRANSPORT + a `Sec-Webtransport-Http3-Draft02'
+%% header on the CONNECT request. We advertise both for interop.
+-define(SETTINGS_WT_MAX_SESSIONS,             16#c671706a).
+-define(SETTINGS_ENABLE_WEBTRANSPORT_DRAFT02, 16#2b603742).
 -define(SETTINGS_ENABLE_CONNECT_PROTOCOL,     16#08).
 -define(SETTINGS_H3_DATAGRAM,                 16#33).
 
@@ -113,6 +116,7 @@
 -define(DEFAULT_MAX_STREAM_DATA, 262144).  %% 256 KB
 -define(DEFAULT_MAX_STREAMS_BIDI, 100).
 -define(DEFAULT_MAX_STREAMS_UNI, 100).
+-define(DEFAULT_MAX_SESSIONS, 100).
 
 %% ============================================================================
 %% Datagram size ceilings

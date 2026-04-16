@@ -28,12 +28,14 @@ default_settings() ->
     %% `h3_datagram_enabled => true' is passed to connect/3 or
     %% start_server/3; don't duplicate it here (duplicate setting ids are
     %% an H3_SETTINGS_ERROR per RFC 9114 §7.2.4.1).
+    %%
+    %% draft-15 replaces the old boolean SETTINGS_WT_ENABLED (0x2c7cf000)
+    %% with SETTINGS_WT_MAX_SESSIONS (0xc671706a), whose value is the
+    %% max number of concurrent sessions the peer is willing to accept.
     #{
         enable_connect_protocol => 1,
-        ?SETTINGS_WT_ENABLED => 1,
-        ?SETTINGS_WT_INITIAL_MAX_DATA => ?DEFAULT_MAX_DATA,
-        ?SETTINGS_WT_INITIAL_MAX_STREAMS_BIDI => ?DEFAULT_MAX_STREAMS_BIDI,
-        ?SETTINGS_WT_INITIAL_MAX_STREAMS_UNI => ?DEFAULT_MAX_STREAMS_UNI
+        ?SETTINGS_WT_MAX_SESSIONS => ?DEFAULT_MAX_SESSIONS,
+        ?SETTINGS_ENABLE_WEBTRANSPORT_DRAFT02 => 1
     }.
 
 %% ============================================================================
@@ -46,12 +48,16 @@ request_headers(Authority, Path) ->
 
 -spec request_headers(binary(), binary(), headers()) -> headers().
 request_headers(Authority, Path, ExtraHeaders) ->
+    %% `:protocol' is "webtransport" in every draft from -02 onward.
+    %% `Sec-Webtransport-Http3-Draft02: 1' is required by draft-02 peers
+    %% (including quic-go/webtransport-go v0.9); draft-15 peers ignore it.
     BaseHeaders = [
         {<<":method">>, <<"CONNECT">>},
-        {<<":protocol">>, <<"webtransport-h3">>},
+        {<<":protocol">>, <<"webtransport">>},
         {<<":scheme">>, <<"https">>},
         {<<":authority">>, Authority},
-        {<<":path">>, Path}
+        {<<":path">>, Path},
+        {<<"sec-webtransport-http3-draft02">>, <<"1">>}
     ],
     BaseHeaders ++ strip_reserved_headers(ExtraHeaders).
 
@@ -92,8 +98,8 @@ validate_wt_support(H3Conn, _QuicConn) ->
     %% 200 response to a CONNECT request with :protocol=webtransport.
     %%
     %% Note: quic_h3 drops unknown settings from peer_settings, so we can't
-    %% check for SETTINGS_WT_ENABLED directly. The server accepting the
-    %% extended CONNECT request is sufficient validation.
+    %% check for SETTINGS_WT_MAX_SESSIONS directly. The server accepting
+    %% the extended CONNECT request is sufficient validation.
     case quic_h3:get_peer_settings(H3Conn) of
         undefined ->
             {error, settings_not_received};
@@ -144,7 +150,7 @@ strip_reserved_headers(Headers) ->
 request_headers_test() ->
     Headers = request_headers(<<"example.com">>, <<"/wt">>, [{<<"origin">>, <<"https://example.com">>}]),
     ?assertEqual({<<":method">>, <<"CONNECT">>}, lists:nth(1, Headers)),
-    ?assert(lists:member({<<":protocol">>, <<"webtransport-h3">>}, Headers)),
+    ?assert(lists:member({<<":protocol">>, <<"webtransport">>}, Headers)),
     ?assert(lists:member({<<"origin">>, <<"https://example.com">>}, Headers)).
 
 response_status_test_() ->

@@ -86,6 +86,150 @@ services:
       - interop
     entrypoint: ["/bin/sh", "-c", "sleep 3 && /app/run_endpoint.sh"]
 
+  # ============================================================================
+  # Cross-implementation services. Use `docker compose --profile cross up` to
+  # run these alongside the erlang-only services above.
+  # ============================================================================
+
+  server-go:
+    profiles: ["cross"]
+    build:
+      context: ..
+      dockerfile: interop/go/Dockerfile
+    environment:
+      - ROLE=server
+      - PORT=443
+    networks:
+      - interop
+
+  client-go-vs-erlang-handshake:
+    profiles: ["cross"]
+    build:
+      context: ..
+      dockerfile: interop/go/Dockerfile
+    environment:
+      - ROLE=client
+      - TESTCASE=handshake
+      - SERVER_HOST=server
+      - PORT=443
+    depends_on:
+      - server
+    networks:
+      - interop
+    entrypoint: ["/bin/sh", "-c", "sleep 3 && /app/run_endpoint.sh"]
+
+  client-go-vs-erlang-bidi:
+    profiles: ["cross"]
+    build:
+      context: ..
+      dockerfile: interop/go/Dockerfile
+    environment:
+      - ROLE=client
+      - TESTCASE=transfer-bidirectional
+      - SERVER_HOST=server
+      - PORT=443
+    depends_on:
+      - server
+    networks:
+      - interop
+    entrypoint: ["/bin/sh", "-c", "sleep 3 && /app/run_endpoint.sh"]
+
+  client-go-vs-erlang-uni:
+    profiles: ["cross"]
+    build:
+      context: ..
+      dockerfile: interop/go/Dockerfile
+    environment:
+      - ROLE=client
+      - TESTCASE=transfer-unidirectional
+      - SERVER_HOST=server
+      - PORT=443
+    depends_on:
+      - server
+    networks:
+      - interop
+    entrypoint: ["/bin/sh", "-c", "sleep 3 && /app/run_endpoint.sh"]
+
+  client-go-vs-erlang-datagram:
+    profiles: ["cross"]
+    build:
+      context: ..
+      dockerfile: interop/go/Dockerfile
+    environment:
+      - ROLE=client
+      - TESTCASE=transfer-datagram
+      - SERVER_HOST=server
+      - PORT=443
+    depends_on:
+      - server
+    networks:
+      - interop
+    entrypoint: ["/bin/sh", "-c", "sleep 3 && /app/run_endpoint.sh"]
+
+  client-erlang-vs-go-handshake:
+    profiles: ["cross"]
+    build:
+      context: ..
+      dockerfile: interop/Dockerfile
+    environment:
+      - ROLE=client
+      - TESTCASE=handshake
+      - SERVER_HOST=server-go
+      - PORT=443
+    depends_on:
+      - server-go
+    networks:
+      - interop
+    entrypoint: ["/bin/sh", "-c", "sleep 3 && /app/run_endpoint.sh"]
+
+  client-erlang-vs-go-bidi:
+    profiles: ["cross"]
+    build:
+      context: ..
+      dockerfile: interop/Dockerfile
+    environment:
+      - ROLE=client
+      - TESTCASE=transfer-bidirectional
+      - SERVER_HOST=server-go
+      - PORT=443
+    depends_on:
+      - server-go
+    networks:
+      - interop
+    entrypoint: ["/bin/sh", "-c", "sleep 3 && /app/run_endpoint.sh"]
+
+  client-erlang-vs-go-uni:
+    profiles: ["cross"]
+    build:
+      context: ..
+      dockerfile: interop/Dockerfile
+    environment:
+      - ROLE=client
+      - TESTCASE=transfer-unidirectional
+      - SERVER_HOST=server-go
+      - PORT=443
+    depends_on:
+      - server-go
+    networks:
+      - interop
+    entrypoint: ["/bin/sh", "-c", "sleep 3 && /app/run_endpoint.sh"]
+
+  client-erlang-vs-go-datagram:
+    profiles: ["cross"]
+    build:
+      context: ..
+      dockerfile: interop/Dockerfile
+    environment:
+      - ROLE=client
+      - TESTCASE=transfer-datagram
+      - SERVER_HOST=server-go
+      - PORT=443
+    depends_on:
+      - server-go
+    networks:
+      - interop
+    entrypoint: ["/bin/sh", "-c", "sleep 3 && /app/run_endpoint.sh"]
+
 networks:
   interop:
     driver: bridge

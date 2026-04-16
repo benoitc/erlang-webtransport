@@ -172,7 +172,12 @@ collect_stream(Session, StreamId, Acc, Timeout) ->
         {webtransport, Session, {stream, StreamId, _Type, Data}} ->
             collect_stream(Session, StreamId, <<Acc/binary, Data/binary>>, Timeout);
         {webtransport, Session, {stream_fin, StreamId, _Type, Data}} ->
-            {ok, <<Acc/binary, Data/binary>>}
+            {ok, <<Acc/binary, Data/binary>>};
+        %% Peer closed the stream without flagging fin on the last data
+        %% frame (quic-go closes uni replies this way). Treat close as
+        %% end-of-data for reliable reads.
+        {webtransport, Session, {stream_closed, StreamId, _Reason}} ->
+            {ok, Acc}
     after Timeout ->
         {error, {stream_timeout, byte_size(Acc)}}
     end.
