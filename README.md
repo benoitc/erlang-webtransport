@@ -1,6 +1,6 @@
 # WebTransport for Erlang
 
-An Erlang implementation of WebTransport over HTTP/2 ([RFC 9297](https://www.rfc-editor.org/rfc/rfc9297)) and HTTP/3 ([draft-ietf-webtrans-http3](https://datatracker.ietf.org/doc/html/draft-ietf-webtrans-http3)).
+An Erlang implementation of WebTransport over HTTP/2 ([draft-ietf-webtrans-http2-14](https://datatracker.ietf.org/doc/html/draft-ietf-webtrans-http2)) and HTTP/3 ([draft-ietf-webtrans-http3-15](https://datatracker.ietf.org/doc/html/draft-ietf-webtrans-http3)). Capsule framing uses [RFC 9297](https://www.rfc-editor.org/rfc/rfc9297) (HTTP Datagrams and the Capsule Protocol).
 
 WebTransport is a protocol providing bidirectional communication between a client and server using reliable streams and unreliable datagrams over HTTP.
 

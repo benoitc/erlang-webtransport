@@ -5,36 +5,51 @@
 %%
 -module(wt_h3).
 
--export([default_settings/0]).
--export([request_headers/2, request_headers/3]).
--export([request_session/4]).
+-export([default_settings/0, default_settings/1]).
+-export([request_headers/2, request_headers/3, request_headers/4]).
+-export([request_session/4, request_session/5]).
 -export([response_status/1, is_success_response/1]).
--export([validate_wt_support/2]).
+-export([validate_wt_support/2, validate_wt_support/3]).
+-export([detect_compat_mode/1]).
 -export([send_capsule/3, close_session/4, drain_session/2]).
 
 -include("webtransport.hrl").
 
 -type headers() :: [{binary(), binary()}].
+-type compat_mode() :: latest | legacy_browser_compat.
 
--export_type([headers/0]).
+-export_type([headers/0, compat_mode/0]).
 
 %% ============================================================================
 %% Settings
 %% ============================================================================
 
+%% @deprecated Use `default_settings/1' with an explicit `compat_mode'.
+%% Retained for the eunit suite and external callers that haven't migrated.
+%% Returns the latest-spec settings.
 -spec default_settings() -> map().
 default_settings() ->
-    %% SETTINGS_H3_DATAGRAM (0x33) is emitted by quic_h3 when
-    %% `h3_datagram_enabled => true' is passed to connect/3 or
-    %% start_server/3; don't duplicate it here (duplicate setting ids are
-    %% an H3_SETTINGS_ERROR per RFC 9114 §7.2.4.1).
-    %%
-    %% draft-15 replaces the old boolean SETTINGS_WT_ENABLED (0x2c7cf000)
-    %% with SETTINGS_WT_MAX_SESSIONS (0xc671706a), whose value is the
-    %% max number of concurrent sessions the peer is willing to accept.
+    default_settings(latest).
+
+-spec default_settings(compat_mode()) -> map().
+default_settings(latest) ->
+    %% draft-15 §3.1: servers advertise SETTINGS_WT_ENABLED plus initial
+    %% flow-control windows. SETTINGS_H3_DATAGRAM (0x33) is emitted by
+    %% quic_h3 when `h3_datagram_enabled => true' — don't duplicate it
+    %% here (duplicate setting ids are an H3_SETTINGS_ERROR per
+    %% RFC 9114 §7.2.4.1).
     #{
-        enable_connect_protocol => 1,
-        ?SETTINGS_WT_MAX_SESSIONS => ?DEFAULT_MAX_SESSIONS,
+        enable_connect_protocol                      => 1,
+        ?SETTINGS_WT_ENABLED                         => 1,
+        ?SETTINGS_WT_INITIAL_MAX_DATA                => ?DEFAULT_MAX_DATA,
+        ?SETTINGS_WT_INITIAL_MAX_STREAMS_BIDI        => ?DEFAULT_MAX_STREAMS_BIDI,
+        ?SETTINGS_WT_INITIAL_MAX_STREAMS_UNI         => ?DEFAULT_MAX_STREAMS_UNI
+    };
+default_settings(legacy_browser_compat) ->
+    %% draft-02 (Chrome / Firefox / quic-go v0.9). Never mix these
+    %% with the latest-spec settings in one handshake.
+    #{
+        enable_connect_protocol              => 1,
         ?SETTINGS_ENABLE_WEBTRANSPORT_DRAFT02 => 1
     }.
 
@@ -44,13 +59,27 @@ default_settings() ->
 
 -spec request_headers(binary(), binary()) -> headers().
 request_headers(Authority, Path) ->
-    request_headers(Authority, Path, []).
+    request_headers(Authority, Path, [], latest).
 
 -spec request_headers(binary(), binary(), headers()) -> headers().
 request_headers(Authority, Path, ExtraHeaders) ->
-    %% `:protocol' is "webtransport" in every draft from -02 onward.
-    %% `Sec-Webtransport-Http3-Draft02: 1' is required by draft-02 peers
-    %% (including quic-go/webtransport-go v0.9); draft-15 peers ignore it.
+    request_headers(Authority, Path, ExtraHeaders, latest).
+
+-spec request_headers(binary(), binary(), headers(), compat_mode()) -> headers().
+request_headers(Authority, Path, ExtraHeaders, latest) ->
+    %% draft-15 §3.2: `:protocol' MUST be `webtransport-h3'. No draft-02
+    %% Sec- header on this path.
+    BaseHeaders = [
+        {<<":method">>, <<"CONNECT">>},
+        {<<":protocol">>, <<"webtransport-h3">>},
+        {<<":scheme">>, <<"https">>},
+        {<<":authority">>, Authority},
+        {<<":path">>, Path}
+    ],
+    BaseHeaders ++ strip_reserved_headers(ExtraHeaders);
+request_headers(Authority, Path, ExtraHeaders, legacy_browser_compat) ->
+    %% draft-02: `:protocol' = webtransport + the draft-02 marker header.
+    %% Chrome / Firefox / quic-go v0.9 expect this exact shape.
     BaseHeaders = [
         {<<":method">>, <<"CONNECT">>},
         {<<":protocol">>, <<"webtransport">>},
@@ -64,7 +93,12 @@ request_headers(Authority, Path, ExtraHeaders) ->
 -spec request_session(pid(), binary(), binary(), headers()) ->
     {ok, non_neg_integer()} | {error, term()}.
 request_session(H3Conn, Authority, Path, ExtraHeaders) ->
-    Headers = request_headers(Authority, Path, ExtraHeaders),
+    request_session(H3Conn, Authority, Path, ExtraHeaders, latest).
+
+-spec request_session(pid(), binary(), binary(), headers(), compat_mode()) ->
+    {ok, non_neg_integer()} | {error, term()}.
+request_session(H3Conn, Authority, Path, ExtraHeaders, CompatMode) ->
+    Headers = request_headers(Authority, Path, ExtraHeaders, CompatMode),
     quic_h3:request(H3Conn, Headers, #{end_stream => false}).
 
 -spec response_status(headers()) -> {ok, non_neg_integer()} | {error, term()}.
@@ -92,27 +126,107 @@ is_success_response(Headers) ->
 %% ============================================================================
 
 -spec validate_wt_support(pid(), pid()) -> ok | {error, term()}.
-validate_wt_support(H3Conn, _QuicConn) ->
-    %% Basic validation: check that peer supports extended CONNECT protocol
-    %% (RFC 9220). Full WebTransport support is validated by the server's
-    %% 200 response to a CONNECT request with :protocol=webtransport.
-    %%
-    %% Note: quic_h3 drops unknown settings from peer_settings, so we can't
-    %% check for SETTINGS_WT_MAX_SESSIONS directly. The server accepting
-    %% the extended CONNECT request is sufficient validation.
+validate_wt_support(H3Conn, QuicConn) ->
+    validate_wt_support(H3Conn, QuicConn, latest).
+
+-spec validate_wt_support(pid(), pid(), compat_mode()) -> ok | {error, term()}.
+validate_wt_support(H3Conn, QuicConn, CompatMode) ->
     case quic_h3:get_peer_settings(H3Conn) of
         undefined ->
             {error, settings_not_received};
         PeerSettings ->
-            case setting_enabled(PeerSettings, enable_connect_protocol) of
-                true -> ok;
-                false -> {error, connect_protocol_not_enabled}
+            case validate_required_settings(PeerSettings, CompatMode) of
+                ok -> validate_transport_params(QuicConn);
+                Err -> Err
             end
+    end.
+
+validate_transport_params(QuicConn) ->
+    case quic:get_peer_transport_params(QuicConn) of
+        {ok, TP} ->
+            case maps:get(max_datagram_frame_size, TP, 0) of
+                0 -> {error, datagrams_not_enabled};
+                _ ->
+                    %% reset_stream_at is required by draft-15 §3.1.
+                    %% If the peer does not advertise it, warn but allow
+                    %% (many implementations have not adopted it yet).
+                    case maps:get(reset_stream_at, TP, false) of
+                        true -> ok;
+                        false ->
+                            logger:debug("peer does not advertise reset_stream_at"),
+                            ok
+                    end
+            end;
+        {error, _} ->
+            %% Transport params not yet available (rare race).
+            ok
+    end.
+
+validate_required_settings(PeerSettings, CompatMode) ->
+    %% draft-15 §3.1 / draft-02: server MUST send SETTINGS_WT_ENABLED (or the
+    %% draft-02 equivalent) plus SETTINGS_ENABLE_CONNECT_PROTOCOL and
+    %% SETTINGS_H3_DATAGRAM. We can always observe `enable_connect_protocol'
+    %% via `quic_h3:get_peer_settings/1'. The WebTransport-specific setting
+    %% IDs, however, are stripped by `quic_h3_frame:decode_settings_pairs/2'
+    %% because they're unknown to the vendored quic_h3 module. Until that
+    %% upstream limitation is fixed we can only reject when the peer
+    %% advertised the WT setting AND set it to 0; a missing key is
+    %% indistinguishable from "upstream dropped it" and we pass through.
+    case setting_enabled(PeerSettings, enable_connect_protocol) of
+        false -> {error, connect_protocol_not_enabled};
+        true -> check_wt_setting(PeerSettings, CompatMode)
+    end.
+
+%% Only reject when the peer explicitly advertised the WebTransport setting
+%% with a value of 0. Absence is treated as "cannot verify" (see
+%% `validate_required_settings/2' note above).
+check_wt_setting(PeerSettings, latest) ->
+    case maps:find(?SETTINGS_WT_ENABLED, PeerSettings) of
+        {ok, 0} -> {error, wt_not_enabled};
+        _ -> ok
+    end;
+check_wt_setting(PeerSettings, legacy_browser_compat) ->
+    case maps:find(?SETTINGS_ENABLE_WEBTRANSPORT_DRAFT02, PeerSettings) of
+        {ok, 0} -> {error, wt_not_enabled};
+        _ -> ok
     end.
 
 setting_enabled(Settings, Key) ->
     Value = maps:get(Key, Settings, 0),
     Value =:= 1 orelse Value =:= true.
+
+%% Server-side helper: read the incoming CONNECT request and decide which
+%% compat mode it is asking for. Returns `{ok, latest | legacy_browser_compat}'
+%% on a well-formed request or `{error, Reason}' if the three signals
+%% disagree.
+-spec detect_compat_mode(headers()) ->
+    {ok, compat_mode()} | {error, term()}.
+detect_compat_mode(Headers) ->
+    Protocol = header_value(<<":protocol">>, Headers),
+    Draft02Marker = header_value(<<"sec-webtransport-http3-draft02">>, Headers),
+    case {Protocol, Draft02Marker} of
+        {<<"webtransport-h3">>, undefined} ->
+            {ok, latest};
+        {<<"webtransport-h3">>, _} ->
+            %% Sending the draft-02 marker alongside the draft-15 :protocol
+            %% is not a valid handshake.
+            {error, mixed_draft_signals};
+        {<<"webtransport">>, _} ->
+            %% draft-02. Some implementations (webtransport-go) do not send
+            %% the `Sec-Webtransport-Http3-Draft02' header; treat the
+            %% :protocol alone as sufficient evidence of draft-02 intent.
+            {ok, legacy_browser_compat};
+        {undefined, _} ->
+            {error, missing_protocol};
+        {_, _} ->
+            {error, unknown_protocol}
+    end.
+
+header_value(Name, Headers) ->
+    case lists:keyfind(Name, 1, Headers) of
+        {_, Value} -> Value;
+        false -> undefined
+    end.
 
 %% ============================================================================
 %% CONNECT Stream Capsules
@@ -147,11 +261,46 @@ strip_reserved_headers(Headers) ->
 -ifdef(TEST).
 -include_lib("eunit/include/eunit.hrl").
 
-request_headers_test() ->
-    Headers = request_headers(<<"example.com">>, <<"/wt">>, [{<<"origin">>, <<"https://example.com">>}]),
+request_headers_latest_test() ->
+    Headers = request_headers(<<"example.com">>, <<"/wt">>,
+                              [{<<"origin">>, <<"https://example.com">>}], latest),
     ?assertEqual({<<":method">>, <<"CONNECT">>}, lists:nth(1, Headers)),
-    ?assert(lists:member({<<":protocol">>, <<"webtransport">>}, Headers)),
+    ?assert(lists:member({<<":protocol">>, <<"webtransport-h3">>}, Headers)),
+    ?assertNot(lists:keymember(<<"sec-webtransport-http3-draft02">>, 1, Headers)),
     ?assert(lists:member({<<"origin">>, <<"https://example.com">>}, Headers)).
+
+request_headers_legacy_test() ->
+    Headers = request_headers(<<"example.com">>, <<"/wt">>, [], legacy_browser_compat),
+    ?assert(lists:member({<<":protocol">>, <<"webtransport">>}, Headers)),
+    ?assert(lists:member({<<"sec-webtransport-http3-draft02">>, <<"1">>}, Headers)).
+
+default_settings_latest_disjoint_from_legacy_test() ->
+    Latest = default_settings(latest),
+    Legacy = default_settings(legacy_browser_compat),
+    ?assert(maps:is_key(?SETTINGS_WT_ENABLED, Latest)),
+    ?assertNot(maps:is_key(?SETTINGS_ENABLE_WEBTRANSPORT_DRAFT02, Latest)),
+    ?assert(maps:is_key(?SETTINGS_ENABLE_WEBTRANSPORT_DRAFT02, Legacy)),
+    ?assertNot(maps:is_key(?SETTINGS_WT_ENABLED, Legacy)).
+
+detect_compat_mode_latest_test() ->
+    ?assertEqual({ok, latest},
+                 detect_compat_mode([{<<":protocol">>, <<"webtransport-h3">>}])).
+
+detect_compat_mode_legacy_test() ->
+    ?assertEqual({ok, legacy_browser_compat},
+                 detect_compat_mode([{<<":protocol">>, <<"webtransport">>},
+                                     {<<"sec-webtransport-http3-draft02">>, <<"1">>}])).
+
+detect_compat_mode_bare_legacy_test() ->
+    %% webtransport-go v0.9 sends `:protocol = webtransport' without the
+    %% draft-02 Sec- header; we still recognize it as legacy.
+    ?assertEqual({ok, legacy_browser_compat},
+                 detect_compat_mode([{<<":protocol">>, <<"webtransport">>}])).
+
+detect_compat_mode_rejects_mixed_test() ->
+    ?assertEqual({error, mixed_draft_signals},
+                 detect_compat_mode([{<<":protocol">>, <<"webtransport-h3">>},
+                                     {<<"sec-webtransport-http3-draft02">>, <<"1">>}])).
 
 response_status_test_() ->
     [

@@ -229,9 +229,14 @@ stop_sending(Stream, ErrorCode) ->
     Stream#stream{local_stop_sending_code = ErrorCode}.
 
 %% Peer sent us a STOP_SENDING capsule / frame: our write side must stop.
--spec peer_stop_sending(stream(), non_neg_integer()) -> stream().
-peer_stop_sending(Stream, ErrorCode) ->
-    Stream#stream{peer_stop_sending_code = ErrorCode}.
+%% Returns `{error, duplicate}' if we already received a STOP_SENDING for
+%% this stream (draft-14 §6.3: WEBTRANSPORT_STREAM_STATE_ERROR).
+-spec peer_stop_sending(stream(), non_neg_integer()) ->
+    {ok, stream()} | {error, duplicate}.
+peer_stop_sending(#stream{peer_stop_sending_code = undefined} = Stream, ErrorCode) ->
+    {ok, Stream#stream{peer_stop_sending_code = ErrorCode}};
+peer_stop_sending(#stream{peer_stop_sending_code = _}, _ErrorCode) ->
+    {error, duplicate}.
 
 -spec update_send_window(stream(), non_neg_integer()) -> stream().
 update_send_window(Stream, NewWindow) ->

@@ -22,6 +22,9 @@
     sessions = #{} :: #{non_neg_integer() => pid()},
     monitors = #{} :: #{reference() => non_neg_integer()},
     pending = #{} :: #{non_neg_integer() => {bidi | uni, binary()}},
+    %% Max pending (un-dispatched) streams before we cancel with
+    %% WT_BUFFERED_STREAM_REJECTED. Default 64.
+    max_pending_streams = 64 :: non_neg_integer(),
     %% Streams opened locally (by us) — StreamId => SessionPid.
     %% Data on these streams is delivered straight to the session, skipping
     %% the session-id varint decode that peer-initiated streams go through.
@@ -132,8 +135,15 @@ handle_quic_h3({quic_h3, Conn, {stream_type_open, Direction, StreamId, _Type}}, 
         true ->
             {noreply, State};
         false ->
-            Pending = (State#state.pending)#{StreamId => {Direction, <<>>}},
-            {noreply, State#state{pending = Pending}}
+            case map_size(State#state.pending) >= State#state.max_pending_streams of
+                true ->
+                    %% Buffering cap reached; reject per draft-15 §4.6.
+                    _ = cancel_stream(Conn, StreamId, ?WT_BUFFERED_STREAM_REJECTED),
+                    {noreply, State};
+                false ->
+                    Pending = (State#state.pending)#{StreamId => {Direction, <<>>}},
+                    {noreply, State#state{pending = Pending}}
+            end
     end;
 handle_quic_h3({quic_h3, Conn, {stream_type_data, _Direction, StreamId, Data, Fin}}, State0) ->
     State = ensure_h3_monitor(Conn, State0),
@@ -236,16 +246,15 @@ deliver_open_and_data(SessionId, StreamId, Direction, Rest, Fin, State) ->
 reset_unknown_session_stream(_StreamId, #state{h3_conn = undefined} = State) ->
     State;
 reset_unknown_session_stream(StreamId, #state{h3_conn = H3Conn} = State) ->
+    _ = cancel_stream(H3Conn, StreamId, ?WT_SESSION_GONE),
+    State.
+
+cancel_stream(H3Conn, StreamId, ErrorCode) ->
     case is_process_alive(H3Conn) of
-        false ->
-            State;
+        false -> ok;
         true ->
-            try
-                _ = quic_h3:cancel(H3Conn, StreamId, ?WT_SESSION_GONE),
-                State
-            catch
-                exit:_ -> State;
-                error:_ -> State
+            try quic_h3:cancel(H3Conn, StreamId, ErrorCode)
+            catch exit:_ -> ok; error:_ -> ok
             end
     end.
 

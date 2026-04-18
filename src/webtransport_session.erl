@@ -253,8 +253,14 @@ open({call, From}, get_info, StateData) ->
     {keep_state, StateData, [{reply, From, {ok, Info}}]};
 
 open(cast, {capsule, Capsule}, StateData) ->
-    StateData1 = handle_incoming_capsule(Capsule, StateData),
-    apply_capsule_transition(Capsule, StateData1);
+    case handle_incoming_capsule(Capsule, StateData) of
+        {session_error, Code, Reason} ->
+            do_close(Code, Reason, StateData),
+            {stop, {shutdown, {session_error, Code}},
+             StateData#data{close_info = {Code, Reason}}};
+        StateData1 ->
+            apply_capsule_transition(Capsule, StateData1)
+    end;
 
 open(cast, {stream_data, StreamId, Data, Fin}, StateData) ->
     {StateData1, Transition} = handle_incoming_stream_data(StreamId, Data, Fin, StateData),
@@ -284,7 +290,7 @@ open(cast, {close, ErrorCode, Reason}, StateData) ->
 %% so session-management capsules (CLOSE_SESSION, DRAIN_SESSION) arrive as
 %% raw bytes in `{quic_h3, _, {data, StreamId, Data, Fin}}'. Decode and
 %% dispatch them through the same handle_incoming_capsule path as h2.
-open(info, {quic_h3, _Conn, {data, StreamId, Data, _Fin}},
+open(info, {quic_h3, _Conn, {data, StreamId, Data, Fin}},
      #data{transport = h3, transport_state = H3State} = StateData) ->
     %% draft-15 §5: session-management capsules ride the CONNECT stream.
     %% Decode and dispatch like the h2 capsule path; non-CONNECT streams
@@ -293,9 +299,25 @@ open(info, {quic_h3, _Conn, {data, StreamId, Data, _Fin}},
         StreamId ->
             case wt_h3_capsule:decode_all(Data) of
                 {ok, Capsules, _} ->
-                    apply_capsule_list(Capsules, StateData);
-                {error, _} ->
-                    {keep_state, StateData}
+                    Result = apply_capsule_list(Capsules, StateData),
+                    %% draft-14 §3.4: "A WebTransport session is terminated
+                    %% when either endpoint closes the stream". If the peer
+                    %% FINs the CONNECT stream without sending CLOSE_SESSION,
+                    %% treat as session close.
+                    case {Fin, Result} of
+                        {true, {keep_state, SD}} ->
+                            reset_all_streams(?WT_SESSION_GONE, SD),
+                            {stop, normal, SD#data{close_info = {0, <<"peer closed CONNECT">>}}};
+                        _ ->
+                            Result
+                    end;
+                {error, Reason} ->
+                    %% Malformed capsule framing is a protocol error.
+                    logger:warning("h3 CONNECT capsule decode error: ~p", [Reason]),
+                    do_close(?WT_REQUIREMENTS_NOT_MET, <<"malformed capsule">>, StateData),
+                    {stop, {shutdown, {session_error, ?WT_REQUIREMENTS_NOT_MET}},
+                     StateData#data{close_info = {?WT_REQUIREMENTS_NOT_MET,
+                                                  <<"malformed capsule">>}}}
             end;
         _ ->
             {keep_state, StateData}
@@ -320,12 +342,18 @@ open(info, Msg, #data{handler = Handler, handler_state = HState} = StateData) ->
 apply_capsule_list([], StateData) ->
     {keep_state, StateData};
 apply_capsule_list([Capsule | Rest], StateData) ->
-    StateData1 = handle_incoming_capsule(Capsule, StateData),
-    case apply_capsule_transition(Capsule, StateData1) of
-        {keep_state, StateData2} ->
-            apply_capsule_list(Rest, StateData2);
-        Stop ->
-            Stop
+    case handle_incoming_capsule(Capsule, StateData) of
+        {session_error, Code, Reason} ->
+            do_close(Code, Reason, StateData),
+            {stop, {shutdown, {session_error, Code}},
+             StateData#data{close_info = {Code, Reason}}};
+        StateData1 ->
+            case apply_capsule_transition(Capsule, StateData1) of
+                {keep_state, StateData2} ->
+                    apply_capsule_list(Rest, StateData2);
+                Stop ->
+                    Stop
+            end
     end.
 
 %% Translate a `handle_actions' transition into a gen_statem return while
@@ -341,6 +369,8 @@ open_apply_transition({stop, Reason}, StateData) ->
 %% draft-14 §4.6 / draft-15 §5: CLOSE_SESSION is terminal.
 %% draft-14 §4.7 / draft-15 §5.1: DRAIN_SESSION moves us to draining.
 apply_capsule_transition({close_session, _Code, _Reason}, StateData) ->
+    %% Reset all live streams with WT_SESSION_GONE before stopping.
+    reset_all_streams(?WT_SESSION_GONE, StateData),
     {stop, normal, StateData};
 apply_capsule_transition({drain_session}, StateData) ->
     {next_state, draining, StateData};
@@ -552,32 +582,76 @@ do_drain(#data{transport = h2, transport_state = H2State}) ->
 do_drain(#data{transport = h3, transport_state = H3State}) ->
     webtransport_h3:drain_session(H3State).
 
-do_close(ErrorCode, Reason, #data{transport = h2, transport_state = H2State}) ->
-    webtransport_h2:close_session(H2State, ErrorCode, Reason);
-do_close(ErrorCode, Reason, #data{transport = h3, transport_state = H3State}) ->
-    webtransport_h3:close_session(H3State, ErrorCode, Reason).
+do_close(ErrorCode, Reason, StateData) ->
+    %% Reset all live streams with WT_SESSION_GONE, then send CLOSE_SESSION.
+    reset_all_streams(?WT_SESSION_GONE, StateData),
+    case StateData of
+        #data{transport = h2, transport_state = H2State} ->
+            webtransport_h2:close_session(H2State, ErrorCode, Reason);
+        #data{transport = h3, transport_state = H3State} ->
+            webtransport_h3:close_session(H3State, ErrorCode, Reason)
+    end.
+
+reset_all_streams(ErrorCode, #data{streams = Streams} = StateData) ->
+    maps:foreach(fun(StreamId, Stream) ->
+        case webtransport_stream:is_open(Stream) of
+            true -> transport_reset_stream(StreamId, ErrorCode, StateData);
+            false -> ok
+        end
+    end, Streams).
 
 handle_incoming_capsule({max_data, Limit}, #data{remote_max_data = Prev} = StateData) ->
-    %% draft-14 §6.1: peer raises our session-wide send allowance.
-    StateData#data{remote_max_data = max(Prev, Limit)};
+    %% Drafts: MUST close session with WT_FLOW_CONTROL_ERROR on decrease.
+    case Limit < Prev of
+        true ->
+            {session_error, ?WT_FLOW_CONTROL_ERROR, <<"max_data decreased">>};
+        false ->
+            StateData#data{remote_max_data = Limit}
+    end;
+handle_incoming_capsule({max_stream_data, _StreamId, _Limit},
+                        #data{transport = h3} = _StateData) ->
+    %% draft-15 §5.4: WT_MAX_STREAM_DATA is prohibited on h3.
+    {session_error, ?WT_FLOW_CONTROL_ERROR,
+     <<"h3 prohibits per-stream flow control capsules">>};
 handle_incoming_capsule({max_stream_data, StreamId, Limit},
                         #data{streams = Streams} = StateData) ->
-    %% draft-14 §6.2: peer raises the per-stream send window.
+    %% h2 only: peer raises the per-stream send window.
     case maps:find(StreamId, Streams) of
         {ok, Stream} ->
             Current = webtransport_stream:send_window(Stream),
-            Stream1 = webtransport_stream:update_send_window(Stream, max(Current, Limit)),
-            StateData#data{streams = Streams#{StreamId => Stream1}};
+            case Limit < Current of
+                true ->
+                    {session_error, ?WT_FLOW_CONTROL_ERROR,
+                     <<"max_stream_data decreased">>};
+                false ->
+                    Stream1 = webtransport_stream:update_send_window(Stream, Limit),
+                    StateData#data{streams = Streams#{StreamId => Stream1}}
+            end;
         error ->
             StateData
     end;
 handle_incoming_capsule({max_streams_bidi, Limit}, #data{remote_max_streams_bidi = Prev} = StateData) ->
-    StateData#data{remote_max_streams_bidi = max(Prev, Limit)};
+    case Limit < Prev of
+        true ->
+            {session_error, ?WT_FLOW_CONTROL_ERROR, <<"max_streams_bidi decreased">>};
+        false ->
+            StateData#data{remote_max_streams_bidi = Limit}
+    end;
 handle_incoming_capsule({max_streams_uni, Limit}, #data{remote_max_streams_uni = Prev} = StateData) ->
-    StateData#data{remote_max_streams_uni = max(Prev, Limit)};
+    case Limit < Prev of
+        true ->
+            {session_error, ?WT_FLOW_CONTROL_ERROR, <<"max_streams_uni decreased">>};
+        false ->
+            StateData#data{remote_max_streams_uni = Limit}
+    end;
 handle_incoming_capsule({data_blocked, Limit}, StateData) ->
     logger:debug("peer data_blocked at ~p", [Limit]),
     StateData;
+handle_incoming_capsule({stream_data_blocked, _StreamId, _Limit},
+                        #data{transport = h3} = _StateData) ->
+    %% draft-15 §5.4: WT_STREAM_DATA_BLOCKED is prohibited on h3.
+    {session_error, ?WT_FLOW_CONTROL_ERROR,
+     <<"h3 prohibits per-stream flow control capsules">>};
 handle_incoming_capsule({stream_data_blocked, StreamId, Limit}, StateData) ->
     logger:debug("peer stream_data_blocked stream=~p limit=~p", [StreamId, Limit]),
     StateData;
@@ -592,8 +666,17 @@ handle_incoming_capsule({stop_sending, StreamId, ErrorCode},
     %% Peer asked us to stop sending on this stream: block our write side.
     case maps:find(StreamId, Streams) of
         {ok, Stream} ->
-            Stream1 = webtransport_stream:peer_stop_sending(Stream, ErrorCode),
-            StateData#data{streams = Streams#{StreamId => Stream1}};
+            case webtransport_stream:peer_stop_sending(Stream, ErrorCode) of
+                {ok, Stream1} ->
+                    StateData#data{streams = Streams#{StreamId => Stream1}};
+                {error, duplicate} ->
+                    %% draft-14 §6.3: duplicate STOP_SENDING is a stream
+                    %% state error. Log and continue (h2 could emit
+                    %% WEBTRANSPORT_STREAM_STATE_ERROR, but we don't have
+                    %% a separate stream-error return path yet).
+                    logger:warning("duplicate stop_sending on stream ~p", [StreamId]),
+                    StateData
+            end;
         error ->
             StateData
     end;
@@ -612,9 +695,13 @@ handle_incoming_capsule({close_session, ErrorCode, Reason}, #data{} = StateData)
     StateData#data{close_info = {ErrorCode, Reason}};
 handle_incoming_capsule({drain_session}, #data{} = StateData) ->
     StateData;
-handle_incoming_capsule(Unknown, StateData) ->
-    logger:warning("webtransport: dropping unknown capsule ~p", [Unknown]),
-    StateData.
+handle_incoming_capsule(Unknown, _StateData) ->
+    %% Unknown capsule on the CONNECT stream. The drafts don't define a
+    %% "forward-compatible ignore" rule for WT capsules; treat it as a
+    %% session error so protocol mismatches surface immediately.
+    logger:warning("webtransport: unknown capsule ~p, closing session", [Unknown]),
+    {session_error, ?WT_REQUIREMENTS_NOT_MET,
+     iolist_to_binary(io_lib:format("unknown capsule: ~p", [Unknown]))}.
 
 handle_incoming_stream_data(StreamId, Data, Fin,
                              #data{streams = Streams, handler = Handler,
@@ -673,9 +760,46 @@ handle_remote_stream_opened(StreamId, Type, #data{streams = Streams} = StateData
         true ->
             StateData;
         false ->
-            Stream = webtransport_stream:new(StreamId, Type, ?DEFAULT_MAX_STREAM_DATA),
-            StateData#data{streams = Streams#{StreamId => Stream}}
+            Limit = case Type of
+                bidi -> StateData#data.local_max_streams_bidi;
+                uni  -> StateData#data.local_max_streams_uni
+            end,
+            Count = count_peer_streams(Type, Streams, StateData#data.is_server),
+            case Count < Limit of
+                true ->
+                    Stream = webtransport_stream:new(StreamId, Type, ?DEFAULT_MAX_STREAM_DATA),
+                    StateData#data{streams = Streams#{StreamId => Stream}};
+                false ->
+                    %% Peer exceeded our advertised stream limit.
+                    %% Reset the stream with WT_BUFFERED_STREAM_REJECTED.
+                    reject_excess_stream(StreamId, StateData),
+                    StateData
+            end
     end.
+
+count_peer_streams(Type, Streams, IsServer) ->
+    maps:fold(fun(Sid, S, Acc) ->
+        StreamType = webtransport_stream:type(S),
+        Initiator = webtransport_stream:initiator(Sid),
+        IsPeer = case IsServer of
+            true  -> Initiator =:= client;
+            false -> Initiator =:= server
+        end,
+        case IsPeer andalso StreamType =:= Type of
+            true -> Acc + 1;
+            false -> Acc
+        end
+    end, 0, Streams).
+
+reject_excess_stream(StreamId, #data{transport = h3, transport_state = H3State}) ->
+    QuicConn = webtransport_h3:quic_conn(H3State),
+    QuicCode = wt_error:to_quic(?WT_BUFFERED_STREAM_REJECTED),
+    _ = quic:reset_stream(QuicConn, StreamId, QuicCode),
+    ok;
+reject_excess_stream(StreamId, #data{transport = h2, transport_state = H2State}) ->
+    _ = webtransport_h2:send_capsule(H2State,
+            wt_h2_capsule:reset_stream(StreamId, ?WT_BUFFERED_STREAM_REJECTED)),
+    ok.
 
 handle_remote_stream_closed(StreamId, Reason,
                              #data{streams = Streams, handler = Handler,
@@ -872,10 +996,23 @@ handle_incoming_capsule_max_stream_data_test() ->
     Data1 = handle_incoming_capsule({max_stream_data, 4, 65536}, Data),
     #{4 := Stream1} = Data1#data.streams,
     ?assertEqual(65536, webtransport_stream:send_window(Stream1)),
-    %% Lower value is ignored (windows are monotonic).
-    Data2 = handle_incoming_capsule({max_stream_data, 4, 100}, Data1),
-    #{4 := Stream2} = Data2#data.streams,
-    ?assertEqual(65536, webtransport_stream:send_window(Stream2)),
+    %% Lower value triggers session error (monotonicity enforcement).
+    ?assertMatch({session_error, ?WT_FLOW_CONTROL_ERROR, _},
+                 handle_incoming_capsule({max_stream_data, 4, 100}, Data1)),
+    ok.
+
+handle_incoming_capsule_max_stream_data_h3_rejected_test() ->
+    Stream = webtransport_stream:new(4, bidi, 1024),
+    Data = #data{streams = #{4 => Stream}, transport = h3,
+                 remote_max_data = 0, remote_max_streams_bidi = 0,
+                 remote_max_streams_uni = 0,
+                 local_max_data = 0, local_max_streams_bidi = 0,
+                 local_max_streams_uni = 0, is_server = false,
+                 next_bidi_id = 0, next_uni_id = 2,
+                 request = #{}, handler = undefined,
+                 handler_state = undefined},
+    ?assertMatch({session_error, ?WT_FLOW_CONTROL_ERROR, _},
+                 handle_incoming_capsule({max_stream_data, 4, 65536}, Data)),
     ok.
 
 handle_incoming_capsule_max_data_monotonic_test() ->
@@ -885,8 +1022,13 @@ handle_incoming_capsule_max_data_monotonic_test() ->
                  local_max_streams_bidi = 0, local_max_streams_uni = 0,
                  is_server = false, next_bidi_id = 0, next_uni_id = 2,
                  request = #{}, handler = undefined, handler_state = undefined},
-    ?assertEqual(1000, (handle_incoming_capsule({max_data, 500}, Data))#data.remote_max_data),
+    %% Decrease triggers session error.
+    ?assertMatch({session_error, ?WT_FLOW_CONTROL_ERROR, _},
+                 handle_incoming_capsule({max_data, 500}, Data)),
+    %% Increase is accepted.
     ?assertEqual(2000, (handle_incoming_capsule({max_data, 2000}, Data))#data.remote_max_data),
+    %% Equal is accepted (not a decrease).
+    ?assertEqual(1000, (handle_incoming_capsule({max_data, 1000}, Data))#data.remote_max_data),
     ok.
 
 handle_incoming_capsule_stop_sending_test() ->

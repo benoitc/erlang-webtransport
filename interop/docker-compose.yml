@@ -176,6 +176,7 @@ services:
       - TESTCASE=handshake
       - SERVER_HOST=server-go
       - PORT=443
+      - COMPAT=legacy
     depends_on:
       - server-go
     networks:
@@ -192,6 +193,7 @@ services:
       - TESTCASE=transfer-bidirectional
       - SERVER_HOST=server-go
       - PORT=443
+      - COMPAT=legacy
     depends_on:
       - server-go
     networks:
@@ -208,6 +210,7 @@ services:
       - TESTCASE=transfer-unidirectional
       - SERVER_HOST=server-go
       - PORT=443
+      - COMPAT=legacy
     depends_on:
       - server-go
     networks:
@@ -224,6 +227,7 @@ services:
       - TESTCASE=transfer-datagram
       - SERVER_HOST=server-go
       - PORT=443
+      - COMPAT=legacy
     depends_on:
       - server-go
     networks:

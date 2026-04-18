@@ -87,7 +87,12 @@
     handler_opts => term(),
     max_data => non_neg_integer(),
     max_streams_bidi => non_neg_integer(),
-    max_streams_uni => non_neg_integer()
+    max_streams_uni => non_neg_integer(),
+    %% `compat_mode' selects which WebTransport HTTP/3 draft the listener
+    %% accepts. Default `auto' accepts draft-15 and draft-02 and picks the
+    %% matching code path per CONNECT. Pin to `latest' to refuse draft-02
+    %% clients or to `legacy_browser_compat' to refuse draft-15 clients.
+    compat_mode => latest | legacy_browser_compat | auto
 }.
 
 -type connect_opts() :: #{
@@ -97,7 +102,12 @@
     cacertfile => file:filename(),
     verify => verify_none | verify_peer,
     headers => [{binary(), binary()}],
-    timeout => timeout()
+    timeout => timeout(),
+    %% Clients pick an explicit compat mode. Default `latest' sends
+    %% draft-15 SETTINGS and `:protocol = webtransport-h3'. Use
+    %% `legacy_browser_compat' only when talking to a known draft-02 peer
+    %% (Chrome / Firefox / quic-go v0.9).
+    compat_mode => latest | legacy_browser_compat
 }.
 
 -export_type([session/0, stream/0, request/0]).
@@ -384,12 +394,30 @@ start_h3_listener(Name, Opts) ->
                 }
             end,
 
+            ServerCompatMode = maps:get(compat_mode, Opts, auto),
+            %% `auto' advertises both latest (draft-15) AND legacy
+            %% (draft-02) setting keys. H3 SETTINGS are connection-
+            %% scoped and sent before any CONNECT, so the server cannot
+            %% know the client's draft at SETTINGS time. Peers MUST
+            %% ignore unknown settings (RFC 9114 §7.2.4.1), so the
+            %% merged shape is wire-safe. Pinning to a specific mode
+            %% sends only that mode's settings.
+            AdvertisedSettings = case ServerCompatMode of
+                auto ->
+                    maps:merge(wt_h3:default_settings(latest),
+                               wt_h3:default_settings(legacy_browser_compat));
+                Other ->
+                    wt_h3:default_settings(Other)
+            end,
             ServerOpts = #{
                 cert => CertDer,
                 key => PrivateKey,
                 handler => make_h3_handler(Handler, HandlerOpts, Opts, undefined),
-                settings => wt_h3:default_settings(),
-                quic_opts => #{max_datagram_frame_size => 65535},
+                settings => AdvertisedSettings,
+                quic_opts => #{
+                    max_datagram_frame_size => 65535,
+                    reset_stream_at => true
+                },
                 stream_type_handler => Claim,
                 h3_datagram_enabled => true,
                 connection_handler => ConnectionHandler
@@ -448,19 +476,22 @@ handle_h2_request(Conn, StreamId, _Method, _Path, _Headers, _Handler, _HandlerOp
 
 handle_h3_request(H3Conn, StreamId, <<"CONNECT">>, Path, Headers,
                   Handler, HandlerOpts, Opts, Router) ->
-    case is_webtransport_h3_request(Headers) of
-        true ->
+    ListenerMode = maps:get(compat_mode, Opts, auto),
+    case classify_h3_connect(Headers, ListenerMode) of
+        {ok, ClientMode} ->
             case run_origin_check(Handler, Headers, HandlerOpts) of
                 accept ->
+                    Opts1 = Opts#{compat_mode => ClientMode},
                     accept_h3_session(H3Conn, StreamId, Path, Headers,
-                                      Handler, HandlerOpts, Opts, Router);
+                                      Handler, HandlerOpts, Opts1, Router);
                 {reject, Status, Reason} ->
                     quic_h3:send_response(H3Conn, StreamId, Status, []),
                     quic_h3:send_data(H3Conn, StreamId, Reason, true)
             end;
-        false ->
+        {error, Reason} ->
+            Body = iolist_to_binary(io_lib:format("Bad Request: ~p", [Reason])),
             quic_h3:send_response(H3Conn, StreamId, 400, []),
-            quic_h3:send_data(H3Conn, StreamId, <<"Bad Request">>, true)
+            quic_h3:send_data(H3Conn, StreamId, Body, true)
     end;
 
 handle_h3_request(H3Conn, StreamId, _Method, _Path, _Headers,
@@ -477,13 +508,28 @@ accept_h2_session(Conn, StreamId, Path, Headers, Handler, HandlerOpts, Opts) ->
         authority => Authority,
         headers => Headers
     },
+    %% Parse WebTransport-Init from the client's CONNECT request and
+    %% apply the greater-of rule (draft-14 §4.3.2) against our defaults.
+    ServerDefaults = #{
+        u  => maps:get(max_streams_uni, Opts, ?DEFAULT_MAX_STREAMS_UNI),
+        bl => maps:get(max_streams_bidi, Opts, ?DEFAULT_MAX_STREAMS_BIDI),
+        br => maps:get(max_data, Opts, ?DEFAULT_MAX_DATA)
+    },
+    Negotiated = case proplists:get_value(<<"webtransport-init">>, Headers) of
+        undefined -> ServerDefaults;
+        InitBin ->
+            case wt_h2_init:parse(InitBin) of
+                {ok, Init} -> wt_h2_init:apply_greater_of(Init, ServerDefaults);
+                {error, _} -> ServerDefaults
+            end
+    end,
     SessionOpts = maps:merge(HandlerOpts, #{
         request => Request,
         is_server => true,
         handler_opts => HandlerOpts,
-        max_data => maps:get(max_data, Opts, ?DEFAULT_MAX_DATA),
-        max_streams_bidi => maps:get(max_streams_bidi, Opts, ?DEFAULT_MAX_STREAMS_BIDI),
-        max_streams_uni => maps:get(max_streams_uni, Opts, ?DEFAULT_MAX_STREAMS_UNI)
+        max_data => maps:get(br, Negotiated, ?DEFAULT_MAX_DATA),
+        max_streams_bidi => maps:get(bl, Negotiated, ?DEFAULT_MAX_STREAMS_BIDI),
+        max_streams_uni => maps:get(u, Negotiated, ?DEFAULT_MAX_STREAMS_UNI)
     }),
     case webtransport_session:start_link(h2, TransportState, Handler, SessionOpts) of
         {ok, Session} ->
@@ -550,7 +596,16 @@ run_origin_check(Handler, Headers, Opts) ->
                     {reject, 500, <<"origin check failed">>}
             end;
         false ->
-            accept
+            %% No custom origin_check/2 callback. The drafts (h3 §3.2,
+            %% h2 §3.2) require: "the server MUST verify the Origin header
+            %% to ensure that the specified origin is allowed". If the
+            %% request carries an Origin header (browser client), reject
+            %% by default so servers cannot accidentally skip verification.
+            %% Non-browser requests (no Origin header) are accepted.
+            case proplists:get_value(<<"origin">>, Headers) of
+                undefined -> accept;
+                _ -> {reject, 403, <<"origin not allowed">>}
+            end
     end.
 
 is_webtransport_request(Headers) ->
@@ -559,12 +614,23 @@ is_webtransport_request(Headers) ->
         _ -> false
     end.
 
-is_webtransport_h3_request(Headers) ->
-    case proplists:get_value(<<":protocol">>, Headers) of
-        <<"webtransport-h3">> -> true;
-        <<"webtransport">> -> true;
-        _ -> false
+%% Classify an incoming h3 CONNECT request against the listener's
+%% compat_mode. Returns `{ok, ClientMode}' when the request is well-formed
+%% and allowed, or `{error, Reason}' when it is malformed or disallowed.
+classify_h3_connect(Headers, ListenerMode) ->
+    case wt_h3:detect_compat_mode(Headers) of
+        {ok, ClientMode} ->
+            case allowed_by_listener(ClientMode, ListenerMode) of
+                true -> {ok, ClientMode};
+                false -> {error, {compat_mode_refused, ClientMode}}
+            end;
+        {error, _} = Err ->
+            Err
     end.
+
+allowed_by_listener(_, auto) -> true;
+allowed_by_listener(Mode, Mode) -> true;
+allowed_by_listener(_, _) -> false.
 
 %% ============================================================================
 %% Internal Functions - Data Loops
@@ -579,8 +645,11 @@ h2_data_loop(Conn, StreamId, Session) ->
                     lists:foreach(fun(Capsule) ->
                         dispatch_h2_capsule(Session, Capsule)
                     end, Capsules);
-                {error, _Reason} ->
-                    ok
+                {error, Reason} ->
+                    %% Malformed capsule framing on the CONNECT stream is
+                    %% a protocol violation. Close the session.
+                    logger:warning("h2 capsule decode error: ~p", [Reason]),
+                    webtransport_session:close(Session, 0, <<"malformed capsule">>)
             end,
             h2_data_loop(Conn, StreamId, Session);
         {h2, Conn, {stream_reset, StreamId, _ErrorCode}} ->
@@ -697,14 +766,23 @@ build_h2_ssl_opts(Opts) ->
     end.
 
 build_h3_connect_opts(Opts) ->
-    %% Use WebTransport settings
-    WTSettings = wt_h3:default_settings(),
+    %% Client picks a compat_mode explicitly; default `latest' (draft-15).
+    %% Clients must not auto-probe the server, so the default is a single
+    %% disjoint handshake shape.
+    CompatMode = case maps:get(compat_mode, Opts, latest) of
+        legacy_browser_compat -> legacy_browser_compat;
+        _ -> latest
+    end,
+    WTSettings = wt_h3:default_settings(CompatMode),
     BaseOpts = #{
         settings => WTSettings,
         sync => true,
         connect_timeout => maps:get(timeout, Opts, 30000),
         verify => maps:get(verify, Opts, verify_peer),
-        quic_opts => #{max_datagram_frame_size => 65535},
+        quic_opts => #{
+            max_datagram_frame_size => 65535,
+            reset_stream_at => true
+        },
         h3_datagram_enabled => true,
         stream_type_handler => fun
             (uni,  _, 16#54) -> claim;
@@ -750,18 +828,20 @@ build_h3_connect_opts(Opts) ->
     end.
 
 h3_validate_and_request(H3Conn, HostBin, Port, Path, Opts, Handler, Router) ->
+    CompatMode = maps:get(compat_mode, Opts, latest),
     QuicConn = quic_h3:get_quic_conn(H3Conn),
-    case wt_h3:validate_wt_support(H3Conn, QuicConn) of
+    case wt_h3:validate_wt_support(H3Conn, QuicConn, CompatMode) of
         ok ->
             Authority = <<HostBin/binary, ":", (integer_to_binary(Port))/binary>>,
-            h3_send_connect(H3Conn, Authority, Path, Opts, Handler, Router);
+            h3_send_connect(H3Conn, Authority, Path, Opts, Handler, Router, CompatMode);
         {error, Reason} ->
             quic_h3:close(H3Conn),
             {error, Reason}
     end.
 
-h3_send_connect(H3Conn, Authority, Path, Opts, Handler, Router) ->
-    case wt_h3:request_session(H3Conn, Authority, Path, maps:get(headers, Opts, [])) of
+h3_send_connect(H3Conn, Authority, Path, Opts, Handler, Router, CompatMode) ->
+    Headers = maps:get(headers, Opts, []),
+    case wt_h3:request_session(H3Conn, Authority, Path, Headers, CompatMode) of
         {ok, SessionId} ->
             h3_await_response(H3Conn, SessionId, Authority, Path, Opts, Handler, Router);
         {error, Reason} ->

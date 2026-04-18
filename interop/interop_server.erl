@@ -44,13 +44,22 @@ start() ->
     %% Store www_dir in persistent term for handler access
     persistent_term:put(interop_www_dir, WwwDir),
 
+    CompatMode = case os:getenv("COMPAT") of
+        "legacy" -> legacy_browser_compat;
+        "legacy_browser_compat" -> legacy_browser_compat;
+        "latest" -> latest;
+        _ -> auto
+    end,
+    io:format("  compat_mode: ~p~n", [CompatMode]),
+
     %% Start the listener
     ListenerOpts = #{
         transport => h3,
         port => list_to_integer(Port),
         certfile => CertFile,
         keyfile => KeyFile,
-        handler => ?MODULE
+        handler => ?MODULE,
+        compat_mode => CompatMode
     },
 
     case webtransport:start_listener(interop_server, ListenerOpts) of

@@ -118,6 +118,11 @@ request_headers(Authority, Path) ->
 
 -spec request_headers(binary(), binary(), [{binary(), binary()}]) -> [{binary(), binary()}].
 request_headers(Authority, Path, ExtraHeaders) ->
+    request_headers(Authority, Path, ExtraHeaders, #{}).
+
+-spec request_headers(binary(), binary(), [{binary(), binary()}], map()) ->
+    [{binary(), binary()}].
+request_headers(Authority, Path, ExtraHeaders, ConnectOpts) ->
     %% h2_connection derives :authority from the "host" header and rejects
     %% duplicate :authority pseudo-headers, so we only send "host" here.
     BaseHeaders = [
@@ -126,7 +131,18 @@ request_headers(Authority, Path, ExtraHeaders) ->
         {<<":path">>, Path},
         {<<"host">>, Authority}
     ],
-    BaseHeaders ++ strip_reserved_headers(ExtraHeaders).
+    %% Emit WebTransport-Init if the caller provided initial windows.
+    InitParams = maps:fold(fun
+        (max_streams_uni, V, Acc) -> Acc#{u => V};
+        (max_streams_bidi, V, Acc) -> Acc#{bl => V};
+        (max_data, V, Acc) -> Acc#{br => V};
+        (_, _, Acc) -> Acc
+    end, #{}, ConnectOpts),
+    InitHeader = case map_size(InitParams) of
+        0 -> [];
+        _ -> [{<<"webtransport-init">>, wt_h2_init:encode(InitParams)}]
+    end,
+    BaseHeaders ++ InitHeader ++ strip_reserved_headers(ExtraHeaders).
 
 -spec is_success_response([{binary(), binary()}]) -> boolean().
 is_success_response(Headers) ->
@@ -230,17 +246,16 @@ strip_reserved_headers(Headers) ->
     [{Name, Value} || {Name, Value} <- Headers, not maps:is_key(Name, Reserved)].
 
 extract_peer_settings(State, Headers) ->
-    %% Extract any WebTransport settings from response headers
-    Settings = lists:foldl(fun
-        ({<<"wt-max-streams-bidi">>, V}, Acc) ->
-            Acc#{max_streams_bidi => binary_to_integer(V)};
-        ({<<"wt-max-streams-uni">>, V}, Acc) ->
-            Acc#{max_streams_uni => binary_to_integer(V)};
-        ({<<"wt-max-data">>, V}, Acc) ->
-            Acc#{max_data => binary_to_integer(V)};
-        (_, Acc) ->
-            Acc
-    end, #{}, Headers),
+    %% Parse WebTransport-Init structured-field header (draft-14 §4.3.2).
+    Settings = case lists:keyfind(<<"webtransport-init">>, 1, Headers) of
+        {_, InitBin} ->
+            case wt_h2_init:parse(InitBin) of
+                {ok, Init} -> Init;
+                {error, _} -> #{}
+            end;
+        false ->
+            #{}
+    end,
     State#state{peer_settings = Settings}.
 
 -ifdef(TEST).
@@ -251,6 +266,15 @@ request_headers_test() ->
     ?assertEqual({<<":protocol">>, <<"webtransport">>}, lists:nth(1, Headers)),
     ?assertEqual({<<"host">>, <<"example.com:443">>},
                  lists:keyfind(<<"host">>, 1, Headers)).
+
+request_headers_with_init_test() ->
+    Headers = request_headers(<<"example.com:443">>, <<"/wt">>, [],
+                              #{max_streams_uni => 50, max_streams_bidi => 100}),
+    ?assert(lists:keymember(<<"webtransport-init">>, 1, Headers)),
+    {_, InitBin} = lists:keyfind(<<"webtransport-init">>, 1, Headers),
+    {ok, Parsed} = wt_h2_init:parse(InitBin),
+    ?assertEqual(50, maps:get(u, Parsed)),
+    ?assertEqual(100, maps:get(bl, Parsed)).
 
 strip_reserved_headers_test() ->
     Input = [

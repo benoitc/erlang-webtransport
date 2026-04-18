@@ -16,10 +16,13 @@
     webtransport_stream,
     webtransport_h2,
     webtransport_h3,
+    webtransport_h3_router,
     webtransport_client_handler,
     wt_h2_capsule,
+    wt_h2_init,
     wt_h3,
-    wt_h3_capsule
+    wt_h3_capsule,
+    wt_error
    ]},
   {licenses, ["Apache-2.0"]},
   {links, [{"GitHub", "https://github.com/benoitc/erlang-webtransport"}]}

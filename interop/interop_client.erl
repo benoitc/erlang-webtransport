@@ -89,10 +89,16 @@ run_testcase(Unknown, _Host, _Port) ->
 %% ============================================================================
 
 connect(Host, Port) ->
+    CompatMode = case os:getenv("COMPAT") of
+        "legacy" -> legacy_browser_compat;
+        "legacy_browser_compat" -> legacy_browser_compat;
+        _ -> latest
+    end,
     webtransport:connect(Host, Port, <<"/interop">>, #{
         transport => h3,
         verify => verify_none,
         timeout => 10000,
+        compat_mode => CompatMode,
         handler_opts => #{owner => self()}
     }).
 
