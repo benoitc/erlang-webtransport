@@ -6,3 +6,5 @@ doc/
 erl_crash.dump
 rebar3.crashdump
 .rebar3/
+cert.pem
+key.pem
