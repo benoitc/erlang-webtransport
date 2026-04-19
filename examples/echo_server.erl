@@ -1,3 +1,6 @@
+%% Copyright (c) 2026, Benoit Chesneau.
+%% Licensed under the Apache License, Version 2.0.
+%%
 %% @doc Simple WebTransport echo server example.
 %%
 %% Demonstrates implementing the webtransport_handler behaviour.
@@ -15,7 +18,7 @@
 -export([start/0, start/1, stop/0]).
 
 %% webtransport_handler callbacks
--export([init/2, handle_stream/4, handle_stream_fin/4]).
+-export([init/3, handle_stream/4, handle_stream_fin/4]).
 -export([handle_datagram/2, handle_stream_closed/3, terminate/2]).
 
 -record(state, {
@@ -58,7 +61,7 @@ stop() ->
 %% webtransport_handler callbacks
 %%====================================================================
 
-init(Session, Req) ->
+init(Session, Req, _Opts) ->
     Path = maps:get(path, Req),
     Authority = maps:get(authority, Req),
     io:format("[~p] Session started: ~s~s~n", [Session, Authority, Path]),

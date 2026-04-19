@@ -1,3 +1,6 @@
+%% Copyright (c) 2026, Benoit Chesneau.
+%% Licensed under the Apache License, Version 2.0.
+%%
 %% @doc WebTransport echo client example.
 %%
 %% Demonstrates connecting to a WebTransport server and using streams/datagrams.
