@@ -1,3 +1,6 @@
+%% Copyright (c) 2026, Benoit Chesneau.
+%% Licensed under the Apache License, Version 2.0.
+%%
 %% @doc WebTransport Public API
 %%
 %% This module provides the public API for WebTransport over HTTP/2 and HTTP/3.

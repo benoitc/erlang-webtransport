@@ -1,3 +1,6 @@
+%% Copyright (c) 2026, Benoit Chesneau.
+%% Licensed under the Apache License, Version 2.0.
+%%
 %% @doc Default WebTransport client handler.
 %%
 %% This handler forwards all events to the controlling process as messages:

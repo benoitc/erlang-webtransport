@@ -1,3 +1,6 @@
+%% Copyright (c) 2026, Benoit Chesneau.
+%% Licensed under the Apache License, Version 2.0.
+%%
 %% @doc Application error code mapping (draft-ietf-webtrans-http3-15 §3.3).
 %%
 %% WebTransport application error codes are 32-bit integers local to the

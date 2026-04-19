@@ -1,3 +1,6 @@
+%% Copyright (c) 2026, Benoit Chesneau.
+%% Licensed under the Apache License, Version 2.0.
+%%
 %% @doc WebTransport-Init structured-field header (draft-14 §4.3.2).
 %%
 %% The WebTransport-Init request header is an RFC 8941 Dictionary with

@@ -1,3 +1,6 @@
+%% Copyright (c) 2026, Benoit Chesneau.
+%% Licensed under the Apache License, Version 2.0.
+%%
 %% @doc HTTP/3 WebTransport capsules and stream/datagram headers.
 %%
 %% HTTP/3 WebTransport uses:

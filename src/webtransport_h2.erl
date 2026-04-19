@@ -1,3 +1,6 @@
+%% Copyright (c) 2026, Benoit Chesneau.
+%% Licensed under the Apache License, Version 2.0.
+%%
 %% @doc HTTP/2 WebTransport runtime wrapper.
 %%
 %% WebTransport over HTTP/2 uses a single CONNECT stream to multiplex all

@@ -1,3 +1,6 @@
+%% Copyright (c) 2026, Benoit Chesneau.
+%% Licensed under the Apache License, Version 2.0.
+%%
 %% @doc WebTransport session state machine.
 %%
 %% This module implements a gen_statem that manages a WebTransport session's

@@ -1,3 +1,6 @@
+%% Copyright (c) 2026, Benoit Chesneau.
+%% Licensed under the Apache License, Version 2.0.
+%%
 %% @doc Minimal runtime wrapper for an HTTP/3 WebTransport session.
 %%
 %% The HTTP/3 CONNECT stream is managed through quic_h3. Native WebTransport

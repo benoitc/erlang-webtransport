@@ -1,3 +1,6 @@
+%% Copyright (c) 2026, Benoit Chesneau.
+%% Licensed under the Apache License, Version 2.0.
+%%
 %% @doc Per-H3-connection router for WebTransport extension events.
 %%
 %% Owns claimed-stream and HTTP-datagram events emitted by quic_h3 for one

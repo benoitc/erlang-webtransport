@@ -1,3 +1,6 @@
+%% Copyright (c) 2026, Benoit Chesneau.
+%% Licensed under the Apache License, Version 2.0.
+%%
 %% @doc HTTP/3 WebTransport protocol helpers.
 %%
 %% This module bridges the generic HTTP/3 connection layer from quic_h3

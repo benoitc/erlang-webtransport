@@ -1,3 +1,6 @@
+%% Copyright (c) 2026, Benoit Chesneau.
+%% Licensed under the Apache License, Version 2.0.
+%%
 %% @doc WebTransport handler behaviour.
 %%
 %% Applications implement this behaviour to handle WebTransport sessions.

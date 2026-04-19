@@ -1,3 +1,6 @@
+%% Copyright (c) 2026, Benoit Chesneau.
+%% Licensed under the Apache License, Version 2.0.
+%%
 %% @doc HTTP/2 WebTransport Capsules (draft-ietf-webtrans-http2-14)
 %%
 %% All WebTransport data over HTTP/2 flows through capsules in the

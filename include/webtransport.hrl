@@ -1,3 +1,6 @@
+%% Copyright (c) 2026, Benoit Chesneau.
+%% Licensed under the Apache License, Version 2.0.
+%%
 %% @doc WebTransport Protocol Definitions
 %%
 %% draft-ietf-webtrans-overview-12 - Protocol Framework
