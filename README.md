@@ -577,14 +577,18 @@ The `examples/` directory contains a working echo server and client.
 Compile and run them:
 
 ```sh
-# Compile examples
-erlc -o examples -pa _build/default/lib/*/ebin -I include \
-  examples/echo_server.erl examples/echo_client.erl
-
 # Generate certs (if not done already)
 openssl req -x509 -newkey rsa:2048 \
   -keyout key.pem -out cert.pem \
   -days 365 -nodes -subj '/CN=localhost'
+
+# Compile examples
+erlc -o examples \
+  -pa _build/default/lib/webtransport/ebin \
+  -pa _build/default/lib/quic/ebin \
+  -pa _build/default/lib/erlang_h2/ebin \
+  -I include \
+  examples/echo_server.erl examples/echo_client.erl
 
 # Start a shell
 rebar3 shell --apps webtransport --pa examples
