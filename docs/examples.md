@@ -23,7 +23,7 @@ erlc -o examples \
   examples/echo_server.erl examples/echo_client.erl
 
 # 4. Start a shell with everything loaded
-rebar3 shell --apps webtransport --pa examples
+ERL_FLAGS="-pa examples" rebar3 shell --apps webtransport
 ```
 
 ## Echo Server

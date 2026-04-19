@@ -591,7 +591,7 @@ erlc -o examples \
   examples/echo_server.erl examples/echo_client.erl
 
 # Start a shell
-rebar3 shell --apps webtransport --pa examples
+ERL_FLAGS="-pa examples" rebar3 shell --apps webtransport
 ```
 
 ```erlang
