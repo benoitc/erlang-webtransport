@@ -447,10 +447,28 @@ draining_apply_transition(_Transition, StateData) ->
     maybe_stop_if_drained(StateData, []).
 
 terminate(Reason, _State, #data{handler = Handler, handler_state = HState,
-                                close_info = CloseInfo}) ->
+                                close_info = CloseInfo,
+                                transport = Transport,
+                                transport_state = TransportState}) ->
+    %% Close the underlying connection gracefully so quic_h3_connection
+    %% enters its `closing' state and exits with `normal' instead of
+    %% `quic_closed'. Without this, the QUIC connection drop races with
+    %% our process exit and produces noisy crash reports.
+    close_transport(Transport, TransportState),
     %% Surface close_info to the handler so it can distinguish a clean
     %% local/remote close (with error code + reason) from an abnormal exit.
     Handler:terminate(augment_reason(Reason, CloseInfo), HState),
+    ok.
+
+close_transport(h3, H3State) ->
+    %% Tell the h3_connection to enter its `closing' state (which exits
+    %% with `normal'). Without this the QUIC connection drop can race
+    %% our exit. On the server side the peer may have already closed
+    %% the QUIC connection before this cast arrives; the upstream fix
+    %% (quic_h3_connection using `{shutdown, quic_closed}' instead of
+    %% bare `quic_closed') eliminates the remaining noise.
+    catch quic_h3:close(webtransport_h3:h3_conn(H3State));
+close_transport(h2, _H2State) ->
     ok.
 
 augment_reason(Reason, undefined) -> Reason;
