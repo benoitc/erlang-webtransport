@@ -45,6 +45,7 @@
 %% Lifecycle
 %% ============================================================================
 
+%% @doc Create a new H2 transport state for the given CONNECT stream.
 -spec new(pid(), non_neg_integer()) -> state().
 new(H2Conn, ConnectStreamId) ->
     #state{
@@ -52,18 +53,22 @@ new(H2Conn, ConnectStreamId) ->
         connect_stream_id = ConnectStreamId
     }.
 
+%% @doc Return a new state with updated peer settings.
 -spec with_peer_settings(state(), map()) -> state().
 with_peer_settings(State, PeerSettings) ->
     State#state{peer_settings = PeerSettings}.
 
+%% @doc Return the HTTP/2 connection pid.
 -spec h2_conn(state()) -> pid().
 h2_conn(#state{h2_conn = H2Conn}) ->
     H2Conn.
 
+%% @doc Return the HTTP/2 CONNECT stream ID used for this session.
 -spec connect_stream_id(state()) -> non_neg_integer().
 connect_stream_id(#state{connect_stream_id = StreamId}) ->
     StreamId.
 
+%% @doc Return the peer's advertised WebTransport settings.
 -spec peer_settings(state()) -> map().
 peer_settings(#state{peer_settings = PeerSettings}) ->
     PeerSettings.
@@ -72,6 +77,7 @@ peer_settings(#state{peer_settings = PeerSettings}) ->
 %% Client Connection
 %% ============================================================================
 
+%% @doc Establish an HTTP/2 WebTransport session to the given host, port, and path.
 -spec connect(string() | binary(), inet:port_number(), binary(), map()) ->
     {ok, state()} | {error, term()}.
 connect(Host, Port, Path, Opts) ->
@@ -112,14 +118,17 @@ connect(Host, Port, Path, Opts) ->
             {error, Reason}
     end.
 
+%% @doc Build CONNECT request headers for an H2 WebTransport session.
 -spec request_headers(binary(), binary()) -> [{binary(), binary()}].
 request_headers(Authority, Path) ->
     request_headers(Authority, Path, []).
 
+%% @doc Build CONNECT request headers with additional custom headers.
 -spec request_headers(binary(), binary(), [{binary(), binary()}]) -> [{binary(), binary()}].
 request_headers(Authority, Path, ExtraHeaders) ->
     request_headers(Authority, Path, ExtraHeaders, #{}).
 
+%% @doc Build CONNECT request headers with custom headers and initial flow-control options.
 -spec request_headers(binary(), binary(), [{binary(), binary()}], map()) ->
     [{binary(), binary()}].
 request_headers(Authority, Path, ExtraHeaders, ConnectOpts) ->
@@ -144,6 +153,7 @@ request_headers(Authority, Path, ExtraHeaders, ConnectOpts) ->
     end,
     BaseHeaders ++ InitHeader ++ strip_reserved_headers(ExtraHeaders).
 
+%% @doc Return true if the response headers contain a 2xx status code.
 -spec is_success_response([{binary(), binary()}]) -> boolean().
 is_success_response(Headers) ->
     case lists:keyfind(<<":status">>, 1, Headers) of
@@ -160,12 +170,14 @@ is_success_response(Headers) ->
 %% WebTransport Streams (multiplexed over capsules)
 %% ============================================================================
 
+%% @doc No-op: H2 streams are implicitly opened when first used via capsules.
 -spec open_stream(state(), non_neg_integer(), bidi | uni) -> ok | {error, term()}.
 open_stream(_State, _StreamId, _Type) ->
     %% In HTTP/2, streams are implicitly opened when first used
     %% No explicit open operation needed
     ok.
 
+%% @doc Send data on a multiplexed stream via a WT_STREAM capsule.
 -spec send(state(), non_neg_integer(), iodata(), boolean()) -> ok | {error, term()}.
 send(#state{h2_conn = H2Conn, connect_stream_id = ConnectStreamId}, StreamId, Data, Fin) ->
     DataBin = iolist_to_binary(Data),
@@ -175,6 +187,7 @@ send(#state{h2_conn = H2Conn, connect_stream_id = ConnectStreamId}, StreamId, Da
     end,
     h2:send_data(H2Conn, ConnectStreamId, wt_h2_capsule:encode(Capsule), false).
 
+%% @doc Send an unreliable datagram via the DATAGRAM capsule type.
 -spec send_datagram(state(), binary()) -> ok | {error, term()}.
 send_datagram(_State, Data) when byte_size(Data) > ?WT_H2_DATAGRAM_MAX ->
     {error, datagram_too_large};
@@ -186,11 +199,13 @@ send_datagram(#state{h2_conn = H2Conn, connect_stream_id = ConnectStreamId}, Dat
 %% Session Control
 %% ============================================================================
 
+%% @doc Send a CLOSE_WEBTRANSPORT_SESSION capsule and FIN the CONNECT stream.
 -spec close_session(state(), non_neg_integer(), binary()) -> ok | {error, term()}.
 close_session(#state{h2_conn = H2Conn, connect_stream_id = ConnectStreamId}, ErrorCode, Reason) ->
     Capsule = wt_h2_capsule:close_session(ErrorCode, Reason),
     h2:send_data(H2Conn, ConnectStreamId, wt_h2_capsule:encode(Capsule), true).
 
+%% @doc Send a DRAIN_WEBTRANSPORT_SESSION capsule to signal graceful shutdown.
 -spec drain_session(state()) -> ok | {error, term()}.
 drain_session(#state{h2_conn = H2Conn, connect_stream_id = ConnectStreamId}) ->
     Capsule = wt_h2_capsule:drain_session(),
@@ -200,19 +215,19 @@ drain_session(#state{h2_conn = H2Conn, connect_stream_id = ConnectStreamId}) ->
 %% Stream Control (via capsules)
 %% ============================================================================
 
+%% @doc Reset a multiplexed stream by sending a WT_RESET_STREAM capsule.
 -spec reset_stream(state(), non_neg_integer(), non_neg_integer()) -> ok | {error, term()}.
 reset_stream(#state{h2_conn = H2Conn, connect_stream_id = ConnectStreamId}, StreamId, ErrorCode) ->
     Capsule = wt_h2_capsule:reset_stream(StreamId, ErrorCode),
     h2:send_data(H2Conn, ConnectStreamId, wt_h2_capsule:encode(Capsule), false).
 
+%% @doc Request the peer stop sending on a stream via a WT_STOP_SENDING capsule.
 -spec stop_sending(state(), non_neg_integer(), non_neg_integer()) -> ok | {error, term()}.
 stop_sending(#state{h2_conn = H2Conn, connect_stream_id = ConnectStreamId}, StreamId, ErrorCode) ->
     Capsule = wt_h2_capsule:stop_sending(StreamId, ErrorCode),
     h2:send_data(H2Conn, ConnectStreamId, wt_h2_capsule:encode(Capsule), false).
 
-%% Write an already-constructed capsule on the CONNECT stream. Used by the
-%% session to emit flow-control signalling (WT_DATA_BLOCKED etc.) without
-%% each call site having to know the h2 connection / stream id pair.
+%% @doc Write a pre-built capsule on the CONNECT stream (e.g. for flow-control signalling).
 -spec send_capsule(state(), wt_h2_capsule:capsule()) -> ok | {error, term()}.
 send_capsule(#state{h2_conn = H2Conn, connect_stream_id = ConnectStreamId}, Capsule) ->
     h2:send_data(H2Conn, ConnectStreamId, wt_h2_capsule:encode(Capsule), false).
@@ -221,11 +236,13 @@ send_capsule(#state{h2_conn = H2Conn, connect_stream_id = ConnectStreamId}, Caps
 %% Capsule Decoding
 %% ============================================================================
 
+%% @doc Decode a single capsule from the binary buffer, returning any remainder.
 -spec decode_capsule(binary()) ->
     {ok, wt_h2_capsule:capsule(), binary()} | {more, pos_integer()} | {error, term()}.
 decode_capsule(Bin) ->
     wt_h2_capsule:decode(Bin).
 
+%% @doc Decode all complete capsules from the binary buffer, returning the unparsed tail.
 -spec decode_capsules(binary()) ->
     {ok, [wt_h2_capsule:capsule()], binary()} | {error, term()}.
 decode_capsules(Bin) ->

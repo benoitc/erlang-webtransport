@@ -45,34 +45,42 @@
 %% Constructors
 %% ============================================================================
 
+%% @doc Construct a MAX_DATA capsule with the given connection-level limit.
 -spec max_data(non_neg_integer()) -> capsule().
 max_data(Limit) ->
     {max_data, Limit}.
 
+%% @doc Construct a DATA_BLOCKED capsule indicating the connection-level limit reached.
 -spec data_blocked(non_neg_integer()) -> capsule().
 data_blocked(Limit) ->
     {data_blocked, Limit}.
 
+%% @doc Construct a MAX_STREAMS capsule for bidirectional streams.
 -spec max_streams_bidi(non_neg_integer()) -> capsule().
 max_streams_bidi(Limit) ->
     {max_streams_bidi, Limit}.
 
+%% @doc Construct a MAX_STREAMS capsule for unidirectional streams.
 -spec max_streams_uni(non_neg_integer()) -> capsule().
 max_streams_uni(Limit) ->
     {max_streams_uni, Limit}.
 
+%% @doc Construct a STREAMS_BLOCKED capsule for bidirectional streams.
 -spec streams_blocked_bidi(non_neg_integer()) -> capsule().
 streams_blocked_bidi(Limit) ->
     {streams_blocked_bidi, Limit}.
 
+%% @doc Construct a STREAMS_BLOCKED capsule for unidirectional streams.
 -spec streams_blocked_uni(non_neg_integer()) -> capsule().
 streams_blocked_uni(Limit) ->
     {streams_blocked_uni, Limit}.
 
+%% @doc Construct a CLOSE_SESSION capsule with the given error code and no reason.
 -spec close_session(non_neg_integer()) -> capsule().
 close_session(ErrorCode) ->
     {close_session, ErrorCode, <<>>}.
 
+%% @doc Construct a CLOSE_SESSION capsule with the given error code and reason.
 %% draft-15 §5: the Reason field MUST be at most 1024 UTF-8 bytes.
 -spec close_session(non_neg_integer(), binary()) -> capsule() | {error, reason_too_long}.
 close_session(_ErrorCode, Reason) when byte_size(Reason) > 1024 ->
@@ -80,6 +88,7 @@ close_session(_ErrorCode, Reason) when byte_size(Reason) > 1024 ->
 close_session(ErrorCode, Reason) ->
     {close_session, ErrorCode, Reason}.
 
+%% @doc Construct a DRAIN_SESSION capsule to signal graceful shutdown.
 -spec drain_session() -> capsule().
 drain_session() ->
     {drain_session}.
@@ -88,6 +97,7 @@ drain_session() ->
 %% Encoding
 %% ============================================================================
 
+%% @doc Encode a capsule record into its wire-format binary.
 -spec encode(capsule()) -> binary().
 encode({max_data, Limit}) ->
     h2_capsule:encode(?WT_MAX_DATA, h2_varint:encode(Limit));
@@ -111,6 +121,7 @@ encode({drain_session}) ->
 %% Decoding
 %% ============================================================================
 
+%% @doc Decode the first capsule from a binary, returning the capsule and remaining bytes.
 -spec decode(binary()) -> {ok, capsule(), binary()} | {more, pos_integer()} | {error, term()}.
 decode(Bin) ->
     case h2_capsule:decode(Bin) of
@@ -153,6 +164,7 @@ decode_payload(?WT_DRAIN_SESSION_H3, _) ->
 decode_payload(Type, Payload) when is_integer(Type) ->
     {ok, {unknown, Type, Payload}}.
 
+%% @doc Decode all capsules from a binary, returning the list and any trailing bytes.
 -spec decode_all(binary()) -> {ok, [capsule()], binary()} | {error, term()}.
 decode_all(Bin) ->
     decode_all(Bin, []).
@@ -180,16 +192,19 @@ decode_limit(Name, Payload) ->
 %% Native Stream Headers
 %% ============================================================================
 
+%% @doc Encode a unidirectional WebTransport stream header for the given session.
 -spec encode_uni_stream_header(non_neg_integer()) -> binary().
 encode_uni_stream_header(SessionId) ->
     validate_session_id(SessionId),
     <<(h2_varint:encode(?WT_UNI_STREAM_TYPE))/binary, (h2_varint:encode(SessionId))/binary>>.
 
+%% @doc Encode a bidirectional WebTransport stream header for the given session.
 -spec encode_bidi_stream_header(non_neg_integer()) -> binary().
 encode_bidi_stream_header(SessionId) ->
     validate_session_id(SessionId),
     <<(h2_varint:encode(?WT_BIDI_SIGNAL))/binary, (h2_varint:encode(SessionId))/binary>>.
 
+%% @doc Decode a WebTransport stream header, returning the session ID and stream kind.
 -spec decode_stream_header(binary()) ->
     {ok, non_neg_integer(), stream_kind(), binary()} | {more, pos_integer()} | {error, term()}.
 decode_stream_header(Bin) ->
@@ -217,21 +232,25 @@ decode_stream_session_id(Kind, Bin) ->
 %% HTTP Datagrams
 %% ============================================================================
 
+%% @doc Convert a session ID to its quarter stream ID for datagram framing.
 -spec quarter_stream_id(non_neg_integer()) -> non_neg_integer().
 quarter_stream_id(SessionId) when is_integer(SessionId), SessionId >= 0, SessionId rem 4 =:= 0 ->
     SessionId div 4;
 quarter_stream_id(SessionId) ->
     error({invalid_session_id, SessionId}).
 
+%% @doc Convert a quarter stream ID back to the original session ID.
 -spec session_id_from_quarter_stream_id(non_neg_integer()) -> non_neg_integer().
 session_id_from_quarter_stream_id(QuarterStreamId) when is_integer(QuarterStreamId), QuarterStreamId >= 0 ->
     QuarterStreamId * 4.
 
+%% @doc Encode an HTTP Datagram payload with the quarter stream ID prefix.
 -spec encode_datagram(non_neg_integer(), binary()) -> binary().
 encode_datagram(SessionId, Data) ->
     QuarterStreamId = quarter_stream_id(SessionId),
     <<(h2_varint:encode(QuarterStreamId))/binary, Data/binary>>.
 
+%% @doc Decode an HTTP Datagram, returning the session ID and payload.
 -spec decode_datagram(binary()) ->
     {ok, non_neg_integer(), binary()} | {more, pos_integer()} | {error, term()}.
 decode_datagram(Bin) ->
@@ -248,6 +267,7 @@ decode_datagram(Bin) ->
 %% Helpers
 %% ============================================================================
 
+%% @doc Return the human-readable atom for a capsule type code.
 -spec type_name(non_neg_integer()) -> atom() | non_neg_integer().
 type_name(?WT_MAX_DATA) -> max_data;
 type_name(?WT_DATA_BLOCKED) -> data_blocked;

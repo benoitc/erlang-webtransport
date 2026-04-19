@@ -65,67 +65,84 @@
 %% API
 %% ============================================================================
 
+%% @doc Start a session with default gen_statem options.
 -spec start_link(h2 | h3, term(), module(), map()) -> {ok, pid()} | {error, term()}.
 start_link(Transport, TransportState, Handler, Opts) ->
     start_link(Transport, TransportState, Handler, Opts, []).
 
+%% @doc Start a session linked to the caller, with explicit gen_statem start options.
 -spec start_link(h2 | h3, term(), module(), map(), list()) -> {ok, pid()} | {error, term()}.
 start_link(Transport, TransportState, Handler, Opts, StartOpts) ->
     gen_statem:start_link(?MODULE, {Transport, TransportState, Handler, Opts}, StartOpts).
 
+%% @doc Send data on a stream. Set Fin to true to half-close the local side.
 -spec send(session(), stream_ref(), iodata(), boolean()) -> ok | {error, term()}.
 send(Session, StreamId, Data, Fin) ->
     gen_statem:call(Session, {send, StreamId, iolist_to_binary(Data), Fin}).
 
+%% @doc Send an unreliable datagram on the session.
 -spec send_datagram(session(), iodata()) -> ok | {error, term()}.
 send_datagram(Session, Data) ->
     gen_statem:call(Session, {send_datagram, iolist_to_binary(Data)}).
 
+%% @doc Open a new locally-initiated stream of the given type.
 -spec open_stream(session(), bidi | uni) -> {ok, stream_ref()} | {error, term()}.
 open_stream(Session, Type) ->
     gen_statem:call(Session, {open_stream, Type}).
 
+%% @doc Gracefully close a stream by sending FIN.
 -spec close_stream(session(), stream_ref()) -> ok | {error, term()}.
 close_stream(Session, StreamId) ->
     gen_statem:call(Session, {close_stream, StreamId}).
 
+%% @doc Abruptly reset a stream with the given application error code.
 -spec reset_stream(session(), stream_ref(), non_neg_integer()) -> ok | {error, term()}.
 reset_stream(Session, StreamId, ErrorCode) ->
     gen_statem:call(Session, {reset_stream, StreamId, ErrorCode}).
 
+%% @doc Ask the peer to stop sending on a stream with the given error code.
 -spec stop_sending(session(), stream_ref(), non_neg_integer()) -> ok | {error, term()}.
 stop_sending(Session, StreamId, ErrorCode) ->
     gen_statem:call(Session, {stop_sending, StreamId, ErrorCode}).
 
+%% @doc Initiate a graceful drain: no new streams, existing ones finish.
 -spec drain(session()) -> ok.
 drain(Session) ->
     gen_statem:cast(Session, drain).
 
+%% @doc Close the session immediately with the given error code and reason.
 -spec close(session(), non_neg_integer(), binary()) -> ok.
 close(Session, ErrorCode, Reason) ->
     gen_statem:cast(Session, {close, ErrorCode, Reason}).
 
+%% @doc Return a map of session metrics: stream count, flow control limits, bytes sent/received.
 -spec get_info(session()) -> {ok, map()} | {error, term()}.
 get_info(Session) ->
     gen_statem:call(Session, get_info).
 
 %% Internal API
+
+%% @doc Deliver a decoded capsule to the session (called by transport layers).
 -spec handle_capsule(session(), term()) -> ok.
 handle_capsule(Session, Capsule) ->
     gen_statem:cast(Session, {capsule, Capsule}).
 
+%% @doc Deliver inbound stream data to the session (called by transport layers).
 -spec handle_stream_data(session(), stream_ref(), binary(), boolean()) -> ok.
 handle_stream_data(Session, StreamId, Data, Fin) ->
     gen_statem:cast(Session, {stream_data, StreamId, Data, Fin}).
 
+%% @doc Deliver an inbound datagram payload to the session.
 -spec handle_datagram_data(session(), binary()) -> ok.
 handle_datagram_data(Session, Data) ->
     gen_statem:cast(Session, {datagram_data, Data}).
 
+%% @doc Notify the session that a peer-initiated stream was opened.
 -spec handle_stream_opened(session(), stream_ref(), bidi | uni) -> ok.
 handle_stream_opened(Session, StreamId, Type) ->
     gen_statem:cast(Session, {stream_opened, StreamId, Type}).
 
+%% @doc Notify the session that a stream was closed or reset by the peer.
 -spec handle_stream_closed(session(), stream_ref(), term()) -> ok.
 handle_stream_closed(Session, StreamId, Reason) ->
     gen_statem:cast(Session, {stream_closed, StreamId, Reason}).

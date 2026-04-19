@@ -31,6 +31,7 @@
 default_settings() ->
     default_settings(latest).
 
+%% @doc Return default H3 settings for the given compatibility mode.
 -spec default_settings(compat_mode()) -> map().
 default_settings(latest) ->
     %% draft-15 §3.1: servers advertise wt_enabled plus initial
@@ -57,14 +58,17 @@ default_settings(legacy_browser_compat) ->
 %% Session Establishment
 %% ============================================================================
 
+%% @doc Build WebTransport CONNECT request headers for the latest draft.
 -spec request_headers(binary(), binary()) -> headers().
 request_headers(Authority, Path) ->
     request_headers(Authority, Path, [], latest).
 
+%% @doc Build WebTransport CONNECT request headers with additional custom headers.
 -spec request_headers(binary(), binary(), headers()) -> headers().
 request_headers(Authority, Path, ExtraHeaders) ->
     request_headers(Authority, Path, ExtraHeaders, latest).
 
+%% @doc Build WebTransport CONNECT request headers for the specified compat mode.
 -spec request_headers(binary(), binary(), headers(), compat_mode()) -> headers().
 request_headers(Authority, Path, ExtraHeaders, latest) ->
     %% draft-15 §3.2: `:protocol' MUST be `webtransport-h3'. No draft-02
@@ -90,17 +94,20 @@ request_headers(Authority, Path, ExtraHeaders, legacy_browser_compat) ->
     ],
     BaseHeaders ++ strip_reserved_headers(ExtraHeaders).
 
+%% @doc Send a WebTransport CONNECT request on the H3 connection, returning the stream ID.
 -spec request_session(pid(), binary(), binary(), headers()) ->
     {ok, non_neg_integer()} | {error, term()}.
 request_session(H3Conn, Authority, Path, ExtraHeaders) ->
     request_session(H3Conn, Authority, Path, ExtraHeaders, latest).
 
+%% @doc Send a WebTransport CONNECT request using the given compat mode.
 -spec request_session(pid(), binary(), binary(), headers(), compat_mode()) ->
     {ok, non_neg_integer()} | {error, term()}.
 request_session(H3Conn, Authority, Path, ExtraHeaders, CompatMode) ->
     Headers = request_headers(Authority, Path, ExtraHeaders, CompatMode),
     quic_h3:request(H3Conn, Headers, #{end_stream => false}).
 
+%% @doc Extract the numeric HTTP status code from response headers.
 -spec response_status(headers()) -> {ok, non_neg_integer()} | {error, term()}.
 response_status(Headers) ->
     case lists:keyfind(<<":status">>, 1, Headers) of
@@ -114,6 +121,7 @@ response_status(Headers) ->
             {error, missing_status}
     end.
 
+%% @doc Return true if the response headers contain a 2xx status code.
 -spec is_success_response(headers()) -> boolean().
 is_success_response(Headers) ->
     case response_status(Headers) of
@@ -125,10 +133,12 @@ is_success_response(Headers) ->
 %% Peer Validation
 %% ============================================================================
 
+%% @doc Check that the peer advertises WebTransport support (latest draft).
 -spec validate_wt_support(pid(), pid()) -> ok | {error, term()}.
 validate_wt_support(H3Conn, QuicConn) ->
     validate_wt_support(H3Conn, QuicConn, latest).
 
+%% @doc Check that the peer advertises WebTransport support for the given compat mode.
 -spec validate_wt_support(pid(), pid(), compat_mode()) -> ok | {error, term()}.
 validate_wt_support(H3Conn, QuicConn, CompatMode) ->
     case quic_h3:get_peer_settings(H3Conn) of
@@ -188,6 +198,7 @@ setting_enabled(Settings, Key) ->
 %% compat mode it is asking for. Returns `{ok, latest | legacy_browser_compat}'
 %% on a well-formed request or `{error, Reason}' if the three signals
 %% disagree.
+%% @doc Determine the compat mode (latest or legacy) from incoming CONNECT headers.
 -spec detect_compat_mode(headers()) ->
     {ok, compat_mode()} | {error, term()}.
 detect_compat_mode(Headers) ->
@@ -221,14 +232,17 @@ header_value(Name, Headers) ->
 %% CONNECT Stream Capsules
 %% ============================================================================
 
+%% @doc Encode and send a capsule on the CONNECT stream for the given session.
 -spec send_capsule(pid(), non_neg_integer(), wt_h3_capsule:capsule()) -> ok | {error, term()}.
 send_capsule(H3Conn, SessionId, Capsule) ->
     quic_h3:send_data(H3Conn, SessionId, wt_h3_capsule:encode(Capsule), false).
 
+%% @doc Send a CLOSE_WEBTRANSPORT_SESSION capsule on the CONNECT stream.
 -spec close_session(pid(), non_neg_integer(), non_neg_integer(), binary()) -> ok | {error, term()}.
 close_session(H3Conn, SessionId, ErrorCode, Reason) ->
     send_capsule(H3Conn, SessionId, wt_h3_capsule:close_session(ErrorCode, Reason)).
 
+%% @doc Send a DRAIN_WEBTRANSPORT_SESSION capsule to signal graceful shutdown.
 -spec drain_session(pid(), non_neg_integer()) -> ok | {error, term()}.
 drain_session(H3Conn, SessionId) ->
     send_capsule(H3Conn, SessionId, wt_h3_capsule:drain_session()).

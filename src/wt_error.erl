@@ -20,14 +20,17 @@
 
 -define(WT_APP_ERROR_LAST, ?WT_APP_ERROR_FIRST + 16#ffffffff + (16#ffffffff div 30)).
 
+%% @doc Return the {First, Last} QUIC error code range reserved for WT app errors.
 -spec app_error_range() -> {non_neg_integer(), non_neg_integer()}.
 app_error_range() ->
     {?WT_APP_ERROR_FIRST, ?WT_APP_ERROR_LAST}.
 
+%% @doc Map a 32-bit application error code to its QUIC wire representation.
 -spec to_quic(non_neg_integer()) -> non_neg_integer().
 to_quic(App) when is_integer(App), App >= 0, App =< 16#ffffffff ->
     ?WT_APP_ERROR_FIRST + App + App div 30.
 
+%% @doc Map a QUIC wire error code back to the application error, or error if out of range.
 -spec from_quic(non_neg_integer()) -> {ok, non_neg_integer()} | error.
 from_quic(Q) when is_integer(Q), Q >= ?WT_APP_ERROR_FIRST, Q =< ?WT_APP_ERROR_LAST ->
     Diff = Q - ?WT_APP_ERROR_FIRST,

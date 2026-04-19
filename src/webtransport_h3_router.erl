@@ -38,46 +38,49 @@
 %% API
 %% ============================================================================
 
+%% @doc Start a router with no passthrough target.
 -spec start_link() -> {ok, pid()}.
 start_link() ->
     start_link(undefined).
 
+%% @doc Start a linked router, forwarding unhandled H3 events to Passthrough.
 -spec start_link(undefined | pid()) -> {ok, pid()}.
 start_link(Passthrough) ->
     gen_server:start_link(?MODULE, [Passthrough], []).
 
+%% @doc Start an unlinked router with the given passthrough target.
 -spec start(undefined | pid()) -> {ok, pid()}.
 start(Passthrough) ->
     gen_server:start(?MODULE, [Passthrough], []).
 
+%% @doc Set or clear the passthrough pid for unhandled H3 events.
 -spec set_passthrough(pid(), undefined | pid()) -> ok.
 set_passthrough(Router, Pid) ->
     gen_server:call(Router, {set_passthrough, Pid}).
 
+%% @doc Register a session pid for the given session ID.
 -spec register_session(pid(), non_neg_integer(), pid()) -> ok.
 register_session(Router, SessionId, SessionPid) ->
     gen_server:call(Router, {register, SessionId, SessionPid}).
 
+%% @doc Remove the session registration for the given session ID.
 -spec unregister_session(pid(), non_neg_integer()) -> ok.
 unregister_session(Router, SessionId) ->
     gen_server:call(Router, {unregister, SessionId}).
 
-%% Run quic_h3:connect/3 from inside the router so the router becomes the
-%% H3 connection owner.
+%% @doc Connect to an H3 server. The router becomes the H3 connection owner.
 -spec client_connect(pid(), string() | binary(), inet:port_number(), map()) ->
     {ok, pid()} | {error, term()}.
 client_connect(Router, Host, Port, H3Opts) ->
     gen_server:call(Router, {client_connect, Host, Port, H3Opts}, infinity).
 
-%% Atomically open a client-initiated WT bidi stream: pre-claim on quic_h3
-%% with the WT bidi signal, register the new StreamId against the session,
-%% send the session-id header, all before any inbound stream_type_* events
-%% on that stream can be processed from our mailbox.
+%% @doc Open a client-initiated WT bidi stream, sending the session-id header atomically.
 -spec open_bidi_stream(pid(), non_neg_integer()) ->
     {ok, non_neg_integer()} | {error, term()}.
 open_bidi_stream(Router, SessionId) ->
     gen_server:call(Router, {open_bidi_stream, SessionId}, infinity).
 
+%% @doc Return the H3 connection pid, or undefined if not yet connected.
 -spec get_h3_conn(pid()) -> undefined | pid().
 get_h3_conn(Router) ->
     gen_server:call(Router, get_h3_conn).

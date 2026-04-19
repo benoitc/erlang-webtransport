@@ -50,76 +50,93 @@
 %% Capsule Constructors
 %% ============================================================================
 
+%% @doc Construct a PADDING capsule of the given size or from raw bytes.
 -spec padding(non_neg_integer() | binary()) -> capsule().
 padding(Size) when is_integer(Size) ->
     {padding, binary:copy(<<0>>, Size)};
 padding(Data) when is_binary(Data) ->
     {padding, Data}.
 
+%% @doc Construct a WT_STREAM capsule carrying data for the given stream.
 -spec wt_stream(stream_id(), binary()) -> capsule().
 wt_stream(StreamId, Data) ->
     {wt_stream, StreamId, Data}.
 
+%% @doc Construct a WT_STREAM or WT_STREAM_FIN capsule depending on the fin flag.
 -spec wt_stream(stream_id(), binary(), boolean()) -> capsule().
 wt_stream(StreamId, Data, true) ->
     {wt_stream_fin, StreamId, Data};
 wt_stream(StreamId, Data, false) ->
     {wt_stream, StreamId, Data}.
 
+%% @doc Construct a WT_STREAM_FIN capsule carrying data with the fin bit set.
 -spec wt_stream_fin(stream_id(), binary()) -> capsule().
 wt_stream_fin(StreamId, Data) ->
     {wt_stream_fin, StreamId, Data}.
 
+%% @doc Construct a WT_STREAM_FIN or WT_STREAM capsule depending on the fin flag.
 -spec wt_stream_fin(stream_id(), binary(), boolean()) -> capsule().
 wt_stream_fin(StreamId, Data, true) ->
     {wt_stream_fin, StreamId, Data};
 wt_stream_fin(StreamId, Data, false) ->
     {wt_stream, StreamId, Data}.
 
+%% @doc Construct a RESET_STREAM capsule for the given stream and error code.
 -spec reset_stream(stream_id(), error_code()) -> capsule().
 reset_stream(StreamId, ErrorCode) ->
     {reset_stream, StreamId, ErrorCode}.
 
+%% @doc Construct a STOP_SENDING capsule for the given stream and error code.
 -spec stop_sending(stream_id(), error_code()) -> capsule().
 stop_sending(StreamId, ErrorCode) ->
     {stop_sending, StreamId, ErrorCode}.
 
+%% @doc Construct a MAX_DATA capsule with the given connection-level limit.
 -spec max_data(non_neg_integer()) -> capsule().
 max_data(Limit) ->
     {max_data, Limit}.
 
+%% @doc Construct a MAX_STREAM_DATA capsule for the given stream and limit.
 -spec max_stream_data(stream_id(), non_neg_integer()) -> capsule().
 max_stream_data(StreamId, Limit) ->
     {max_stream_data, StreamId, Limit}.
 
+%% @doc Construct a MAX_STREAMS capsule for bidirectional streams.
 -spec max_streams_bidi(non_neg_integer()) -> capsule().
 max_streams_bidi(Limit) ->
     {max_streams_bidi, Limit}.
 
+%% @doc Construct a MAX_STREAMS capsule for unidirectional streams.
 -spec max_streams_uni(non_neg_integer()) -> capsule().
 max_streams_uni(Limit) ->
     {max_streams_uni, Limit}.
 
+%% @doc Construct a DATA_BLOCKED capsule indicating the connection-level limit reached.
 -spec data_blocked(non_neg_integer()) -> capsule().
 data_blocked(Limit) ->
     {data_blocked, Limit}.
 
+%% @doc Construct a STREAM_DATA_BLOCKED capsule for the given stream and limit.
 -spec stream_data_blocked(stream_id(), non_neg_integer()) -> capsule().
 stream_data_blocked(StreamId, Limit) ->
     {stream_data_blocked, StreamId, Limit}.
 
+%% @doc Construct a STREAMS_BLOCKED capsule for bidirectional streams.
 -spec streams_blocked_bidi(non_neg_integer()) -> capsule().
 streams_blocked_bidi(Limit) ->
     {streams_blocked_bidi, Limit}.
 
+%% @doc Construct a STREAMS_BLOCKED capsule for unidirectional streams.
 -spec streams_blocked_uni(non_neg_integer()) -> capsule().
 streams_blocked_uni(Limit) ->
     {streams_blocked_uni, Limit}.
 
+%% @doc Construct a CLOSE_SESSION capsule with the given error code and no reason.
 -spec close_session(error_code()) -> capsule().
 close_session(ErrorCode) ->
     {close_session, ErrorCode, <<>>}.
 
+%% @doc Construct a CLOSE_SESSION capsule with the given error code and reason.
 %% draft-14 §4.6: the Reason field MUST be at most 1024 UTF-8 bytes.
 -spec close_session(error_code(), binary()) -> capsule() | {error, reason_too_long}.
 close_session(_ErrorCode, Reason) when byte_size(Reason) > 1024 ->
@@ -127,10 +144,12 @@ close_session(_ErrorCode, Reason) when byte_size(Reason) > 1024 ->
 close_session(ErrorCode, Reason) ->
     {close_session, ErrorCode, Reason}.
 
+%% @doc Construct a DRAIN_SESSION capsule to signal graceful shutdown.
 -spec drain_session() -> capsule().
 drain_session() ->
     {drain_session}.
 
+%% @doc Construct a DATAGRAM capsule wrapping the given payload.
 -spec datagram(binary()) -> capsule().
 datagram(Data) ->
     {datagram, Data}.
@@ -139,6 +158,7 @@ datagram(Data) ->
 %% Encoding
 %% ============================================================================
 
+%% @doc Encode a capsule record into its wire-format binary.
 -spec encode(capsule()) -> binary().
 encode({padding, Data}) ->
     h2_capsule:encode(?WT_PADDING, Data);
@@ -203,6 +223,7 @@ encode({datagram, Data}) ->
 %% Decoding
 %% ============================================================================
 
+%% @doc Decode the first capsule from a binary, returning the capsule and remaining bytes.
 -spec decode(binary()) -> {ok, capsule(), binary()} | {more, pos_integer()} | {error, term()}.
 decode(Bin) ->
     case h2_capsule:decode(Bin) of
