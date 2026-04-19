@@ -108,6 +108,7 @@ init_per_suite(Config) ->
     %% Start required applications
     {ok, _} = application:ensure_all_started(crypto),
     {ok, _} = application:ensure_all_started(ssl),
+    {ok, _} = application:ensure_all_started(h2),
     {ok, _} = application:ensure_all_started(quic),
 
     %% Generate test certificates

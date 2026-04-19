@@ -36,32 +36,13 @@
 
 %% HTTP/3 Settings.
 %%
-%% Default (latest-spec) path, draft-15 §9.2:
-%%   SETTINGS_WT_ENABLED                   0x2c7cf000  boolean enabling WebTransport
-%%   SETTINGS_WT_INITIAL_MAX_DATA          0x2b61      initial session flow-control window
-%%   SETTINGS_WT_INITIAL_MAX_STREAMS_UNI   0x2b64      initial peer uni stream count
-%%   SETTINGS_WT_INITIAL_MAX_STREAMS_BIDI  0x2b65      initial peer bidi stream count
-%% plus SETTINGS_ENABLE_CONNECT_PROTOCOL and SETTINGS_H3_DATAGRAM from RFC 8441 / 9297.
+%% The WT settings (wt_enabled, wt_initial_max_data, etc.) are now
+%% defined as atoms in erlang_quic (quic_h3.hrl) and erlang_h2 (h2.hrl).
+%% Use the atom keys directly in settings maps rather than integer macros.
 %%
-%% Legacy-browser-compat path (draft-02, still what Chrome / Firefox / quic-go
-%% v0.9 ship) uses a separate boolean gate plus a Sec-Webtransport-Http3-Draft02
-%% request header. The two paths are disjoint: never advertise both in the same
-%% handshake.
--define(SETTINGS_WT_ENABLED,                  16#2c7cf000).
--define(SETTINGS_WT_INITIAL_MAX_DATA,         16#2b61).
--define(SETTINGS_WT_INITIAL_MAX_STREAMS_UNI,  16#2b64).
--define(SETTINGS_WT_INITIAL_MAX_STREAMS_BIDI, 16#2b65).
+%% Legacy draft-02 compat uses a separate integer codepoint not in either
+%% upstream library:
 -define(SETTINGS_ENABLE_WEBTRANSPORT_DRAFT02, 16#2b603742).
--define(SETTINGS_ENABLE_CONNECT_PROTOCOL,     16#08).
--define(SETTINGS_H3_DATAGRAM,                 16#33).
-
-%% HTTP/2 WebTransport SETTINGS (draft-14 §11.2).
-%% These are defined here for completeness but cannot be advertised via
-%% the vendored erlang_h2 library today (h2_settings strips unknown IDs).
-%% Upstream fix needed: <https://github.com/benoitc/erlang_h2/issues/N>.
--define(SETTINGS_WT_INITIAL_MAX_STREAM_DATA_UNI,         16#2b62).
--define(SETTINGS_WT_INITIAL_MAX_STREAM_DATA_BIDI_LOCAL,  16#2b63).
--define(SETTINGS_WT_INITIAL_MAX_STREAM_DATA_BIDI_REMOTE, 16#2b66).
 
 %% HTTP/3 Unidirectional Stream Type
 -define(WT_UNI_STREAM_TYPE, 16#54).

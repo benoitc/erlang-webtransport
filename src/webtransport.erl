@@ -311,12 +311,21 @@ start_h2_listener(Name, Opts) ->
     %% Create wrapper handler for H2
     H2Handler = make_h2_handler(Handler, HandlerOpts, Opts),
 
+    WtSettings = #{
+        enable_connect_protocol => 1,
+        wt_initial_max_data =>
+            maps:get(max_data, Opts, ?DEFAULT_MAX_DATA),
+        wt_initial_max_streams_bidi =>
+            maps:get(max_streams_bidi, Opts, ?DEFAULT_MAX_STREAMS_BIDI),
+        wt_initial_max_streams_uni =>
+            maps:get(max_streams_uni, Opts, ?DEFAULT_MAX_STREAMS_UNI)
+    },
     ServerOpts = #{
         cert => CertFile,
         key => KeyFile,
         handler => H2Handler,
         enable_connect_protocol => true,
-        settings => #{enable_connect_protocol => 1}
+        settings => WtSettings
     },
 
     %% h2:start_server spawn_link's acceptor/manager processes to its caller.

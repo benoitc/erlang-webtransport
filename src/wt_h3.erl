@@ -33,17 +33,17 @@ default_settings() ->
 
 -spec default_settings(compat_mode()) -> map().
 default_settings(latest) ->
-    %% draft-15 §3.1: servers advertise SETTINGS_WT_ENABLED plus initial
-    %% flow-control windows. SETTINGS_H3_DATAGRAM (0x33) is emitted by
-    %% quic_h3 when `h3_datagram_enabled => true' — don't duplicate it
-    %% here (duplicate setting ids are an H3_SETTINGS_ERROR per
+    %% draft-15 §3.1: servers advertise wt_enabled plus initial
+    %% flow-control windows. h3_datagram (0x33) is emitted by quic_h3
+    %% when `h3_datagram_enabled => true' -- don't duplicate it here
+    %% (duplicate setting ids are an H3_SETTINGS_ERROR per
     %% RFC 9114 §7.2.4.1).
     #{
-        enable_connect_protocol                      => 1,
-        ?SETTINGS_WT_ENABLED                         => 1,
-        ?SETTINGS_WT_INITIAL_MAX_DATA                => ?DEFAULT_MAX_DATA,
-        ?SETTINGS_WT_INITIAL_MAX_STREAMS_BIDI        => ?DEFAULT_MAX_STREAMS_BIDI,
-        ?SETTINGS_WT_INITIAL_MAX_STREAMS_UNI         => ?DEFAULT_MAX_STREAMS_UNI
+        enable_connect_protocol      => 1,
+        wt_enabled                   => 1,
+        wt_initial_max_data          => ?DEFAULT_MAX_DATA,
+        wt_initial_max_streams_bidi  => ?DEFAULT_MAX_STREAMS_BIDI,
+        wt_initial_max_streams_uni   => ?DEFAULT_MAX_STREAMS_UNI
     };
 default_settings(legacy_browser_compat) ->
     %% draft-02 (Chrome / Firefox / quic-go v0.9). Never mix these
@@ -163,32 +163,21 @@ validate_transport_params(QuicConn) ->
     end.
 
 validate_required_settings(PeerSettings, CompatMode) ->
-    %% draft-15 §3.1 / draft-02: server MUST send SETTINGS_WT_ENABLED (or the
-    %% draft-02 equivalent) plus SETTINGS_ENABLE_CONNECT_PROTOCOL and
-    %% SETTINGS_H3_DATAGRAM. We can always observe `enable_connect_protocol'
-    %% via `quic_h3:get_peer_settings/1'. The WebTransport-specific setting
-    %% IDs, however, are stripped by `quic_h3_frame:decode_settings_pairs/2'
-    %% because they're unknown to the vendored quic_h3 module. Until that
-    %% upstream limitation is fixed we can only reject when the peer
-    %% advertised the WT setting AND set it to 0; a missing key is
-    %% indistinguishable from "upstream dropped it" and we pass through.
     case setting_enabled(PeerSettings, enable_connect_protocol) of
         false -> {error, connect_protocol_not_enabled};
         true -> check_wt_setting(PeerSettings, CompatMode)
     end.
 
-%% Only reject when the peer explicitly advertised the WebTransport setting
-%% with a value of 0. Absence is treated as "cannot verify" (see
-%% `validate_required_settings/2' note above).
 check_wt_setting(PeerSettings, latest) ->
-    case maps:find(?SETTINGS_WT_ENABLED, PeerSettings) of
-        {ok, 0} -> {error, wt_not_enabled};
-        _ -> ok
+    %% draft-15 §3.1: peer MUST advertise wt_enabled = 1.
+    case setting_enabled(PeerSettings, wt_enabled) of
+        true -> ok;
+        false -> {error, wt_not_enabled}
     end;
 check_wt_setting(PeerSettings, legacy_browser_compat) ->
     case maps:find(?SETTINGS_ENABLE_WEBTRANSPORT_DRAFT02, PeerSettings) of
-        {ok, 0} -> {error, wt_not_enabled};
-        _ -> ok
+        {ok, V} when V =/= 0 -> ok;
+        _ -> {error, wt_not_enabled}
     end.
 
 setting_enabled(Settings, Key) ->
@@ -277,10 +266,10 @@ request_headers_legacy_test() ->
 default_settings_latest_disjoint_from_legacy_test() ->
     Latest = default_settings(latest),
     Legacy = default_settings(legacy_browser_compat),
-    ?assert(maps:is_key(?SETTINGS_WT_ENABLED, Latest)),
+    ?assert(maps:is_key(wt_enabled, Latest)),
     ?assertNot(maps:is_key(?SETTINGS_ENABLE_WEBTRANSPORT_DRAFT02, Latest)),
     ?assert(maps:is_key(?SETTINGS_ENABLE_WEBTRANSPORT_DRAFT02, Legacy)),
-    ?assertNot(maps:is_key(?SETTINGS_WT_ENABLED, Legacy)).
+    ?assertNot(maps:is_key(wt_enabled, Legacy)).
 
 detect_compat_mode_latest_test() ->
     ?assertEqual({ok, latest},
