@@ -239,11 +239,12 @@ accept(Conn, StreamId, Headers, Opts) ->
     Transport = maps:get(transport, Opts, h3),
     Handler = maps:get(handler, Opts, undefined),
     HandlerOpts = maps:get(handler_opts, Opts, #{}),
+    Method = proplists:get_value(<<":method">>, Headers, <<>>),
     Path = proplists:get_value(<<":path">>, Headers, <<"/">>),
-    case Handler of
-        undefined ->
+    case {Handler, Method} of
+        {undefined, _} ->
             {error, missing_handler};
-        _ ->
+        {_, <<"CONNECT">>} ->
             case run_origin_check(Handler, Headers, HandlerOpts) of
                 accept ->
                     do_accept(Transport, Conn, StreamId, Path,
@@ -251,7 +252,9 @@ accept(Conn, StreamId, Headers, Opts) ->
                 {reject, Status, Reason} ->
                     send_reject(Transport, Conn, StreamId, Status, Reason),
                     {error, {rejected, Status}}
-            end
+            end;
+        {_, _} ->
+            {error, not_connect_method}
     end.
 
 do_accept(h3, H3Conn, StreamId, Path, Headers, Handler, HandlerOpts, Opts) ->

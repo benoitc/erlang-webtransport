@@ -305,6 +305,77 @@ ok = webtransport:stop_listener(Name).
     webtransport:listener_info(Name).
 ```
 
+## Embedding in an HTTP server
+
+Use `accept/4` to add WebTransport to an existing HTTP/3 or HTTP/2 server.
+Your server owns the listener and routing; `accept/4` upgrades a specific
+CONNECT request into a WebTransport session -- the same pattern as WebSocket
+upgrade.
+
+### HTTP/3 example
+
+```erlang
+%% 1. Merge WT config into your quic_h3 server
+H3Opts = maps:merge(webtransport:h3_settings(), #{
+    cert => CertDer, key => PrivateKey,
+    handler => fun my_handler/5
+}),
+{ok, _} = quic_h3:start_server(my_server, 443, H3Opts).
+
+%% 2. In your request handler, route and upgrade
+my_handler(H3Conn, StreamId, <<"CONNECT">>, <<"/chat">>, Headers) ->
+    {ok, _Session} = webtransport:accept(H3Conn, StreamId, Headers, #{
+        transport => h3,
+        handler => chat_handler,
+        handler_opts => #{room => lobby}
+    });
+my_handler(H3Conn, StreamId, <<"CONNECT">>, <<"/game">>, Headers) ->
+    {ok, _Session} = webtransport:accept(H3Conn, StreamId, Headers, #{
+        transport => h3,
+        handler => game_handler
+    });
+my_handler(H3Conn, StreamId, <<"GET">>, _Path, _Headers) ->
+    quic_h3:send_response(H3Conn, StreamId, 200, []),
+    quic_h3:send_data(H3Conn, StreamId, <<"hello">>, true).
+```
+
+### HTTP/2 example
+
+```erlang
+H2Opts = maps:merge(webtransport:h2_settings(), #{
+    cert => "cert.pem", key => "key.pem",
+    handler => fun my_h2_handler/5
+}),
+{ok, _} = h2:start_server(443, H2Opts).
+
+my_h2_handler(Conn, StreamId, <<"CONNECT">>, <<"/wt">>, Headers) ->
+    {ok, _Session} = webtransport:accept(Conn, StreamId, Headers, #{
+        transport => h2,
+        handler => my_wt_handler
+    });
+my_h2_handler(Conn, StreamId, <<"GET">>, Path, Headers) ->
+    serve_static(Conn, StreamId, Path, Headers).
+```
+
+### accept/4 options
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `transport` | `h3` | `h3` or `h2` |
+| `handler` | required | Module implementing `webtransport_handler` |
+| `handler_opts` | `#{}` | Passed to `handler:init/3` |
+| `compat_mode` | `auto` | HTTP/3 draft selection |
+| `max_data` | 1048576 | Session flow-control window |
+| `max_streams_bidi` | 100 | Max bidi streams |
+| `max_streams_uni` | 100 | Max uni streams |
+
+`accept/4` validates the CONNECT headers, starts a session, registers it
+as the stream handler (same as `quic_h3:set_stream_handler/3`), sends 200,
+and returns `{ok, Session}`. The session pid works with all session API
+functions (`send/3`, `open_stream/2`, etc.).
+
+See the [Integration guide](docs/integration.md) for details.
+
 ## Client API
 
 ### Connecting
