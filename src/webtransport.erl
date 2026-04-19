@@ -51,7 +51,12 @@
 %%
 -module(webtransport).
 
-%% Server API
+%% Integration API (for embedding in a generic HTTP server)
+-export([h3_settings/0, h3_settings/1]).
+-export([h2_settings/0, h2_settings/1]).
+-export([accept/4]).
+
+%% Server API (convenience: standalone listener)
 -export([start_listener/2, stop_listener/1]).
 -export([listeners/0, listener_info/1]).
 
@@ -114,6 +119,272 @@
 -export_type([listener_name/0, listener_opts/0, connect_opts/0]).
 
 -include("webtransport.hrl").
+
+%% ============================================================================
+%% Integration API
+%% ============================================================================
+
+%% @doc Return HTTP/3 settings to merge into a quic_h3 server configuration.
+%%
+%% Use this when embedding WebTransport into an existing HTTP/3 server
+%% instead of using `start_listener/2'. The returned map contains:
+%%
+%% - `settings' -- H3 SETTINGS to advertise (wt_enabled, flow control, etc.)
+%% - `stream_type_handler' -- claims WT extension streams (0x41 bidi, 0x54 uni)
+%% - `h3_datagram_enabled' -- enables QUIC datagrams
+%% - `quic_opts' -- QUIC transport params (max_datagram_frame_size, reset_stream_at)
+%% - `connection_handler' -- per-connection setup (creates the WT stream router)
+%%
+%% Merge the result into your quic_h3 server opts:
+%% ```
+%% Opts = maps:merge(webtransport:h3_settings(), #{
+%%     cert => CertDer, key => PrivateKey,
+%%     handler => fun my_handler/5
+%% }),
+%% quic_h3:start_server(my_server, 443, Opts).
+%% '''
+-spec h3_settings() -> map().
+h3_settings() ->
+    h3_settings(#{}).
+
+-spec h3_settings(map()) -> map().
+h3_settings(Opts) ->
+    CompatMode = maps:get(compat_mode, Opts, auto),
+    Settings = case CompatMode of
+        auto ->
+            maps:merge(wt_h3:default_settings(latest),
+                       wt_h3:default_settings(legacy_browser_compat));
+        Mode ->
+            wt_h3:default_settings(Mode)
+    end,
+    Claim = wt_stream_type_handler(),
+    ConnectionHandler = fun(_QuicConnPid) ->
+        {ok, Router} = webtransport_h3_router:start(undefined),
+        ensure_router_table(),
+        %% Store the router so accept/4 can find it by H3Conn pid.
+        %% The actual H3Conn pid is not known yet here; it will be
+        %% set by the first accept/4 call via get_or_create_router/1.
+        put(wt_router, Router),
+        #{
+            owner => Router,
+            stream_type_handler => Claim,
+            h3_datagram_enabled => true
+        }
+    end,
+    #{
+        settings => Settings,
+        stream_type_handler => Claim,
+        h3_datagram_enabled => true,
+        quic_opts => #{
+            max_datagram_frame_size => 65535,
+            reset_stream_at => true
+        },
+        connection_handler => ConnectionHandler
+    }.
+
+%% @doc Return HTTP/2 settings to merge into an h2 server configuration.
+%%
+%% ```
+%% Opts = maps:merge(webtransport:h2_settings(), #{
+%%     cert => "cert.pem", key => "key.pem",
+%%     handler => fun my_handler/5,
+%%     enable_connect_protocol => true
+%% }),
+%% h2:start_server(443, Opts).
+%% '''
+-spec h2_settings() -> map().
+h2_settings() ->
+    h2_settings(#{}).
+
+-spec h2_settings(map()) -> map().
+h2_settings(Opts) ->
+    #{
+        enable_connect_protocol => true,
+        settings => #{
+            enable_connect_protocol => 1,
+            wt_initial_max_data =>
+                maps:get(max_data, Opts, ?DEFAULT_MAX_DATA),
+            wt_initial_max_streams_bidi =>
+                maps:get(max_streams_bidi, Opts, ?DEFAULT_MAX_STREAMS_BIDI),
+            wt_initial_max_streams_uni =>
+                maps:get(max_streams_uni, Opts, ?DEFAULT_MAX_STREAMS_UNI)
+        }
+    }.
+
+%% @doc Accept a WebTransport session on an incoming CONNECT request.
+%%
+%% Call this from your HTTP request handler when you want a particular
+%% CONNECT request to become a WebTransport session. The function validates
+%% headers, starts the session gen_statem, registers it as the stream
+%% handler (like `quic_h3:set_stream_handler/3'), sends 200, and returns
+%% `{ok, Session}'.
+%%
+%% ```
+%% my_handler(Conn, StreamId, <<"CONNECT">>, <<"/wt">>, Headers) ->
+%%     webtransport:accept(Conn, StreamId, Headers, #{
+%%         transport => h3,
+%%         handler => my_wt_handler,
+%%         handler_opts => #{owner => self()}
+%%     });
+%% my_handler(Conn, StreamId, <<"GET">>, _Path, _Headers) ->
+%%     quic_h3:send_response(Conn, StreamId, 200, []),
+%%     quic_h3:send_data(Conn, StreamId, <<"hello">>, true).
+%% '''
+-spec accept(pid(), non_neg_integer(), [{binary(), binary()}], map()) ->
+    {ok, session()} | {error, term()}.
+accept(Conn, StreamId, Headers, Opts) ->
+    Transport = maps:get(transport, Opts, h3),
+    Handler = maps:get(handler, Opts, undefined),
+    HandlerOpts = maps:get(handler_opts, Opts, #{}),
+    Path = proplists:get_value(<<":path">>, Headers, <<"/">>),
+    case Handler of
+        undefined ->
+            {error, missing_handler};
+        _ ->
+            case run_origin_check(Handler, Headers, HandlerOpts) of
+                accept ->
+                    do_accept(Transport, Conn, StreamId, Path,
+                              Headers, Handler, HandlerOpts, Opts);
+                {reject, Status, Reason} ->
+                    send_reject(Transport, Conn, StreamId, Status, Reason),
+                    {error, {rejected, Status}}
+            end
+    end.
+
+do_accept(h3, H3Conn, StreamId, Path, Headers, Handler, HandlerOpts, Opts) ->
+    CompatMode = maps:get(compat_mode, Opts, auto),
+    case classify_h3_connect(Headers, CompatMode) of
+        {ok, ClientMode} ->
+            Router = get_or_create_router(H3Conn),
+            Opts1 = Opts#{compat_mode => ClientMode},
+            do_accept_h3(H3Conn, StreamId, Path, Headers,
+                         Handler, HandlerOpts, Opts1, Router);
+        {error, Reason} ->
+            send_reject(h3, H3Conn, StreamId, 400,
+                        iolist_to_binary(io_lib:format("~p", [Reason]))),
+            {error, Reason}
+    end;
+do_accept(h2, Conn, StreamId, Path, Headers, Handler, HandlerOpts, Opts) ->
+    case is_webtransport_request(Headers) of
+        true ->
+            do_accept_h2(Conn, StreamId, Path, Headers,
+                         Handler, HandlerOpts, Opts);
+        false ->
+            send_reject(h2, Conn, StreamId, 400, <<"Bad Request">>),
+            {error, not_webtransport}
+    end.
+
+do_accept_h3(H3Conn, StreamId, Path, Headers, Handler, HandlerOpts, Opts, Router) ->
+    TransportState = webtransport_h3:new(H3Conn, StreamId, Router),
+    Authority = proplists:get_value(<<":authority">>, Headers, <<>>),
+    Request = #{path => Path, authority => Authority, headers => Headers},
+    SessionOpts = maps:merge(HandlerOpts, #{
+        request => Request,
+        is_server => true,
+        handler_opts => HandlerOpts,
+        max_data => maps:get(max_data, Opts, ?DEFAULT_MAX_DATA),
+        max_streams_bidi => maps:get(max_streams_bidi, Opts, ?DEFAULT_MAX_STREAMS_BIDI),
+        max_streams_uni => maps:get(max_streams_uni, Opts, ?DEFAULT_MAX_STREAMS_UNI)
+    }),
+    case webtransport_session:start_link(h3, TransportState, Handler, SessionOpts) of
+        {ok, Session} ->
+            quic_h3:set_stream_handler(H3Conn, StreamId, Session),
+            case Router of
+                undefined -> ok;
+                _ -> webtransport_h3_router:register_session(Router, StreamId, Session)
+            end,
+            quic_h3:send_response(H3Conn, StreamId, 200, []),
+            {ok, Session};
+        {error, Reason} ->
+            send_reject(h3, H3Conn, StreamId, 500,
+                        iolist_to_binary(io_lib:format("~p", [Reason]))),
+            {error, Reason}
+    end.
+
+do_accept_h2(Conn, StreamId, Path, Headers, Handler, HandlerOpts, Opts) ->
+    h2:send_response(Conn, StreamId, 200, []),
+    TransportState = webtransport_h2:new(Conn, StreamId),
+    Authority = proplists:get_value(<<":authority">>, Headers, <<>>),
+    Request = #{path => Path, authority => Authority, headers => Headers},
+    ServerDefaults = #{
+        u  => maps:get(max_streams_uni, Opts, ?DEFAULT_MAX_STREAMS_UNI),
+        bl => maps:get(max_streams_bidi, Opts, ?DEFAULT_MAX_STREAMS_BIDI),
+        br => maps:get(max_data, Opts, ?DEFAULT_MAX_DATA)
+    },
+    Negotiated = case proplists:get_value(<<"webtransport-init">>, Headers) of
+        undefined -> ServerDefaults;
+        InitBin ->
+            case wt_h2_init:parse(InitBin) of
+                {ok, Init} -> wt_h2_init:apply_greater_of(Init, ServerDefaults);
+                {error, _} -> ServerDefaults
+            end
+    end,
+    SessionOpts = maps:merge(HandlerOpts, #{
+        request => Request,
+        is_server => true,
+        handler_opts => HandlerOpts,
+        max_data => maps:get(br, Negotiated, ?DEFAULT_MAX_DATA),
+        max_streams_bidi => maps:get(bl, Negotiated, ?DEFAULT_MAX_STREAMS_BIDI),
+        max_streams_uni => maps:get(u, Negotiated, ?DEFAULT_MAX_STREAMS_UNI)
+    }),
+    case webtransport_session:start_link(h2, TransportState, Handler, SessionOpts) of
+        {ok, Session} ->
+            LoopPid = spawn(fun() -> h2_data_loop(Conn, StreamId, Session) end),
+            _ = h2:set_stream_handler(Conn, StreamId, LoopPid),
+            {ok, Session};
+        {error, Reason} ->
+            h2:send_data(Conn, StreamId,
+                         iolist_to_binary(io_lib:format("~p", [Reason])), true),
+            {error, Reason}
+    end.
+
+send_reject(h3, H3Conn, StreamId, Status, Body) ->
+    quic_h3:send_response(H3Conn, StreamId, Status, []),
+    quic_h3:send_data(H3Conn, StreamId, Body, true);
+send_reject(h2, Conn, StreamId, Status, Body) ->
+    h2:send_response(Conn, StreamId, Status, []),
+    h2:send_data(Conn, StreamId, Body, true).
+
+%% Find or create the WT stream router for an H3 connection.
+%% The router demuxes extension streams (uni 0x54, bidi 0x41) to sessions.
+get_or_create_router(H3Conn) ->
+    ensure_router_table(),
+    case ets:lookup(webtransport_routers, H3Conn) of
+        [{_, Router}] ->
+            case is_process_alive(Router) of
+                true -> Router;
+                false ->
+                    ets:delete(webtransport_routers, H3Conn),
+                    create_and_register_router(H3Conn)
+            end;
+        [] ->
+            %% Check if the connection_handler stored a router in the
+            %% process dictionary (h3_settings/1 connection_handler does this).
+            case get(wt_router) of
+                Pid when is_pid(Pid), Pid =/= undefined ->
+                    ets:insert(webtransport_routers, {H3Conn, Pid}),
+                    Pid;
+                _ ->
+                    create_and_register_router(H3Conn)
+            end
+    end.
+
+create_and_register_router(H3Conn) ->
+    {ok, Router} = webtransport_h3_router:start(undefined),
+    ets:insert(webtransport_routers, {H3Conn, Router}),
+    Router.
+
+ensure_router_table() ->
+    case ets:whereis(webtransport_routers) of
+        undefined ->
+            try
+                ets:new(webtransport_routers, [named_table, public, set])
+            catch
+                error:badarg -> ok  %% race: another process created it
+            end;
+        _ ->
+            ok
+    end.
 
 %% ============================================================================
 %% Server API
