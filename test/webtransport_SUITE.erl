@@ -59,7 +59,12 @@
     origin_check_reject_test/1,
 
     %% Listener lifecycle
-    stop_listener_does_not_kill_caller_test/1
+    stop_listener_does_not_kill_caller_test/1,
+    listener_info_lookup_test/1,
+    listeners_lists_active_listener_test/1,
+    start_listener_invalid_certfile_test/1,
+    start_listener_invalid_keyfile_test/1,
+    start_listener_bad_pem_test/1
 ]).
 
 %% ============================================================================
@@ -101,7 +106,12 @@ groups() ->
         datagram_oversize_test,
         datagram_boundary_test,
         server_initiated_bidi_test,
-        stop_listener_does_not_kill_caller_test
+        stop_listener_does_not_kill_caller_test,
+        listener_info_lookup_test,
+        listeners_lists_active_listener_test,
+        start_listener_invalid_certfile_test,
+        start_listener_invalid_keyfile_test,
+        start_listener_bad_pem_test
     ],
     [
         {h3_tests, [sequence], Cases},
@@ -852,3 +862,65 @@ stop_listener_does_not_kill_caller_test(Config) ->
         exit(Child, kill),
         ok
     end.
+
+listener_info_lookup_test(Config) ->
+    Transport = proplists:get_value(transport, Config),
+    Port = proplists:get_value(port, Config),
+    Name = listener_name_for(Transport),
+
+    {ok, Info} = webtransport:listener_info(Name),
+    ?assertEqual(Transport, maps:get(transport, Info)),
+    ?assertEqual(Port, maps:get(port, Info)),
+    ?assert(maps:is_key(handler, Info)),
+    %% server_ref must be hidden from the public view.
+    ?assertNot(maps:is_key(server_ref, Info)),
+
+    ?assertEqual({error, not_found}, webtransport:listener_info(no_such_listener)).
+
+listeners_lists_active_listener_test(Config) ->
+    Transport = proplists:get_value(transport, Config),
+    Name = listener_name_for(Transport),
+    Active = webtransport:listeners(),
+    ?assert(lists:member(Name, Active)).
+
+start_listener_invalid_certfile_test(Config) ->
+    Transport = proplists:get_value(transport, Config),
+    KeyFile = proplists:get_value(keyfile, Config),
+    Result = webtransport:start_listener(bad_cert_listener, #{
+        transport => Transport,
+        port => test_helpers:find_free_port(),
+        certfile => "/nonexistent/cert.pem",
+        keyfile => KeyFile,
+        handler => wt_echo_handler
+    }),
+    ?assertMatch({error, _}, Result).
+
+start_listener_invalid_keyfile_test(Config) ->
+    Transport = proplists:get_value(transport, Config),
+    CertFile = proplists:get_value(certfile, Config),
+    Result = webtransport:start_listener(bad_key_listener, #{
+        transport => Transport,
+        port => test_helpers:find_free_port(),
+        certfile => CertFile,
+        keyfile => "/nonexistent/key.pem",
+        handler => wt_echo_handler
+    }),
+    ?assertMatch({error, _}, Result).
+
+start_listener_bad_pem_test(Config) ->
+    Transport = proplists:get_value(transport, Config),
+    PrivDir = proplists:get_value(priv_dir, Config),
+    KeyFile = proplists:get_value(keyfile, Config),
+    BadCert = filename:join(PrivDir, "bad-cert.pem"),
+    ok = file:write_file(BadCert, <<"not a pem file">>),
+    Result = webtransport:start_listener(bad_pem_listener, #{
+        transport => Transport,
+        port => test_helpers:find_free_port(),
+        certfile => BadCert,
+        keyfile => KeyFile,
+        handler => wt_echo_handler
+    }),
+    ?assertMatch({error, _}, Result).
+
+listener_name_for(h3) -> test_h3_listener;
+listener_name_for(h2) -> test_h2_listener.
