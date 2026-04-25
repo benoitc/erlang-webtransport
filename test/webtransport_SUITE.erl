@@ -56,7 +56,10 @@
     bidi_round_trip_test/1,
     server_initiated_bidi_test/1,
     close_session_reason_too_long_test/1,
-    origin_check_reject_test/1
+    origin_check_reject_test/1,
+
+    %% Listener lifecycle
+    stop_listener_does_not_kill_caller_test/1
 ]).
 
 %% ============================================================================
@@ -97,7 +100,8 @@ groups() ->
         action_failure_stop_test,
         datagram_oversize_test,
         datagram_boundary_test,
-        server_initiated_bidi_test
+        server_initiated_bidi_test,
+        stop_listener_does_not_kill_caller_test
     ],
     [
         {h3_tests, [sequence], Cases},
@@ -775,4 +779,76 @@ collect_stream_echo(Session, StreamId, Acc, Timeout) ->
             <<Acc/binary, Data/binary>>
     after Timeout ->
         error({no_stream_echo, Acc})
+    end.
+
+%% ============================================================================
+%% Listener Lifecycle Regression
+%% ============================================================================
+
+%% Regression: start_listener used to spawn_link the listener loop to the
+%% caller, so stop_listener (via exit(Pid, shutdown)) propagated to the
+%% caller. Verify the caller survives a full start/stop cycle.
+stop_listener_does_not_kill_caller_test(Config) ->
+    Transport = proplists:get_value(transport, Config),
+    CertFile = proplists:get_value(certfile, Config),
+    KeyFile = proplists:get_value(keyfile, Config),
+    Name = list_to_atom("regression_listener_" ++ atom_to_list(Transport)),
+    Port = test_helpers:find_free_port(),
+    Parent = self(),
+
+    Child = spawn(fun() ->
+        ListenerOpts = #{
+            transport => Transport,
+            port => Port,
+            certfile => CertFile,
+            keyfile => KeyFile,
+            handler => wt_echo_handler
+        },
+        case webtransport:start_listener(Name, ListenerOpts) of
+            {ok, _Pid} ->
+                Parent ! {self(), started},
+                receive stop -> ok after 5000 -> ok end,
+                StopRes = webtransport:stop_listener(Name),
+                Parent ! {self(), {stopped, StopRes}},
+                timer:sleep(200);
+            {error, Reason} ->
+                Parent ! {self(), {start_failed, Reason}}
+        end
+    end),
+
+    MRef = erlang:monitor(process, Child),
+
+    receive
+        {Child, started} -> ok;
+        {Child, {start_failed, R}} -> ct:fail({start_failed, R});
+        {'DOWN', MRef, process, Child, Reason} ->
+            ct:fail({child_died_during_start, Reason})
+    after 5000 ->
+        ct:fail(start_timeout)
+    end,
+
+    Child ! stop,
+
+    receive
+        {Child, {stopped, ok}} -> ok;
+        {Child, {stopped, Other}} -> ct:fail({stop_listener_returned, Other});
+        {'DOWN', MRef, process, Child, KillReason} ->
+            ct:fail({caller_killed_by_stop_listener, KillReason})
+    after 5000 ->
+        ct:fail(stop_timeout)
+    end,
+
+    %% Caller must survive the stop_listener call without receiving an
+    %% abnormal exit. The child finishes its sleep and exits normally —
+    %% that is the success path. Anything else (shutdown, killed) means
+    %% stop_listener leaked an exit signal to the caller.
+    receive
+        {'DOWN', MRef, process, Child, normal} ->
+            ok;
+        {'DOWN', MRef, process, Child, KillReason2} ->
+            ct:fail({caller_killed_after_stop, KillReason2})
+    after 1000 ->
+        erlang:demonitor(MRef, [flush]),
+        exit(Child, kill),
+        ok
     end.

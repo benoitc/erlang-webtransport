@@ -708,7 +708,7 @@ start_h3_listener(Name, Opts) ->
 
             case quic_h3:start_server(Name, Port, ServerOpts) of
                 {ok, ServerRef} ->
-                    Pid = spawn_link(?MODULE, listener_loop, [Name]),
+                    Pid = spawn(?MODULE, listener_loop, [Name]),
                     register(Name, Pid),
                     persistent_term:put({webtransport_listener, Name}, #{
                         transport => h3,

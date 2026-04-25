@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.2.1
+
+- `start_listener/2` (h3): switch the listener loop from `spawn_link/3` to `spawn/3` so `stop_listener/1` no longer propagates a `shutdown` exit to the caller. The interactive shell (and any non-trapping caller) now stays clean across a full lifecycle.
+- `webtransport_session:init/1`: distinguish a handler module that fails to load (`{handler_not_loaded, M, Reason}`) from a loaded module missing `init/2` or `init/3`.
+- README: quick-start now launches the shell with `ERL_FLAGS="-pa examples" rebar3 shell --apps webtransport` so handler modules outside `src/` are reachable.
+- Regression test: `stop_listener_does_not_kill_caller_test` (h3 + h2 groups).
+
+Known issue (tracked upstream in `quic`): a graceful `close_session/1` still emits a `quic_h3_connection` `quic_closed` CRASH REPORT because the dep treats any QUIC-conn `'DOWN'` as abnormal. Will resolve when `quic` is bumped.
+
 ## 0.2.0
 
 - Switch `h2` and `quic` deps to hex packages: `h2 0.5.0`, `quic 1.3.0`.
