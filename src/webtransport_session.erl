@@ -191,15 +191,19 @@ init({Transport, TransportState, Handler, Opts}) ->
     %% Preference order: `init/3' > `init/2'. Handlers that export neither
     %% are a configuration error and we stop immediately with a clear
     %% reason so the user sees it in the crash log.
-    _ = code:ensure_loaded(Handler),
     InitResult =
-        case erlang:function_exported(Handler, init, 3) of
-            true ->
-                Handler:init(self(), Request, HandlerOpts);
-            false ->
-                case erlang:function_exported(Handler, init, 2) of
-                    true -> Handler:init(self(), Request);
-                    false -> {error, {no_init_callback, Handler}}
+        case code:ensure_loaded(Handler) of
+            {error, LoadReason} ->
+                {error, {handler_not_loaded, Handler, LoadReason}};
+            {module, Handler} ->
+                case erlang:function_exported(Handler, init, 3) of
+                    true ->
+                        Handler:init(self(), Request, HandlerOpts);
+                    false ->
+                        case erlang:function_exported(Handler, init, 2) of
+                            true -> Handler:init(self(), Request);
+                            false -> {error, {no_init_callback, Handler}}
+                        end
                 end
         end,
     case InitResult of

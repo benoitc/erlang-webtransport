@@ -49,11 +49,14 @@ For production, use certificates from a trusted CA (e.g. [Let's Encrypt](https:/
 
 ## Quick start
 
-Start a shell with all dependencies loaded:
+Compile the bundled examples and start a shell with `examples/` on the code path:
 
 ```sh
-rebar3 shell
+erlc -o examples examples/echo_server.erl examples/echo_client.erl
+ERL_FLAGS="-pa examples" rebar3 shell --apps webtransport
 ```
+
+The `-pa examples` flag is required so that `echo_server` (or any other handler module you keep outside `src/`) is reachable from the session process — otherwise session init fails with `{handler_not_loaded, echo_server, nofile}`.
 
 ### 1. Start the server
 
