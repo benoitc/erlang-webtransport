@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.2.2
+
+- Docs: README gains a Sponsors section (Enki Multimedia logo vendored under `docs/images/`).
+- Docs: fix invalid `webtransport:open_stream(Session, bidi | uni)` snippet — type-union pipe was in expression position; now `bidi  %% or uni`.
+- CT: cover `listeners/0`, `listener_info/1`, and `start_listener/2` cert/key error paths (`webtransport.erl` line coverage 51% → 54%).
+
 ## 0.2.1
 
 - `start_listener/2` (h3): switch the listener loop from `spawn_link/3` to `spawn/3` so `stop_listener/1` no longer propagates a `shutdown` exit to the caller. The interactive shell (and any non-trapping caller) now stays clean across a full lifecycle.
