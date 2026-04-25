@@ -1,10 +1,11 @@
 {application, webtransport,
  [{description, "WebTransport protocol for Erlang (HTTP/2 and HTTP/3)"},
-  {vsn, "0.1.0"},
+  {vsn, "0.2.0"},
   {registered, []},
   {applications,
    [kernel,
     stdlib,
+    public_key,
     quic,
     h2
    ]},
@@ -27,5 +28,5 @@
   {licenses, ["Apache-2.0"]},
   {links, [{"GitHub", "https://github.com/benoitc/erlang-webtransport"}]},
   {files, ["src", "include", "rebar.config", "rebar.lock",
-           "README.md", "LICENSE", "docs"]}
+           "README.md", "CHANGELOG.md", "LICENSE", "docs"]}
  ]}.

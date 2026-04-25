@@ -947,10 +947,8 @@ transport_send_datagram(Data, #data{transport = h3, transport_state = H3State}) 
     webtransport_h3:send_datagram(H3State, Data).
 
 transport_open_stream(StreamId, Type, #data{transport = h2, transport_state = H2State}) ->
-    case webtransport_h2:open_stream(H2State, StreamId, Type) of
-        ok -> {ok, StreamId};
-        {error, _} = Err -> Err
-    end;
+    ok = webtransport_h2:open_stream(H2State, StreamId, Type),
+    {ok, StreamId};
 transport_open_stream(_StreamId, bidi, #data{transport = h3, transport_state = H3State}) ->
     case webtransport_h3:open_bidi_stream(H3State) of
         {ok, RealId, _} -> {ok, RealId};

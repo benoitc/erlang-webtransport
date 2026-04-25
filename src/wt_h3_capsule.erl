@@ -134,9 +134,7 @@ decode(Bin) ->
                 {error, _} = Err -> Err
             end;
         {more, N} ->
-            {more, N};
-        {error, _} = Err ->
-            Err
+            {more, N}
     end.
 
 decode_payload(?WT_MAX_DATA, Payload) ->
@@ -219,16 +217,13 @@ decode_stream_header(Bin) ->
         {ok, Type, _Rest} ->
             {error, {unknown_stream_header, Type}};
         {error, incomplete} ->
-            {more, 1};
-        {error, _} = Err ->
-            Err
+            {more, 1}
     end.
 
 decode_stream_session_id(Kind, Bin) ->
     case h2_varint:decode(Bin) of
         {ok, SessionId, Rest} -> {ok, SessionId, Kind, Rest};
-        {error, incomplete} -> {more, 1};
-        {error, _} = Err -> Err
+        {error, incomplete} -> {more, 1}
     end.
 
 %% ============================================================================
@@ -261,9 +256,7 @@ decode_datagram(Bin) ->
         {ok, QuarterStreamId, Data} ->
             {ok, session_id_from_quarter_stream_id(QuarterStreamId), Data};
         {error, incomplete} ->
-            {more, 1};
-        {error, _} = Err ->
-            Err
+            {more, 1}
     end.
 
 %% ============================================================================

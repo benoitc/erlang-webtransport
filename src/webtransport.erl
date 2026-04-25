@@ -62,6 +62,7 @@
 %% Server API (convenience: standalone listener)
 -export([start_listener/2, stop_listener/1]).
 -export([listeners/0, listener_info/1]).
+-export([listener_loop/1]).
 
 %% Client API
 -export([connect/4, connect/5]).
@@ -295,10 +296,7 @@ do_accept_h3(H3Conn, StreamId, Path, Headers, Handler, HandlerOpts, Opts, Router
     case webtransport_session:start_link(h3, TransportState, Handler, SessionOpts) of
         {ok, Session} ->
             quic_h3:set_stream_handler(H3Conn, StreamId, Session),
-            case Router of
-                undefined -> ok;
-                _ -> webtransport_h3_router:register_session(Router, StreamId, Session)
-            end,
+            webtransport_h3_router:register_session(Router, StreamId, Session),
             quic_h3:send_response(H3Conn, StreamId, 200, []),
             {ok, Session};
         {error, Reason} ->
@@ -705,13 +703,12 @@ start_h3_listener(Name, Opts) ->
                     reset_stream_at => true
                 },
                 stream_type_handler => Claim,
-                h3_datagram_enabled => true,
                 connection_handler => ConnectionHandler
             },
 
             case quic_h3:start_server(Name, Port, ServerOpts) of
                 {ok, ServerRef} ->
-                    Pid = spawn_link(fun() -> listener_loop(Name) end),
+                    Pid = spawn_link(?MODULE, listener_loop, [Name]),
                     register(Name, Pid),
                     persistent_term:put({webtransport_listener, Name}, #{
                         transport => h3,

@@ -225,9 +225,7 @@ route_peer_stream_data(StreamId, Data, Fin, #state{pending = Pending} = State) -
                     deliver_open_and_data(SessionId, StreamId, Direction, Rest, Fin, State1);
                 {error, incomplete} ->
                     Pending1 = Pending#{StreamId => {Direction, Combined}},
-                    State#state{pending = Pending1};
-                {error, _} ->
-                    State#state{pending = maps:remove(StreamId, Pending)}
+                    State#state{pending = Pending1}
             end;
         error ->
             forward_to_session_by_stream(StreamId, Data, Fin, State)

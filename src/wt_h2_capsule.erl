@@ -236,9 +236,7 @@ decode(Bin) ->
                 {error, _} = Err -> Err
             end;
         {more, N} ->
-            {more, N};
-        {error, _} = Err ->
-            Err
+            {more, N}
     end.
 
 decode_payload(?WT_PADDING, Data) ->

@@ -1,0 +1,60 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    name: OTP ${{ matrix.otp }} / rebar3 ${{ matrix.rebar3 }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        otp: ['26', '27']
+        rebar3: ['3.24.0']
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: ${{ matrix.otp }}
+          rebar3-version: ${{ matrix.rebar3 }}
+
+      - name: Cache rebar3 deps
+        uses: actions/cache@v4
+        with:
+          path: |
+            _build
+            ~/.cache/rebar3
+          key: ${{ runner.os }}-otp${{ matrix.otp }}-rebar3-${{ hashFiles('rebar.lock', 'rebar.config') }}
+          restore-keys: |
+            ${{ runner.os }}-otp${{ matrix.otp }}-rebar3-
+
+      - name: Compile
+        run: rebar3 compile
+
+      - name: Xref
+        run: rebar3 xref
+
+      - name: EUnit
+        run: rebar3 eunit
+
+      - name: Dialyzer
+        run: rebar3 dialyzer
+
+  docs:
+    name: Build ex_doc
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: '27'
+          rebar3-version: '3.24.0'
+
+      - name: Build docs
+        run: rebar3 ex_doc
