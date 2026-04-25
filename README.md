@@ -425,7 +425,7 @@ Once connected, use these functions on the session pid:
 
 ```erlang
 %% Streams
-{ok, Stream} = webtransport:open_stream(Session, bidi | uni).
+{ok, Stream} = webtransport:open_stream(Session, bidi).  %% or uni
 ok = webtransport:send(Session, Stream, Data).
 ok = webtransport:send(Session, Stream, Data, fin).
 ok = webtransport:close_stream(Session, Stream).
