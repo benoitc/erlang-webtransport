@@ -58,6 +58,9 @@
     close_session_reason_too_long_test/1,
     origin_check_reject_test/1,
 
+    %% Embedding (accept/4 from a non-connection process)
+    embedded_accept_round_trip_test/1,
+
     %% Listener lifecycle
     stop_listener_does_not_kill_caller_test/1,
     listener_info_lookup_test/1,
@@ -113,8 +116,10 @@ groups() ->
         start_listener_invalid_keyfile_test,
         start_listener_bad_pem_test
     ],
+    %% Embedding via h3_settings/0 + accept/4 is HTTP/3-only.
+    H3Only = [embedded_accept_round_trip_test],
     [
-        {h3_tests, [sequence], Cases},
+        {h3_tests, [sequence], Cases ++ H3Only},
         {h2_tests, [sequence], Cases}
     ].
 
@@ -790,6 +795,83 @@ collect_stream_echo(Session, StreamId, Acc, Timeout) ->
     after Timeout ->
         error({no_stream_echo, Acc})
     end.
+
+%% ============================================================================
+%% Embedding (accept/4 from a non-connection process)
+%% ============================================================================
+
+%% A generic quic_h3 server merges webtransport:h3_settings/0 into its opts
+%% and calls webtransport:accept/4 from a per-request worker process — not
+%% the QUIC connection process — mimicking an embedder (e.g. Livery) that
+%% dispatches each request to its own worker. The connection_handler's router
+%% (which receives the claimed extension streams) and the router accept/4
+%% registers the session in must be the same one, so a connected client can
+%% round-trip both stream data and datagrams through the echo handler.
+embedded_accept_round_trip_test(Config) ->
+    CertFile = proplists:get_value(certfile, Config),
+    KeyFile = proplists:get_value(keyfile, Config),
+    {ok, CertDer, PrivateKey} = read_cert_key_der(CertFile, KeyFile),
+    Port = test_helpers:find_free_port(),
+    Name = embedded_accept_server,
+
+    Dispatch = fun(Conn, StreamId, <<"CONNECT">>, _Path, Headers) ->
+                       %% Dispatch to a per-request worker, like an embedder.
+                       %% The worker exits normally after accept/4 returns;
+                       %% the session it start_link'd survives that.
+                       _ = spawn(fun() ->
+                               {ok, _Session} = webtransport:accept(
+                                   Conn, StreamId, Headers,
+                                   #{transport => h3, handler => wt_echo_handler})
+                           end),
+                       ok;
+                  (Conn, StreamId, _Method, _Path, _Headers) ->
+                       quic_h3:send_response(Conn, StreamId, 404, []),
+                       quic_h3:send_data(Conn, StreamId, <<"not found">>, true)
+               end,
+
+    ServerOpts = maps:merge(webtransport:h3_settings(), #{
+        cert => CertDer,
+        key => PrivateKey,
+        handler => Dispatch
+    }),
+    {ok, _ServerRef} = quic_h3:start_server(Name, Port, ServerOpts),
+    try
+        timer:sleep(100),
+        {ok, Session} = webtransport:connect("localhost", Port, <<"/wt">>, #{
+            transport => h3,
+            verify => verify_none,
+            handler_opts => #{owner => self()}
+        }),
+
+        %% Bidi stream: send with FIN, expect the echo back.
+        {ok, StreamId} = webtransport:open_stream(Session, bidi),
+        Payload = <<"embedded-hello">>,
+        ok = webtransport:send(Session, StreamId, Payload, fin),
+        Echoed = collect_stream_echo(Session, StreamId, <<>>, 3000),
+        ?assertEqual(Payload, Echoed),
+
+        %% Datagram: send, expect the echo back.
+        DPayload = <<"embedded-datagram">>,
+        ok = webtransport:send_datagram(Session, DPayload),
+        receive
+            {webtransport, Session, {datagram, DPayload}} -> ok
+        after 3000 ->
+            error(no_datagram_echo)
+        end,
+
+        ok = webtransport:close_session(Session)
+    after
+        quic_h3:stop_server(Name)
+    end.
+
+%% Decode a PEM cert + key into the DER cert binary and decoded private key
+%% that quic_h3:start_server/3 expects under `cert' and `key'.
+read_cert_key_der(CertFile, KeyFile) ->
+    {ok, CertPem} = file:read_file(CertFile),
+    {ok, KeyPem} = file:read_file(KeyFile),
+    [{'Certificate', CertDer, _} | _] = public_key:pem_decode(CertPem),
+    [{KeyType, KeyDer, _} | _] = public_key:pem_decode(KeyPem),
+    {ok, CertDer, public_key:der_decode(KeyType, KeyDer)}.
 
 %% ============================================================================
 %% Listener Lifecycle Regression

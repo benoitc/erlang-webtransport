@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.2.3
+
+- Embedding (h3): `accept/4` now works when called from a process other than the QUIC connection process. The per-connection stream router is keyed by the QUIC connection pid, shared by the `h3_settings/1` connection_handler and by `accept/4` (via `quic_h3:get_quic_conn/1`), instead of the caller's process dictionary. Incoming bidi/uni streams and datagrams now reach the session even when the embedder dispatches each request to its own worker (e.g. Livery). The router's registry row and process are reaped when its QUIC connection ends.
+- CT: `embedded_accept_round_trip_test` (h3) drives a raw `quic_h3` server with `h3_settings/0` merged in, accepts from a worker process, and asserts that a bidi stream (with FIN) and a datagram both round-trip through the echo handler.
+
 ## 0.2.2
 
 - Docs: README gains a Sponsors section (Enki Multimedia logo vendored under `docs/images/`).

@@ -1,6 +1,6 @@
 {application, webtransport,
  [{description, "WebTransport protocol for Erlang (HTTP/2 and HTTP/3)"},
-  {vsn, "0.2.2"},
+  {vsn, "0.2.3"},
   {registered, []},
   {applications,
    [kernel,
