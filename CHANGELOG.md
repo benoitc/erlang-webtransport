@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.2.4
+
+- Bump `quic` dep to 1.4.2.
+
 ## 0.2.3
 
 - Embedding (h3): `accept/4` now works when called from a process other than the QUIC connection process. The per-connection stream router is keyed by the QUIC connection pid, shared by the `h3_settings/1` connection_handler and by `accept/4` (via `quic_h3:get_quic_conn/1`), instead of the caller's process dictionary. Incoming bidi/uni streams and datagrams now reach the session even when the embedder dispatches each request to its own worker (e.g. Livery). The router's registry row and process are reaped when its QUIC connection ends.
