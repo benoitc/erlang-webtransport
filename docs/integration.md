@@ -63,6 +63,13 @@ my_handler(H3Conn, StreamId, _Method, _Path, _Headers) ->
     quic_h3:send_data(H3Conn, StreamId, <<"not found">>, true).
 ```
 
+`accept/4` may be called from any process, not only the one running your
+handler. The connection_handler installed by `h3_settings/0` registers the
+per-connection stream router keyed by the QUIC connection pid, and `accept/4`
+resolves the same router from its `H3Conn`. So if your server dispatches each
+request to a per-request worker, calling `accept/4` from that worker still
+routes the session's incoming streams and datagrams correctly.
+
 ## HTTP/2 (erlang_h2)
 
 ### 1. Merge WT settings into your server opts

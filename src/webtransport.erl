@@ -162,13 +162,18 @@ h3_settings(Opts) ->
             wt_h3:default_settings(Mode)
     end,
     Claim = wt_stream_type_handler(),
-    ConnectionHandler = fun(_QuicConnPid) ->
+    ConnectionHandler = fun(QuicConnPid) ->
         {ok, Router} = webtransport_h3_router:start(undefined),
         ensure_router_table(),
-        %% Store the router so accept/4 can find it by H3Conn pid.
-        %% The actual H3Conn pid is not known yet here; it will be
-        %% set by the first accept/4 call via get_or_create_router/1.
-        put(wt_router, Router),
+        %% Key the router by the QUIC connection pid. accept/4 derives the
+        %% same key from its H3 connection via quic_h3:get_quic_conn/1, so
+        %% it resolves this exact router no matter which process calls
+        %% accept/4. quic_h3 runs request handlers in a spawned process and
+        %% this callback runs in the listener process, so there is no shared
+        %% process dictionary to rely on; the embedder may also dispatch
+        %% accept/4 to its own per-request worker.
+        ets:insert(webtransport_routers, {QuicConnPid, Router}),
+        spawn(fun() -> reap_router(QuicConnPid, Router) end),
         #{
             owner => Router,
             stream_type_handler => Claim,
@@ -349,34 +354,61 @@ send_reject(h2, Conn, StreamId, Status, Body) ->
     h2:send_response(Conn, StreamId, Status, []),
     h2:send_data(Conn, StreamId, Body, true).
 
-%% Find or create the WT stream router for an H3 connection.
+%% Find the WT stream router for an H3 connection.
+%%
 %% The router demuxes extension streams (uni 0x54, bidi 0x41) to sessions.
+%% It is keyed by the QUIC connection pid: the `h3_settings/1'
+%% connection_handler registers it under the pid it is handed, and accept/4
+%% derives the same pid from its H3 connection via `quic_h3:get_quic_conn/1'.
+%% Both agree on one router per connection without a shared process
+%% dictionary, so accept/4 works from any process (e.g. an embedder's
+%% per-request worker).
 get_or_create_router(H3Conn) ->
     ensure_router_table(),
-    case ets:lookup(webtransport_routers, H3Conn) of
+    Key = router_key(H3Conn),
+    case ets:lookup(webtransport_routers, Key) of
         [{_, Router}] ->
             case is_process_alive(Router) of
                 true -> Router;
                 false ->
-                    ets:delete(webtransport_routers, H3Conn),
-                    create_and_register_router(H3Conn)
+                    ets:delete(webtransport_routers, Key),
+                    create_and_register_router(Key)
             end;
         [] ->
-            %% Check if the connection_handler stored a router in the
-            %% process dictionary (h3_settings/1 connection_handler does this).
-            case get(wt_router) of
-                Pid when is_pid(Pid), Pid =/= undefined ->
-                    ets:insert(webtransport_routers, {H3Conn, Pid}),
-                    Pid;
-                _ ->
-                    create_and_register_router(H3Conn)
-            end
+            %% No connection_handler ran for this connection (the server was
+            %% wired without h3_settings/1). Create a router so the session
+            %% still starts; lacking the connection_handler's `owner' it
+            %% won't receive peer-opened streams, but that is a caller-side
+            %% misconfiguration.
+            create_and_register_router(Key)
     end.
 
-create_and_register_router(H3Conn) ->
+%% The registry key shared by the connection_handler and accept/4: the QUIC
+%% connection pid behind the H3 connection. The connection_handler is handed
+%% this same pid directly, so both sides resolve one router per connection.
+router_key(H3Conn) ->
+    quic_h3:get_quic_conn(H3Conn).
+
+create_and_register_router(Key) ->
     {ok, Router} = webtransport_h3_router:start(undefined),
-    ets:insert(webtransport_routers, {H3Conn, Router}),
+    ets:insert(webtransport_routers, {Key, Router}),
     Router.
+
+%% Drop a per-connection router's registry row and stop the router when its
+%% QUIC connection ends, so a long-lived embedder doesn't accumulate stale
+%% rows or idle router processes. Runs in a throwaway process: the
+%% connection_handler that spawns it runs inside the quic listener, which
+%% must not block or monitor on its behalf. The {Key, Router} match means a
+%% later connection that reuses the pid (and overwrote the row) is left
+%% untouched.
+reap_router(QuicConnPid, Router) ->
+    Ref = erlang:monitor(process, QuicConnPid),
+    receive
+        {'DOWN', Ref, process, _, _} ->
+            ets:match_delete(webtransport_routers, {QuicConnPid, Router}),
+            try gen_server:stop(Router, normal, 5000) catch _:_ -> ok end,
+            ok
+    end.
 
 ensure_router_table() ->
     case ets:whereis(webtransport_routers) of

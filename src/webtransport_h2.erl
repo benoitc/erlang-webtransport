@@ -161,9 +161,11 @@ request_headers(Authority, Path, ExtraHeaders, ConnectOpts) ->
 is_success_response(Headers) ->
     case lists:keyfind(<<":status">>, 1, Headers) of
         {_, Status} ->
-            case catch binary_to_integer(Status) of
-                N when is_integer(N), N >= 200, N < 300 -> true;
+            try binary_to_integer(Status) of
+                N when N >= 200, N < 300 -> true;
                 _ -> false
+            catch
+                _:_ -> false
             end;
         false ->
             false
