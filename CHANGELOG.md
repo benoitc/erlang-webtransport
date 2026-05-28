@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.2.5
+
+- Bump `quic` dep to 1.4.5, `h2` dep to 0.6.1.
+- OTP 29 support: replace deprecated `catch Expr` expressions with `try ... catch ... end` (`webtransport_h2`, `webtransport_session`, `webtransport`).
+- CI: add OTP 28 and 29 to the test matrix; bump rebar3 to 3.25.0.
+
 ## 0.2.4
 
 - Bump `quic` dep to 1.4.2.

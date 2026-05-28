@@ -471,7 +471,7 @@ close_transport(h3, H3State) ->
     %% the QUIC connection before this cast arrives; the upstream fix
     %% (quic_h3_connection using `{shutdown, quic_closed}' instead of
     %% bare `quic_closed') eliminates the remaining noise.
-    catch quic_h3:close(webtransport_h3:h3_conn(H3State));
+    try quic_h3:close(webtransport_h3:h3_conn(H3State)) catch _:_ -> ok end;
 close_transport(h2, _H2State) ->
     ok.
 

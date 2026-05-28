@@ -406,7 +406,7 @@ reap_router(QuicConnPid, Router) ->
     receive
         {'DOWN', Ref, process, _, _} ->
             ets:match_delete(webtransport_routers, {QuicConnPid, Router}),
-            catch gen_server:stop(Router, normal, 5000),
+            try gen_server:stop(Router, normal, 5000) catch _:_ -> ok end,
             ok
     end.
 

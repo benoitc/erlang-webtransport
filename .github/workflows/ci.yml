@@ -13,8 +13,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        otp: ['26', '27']
-        rebar3: ['3.24.0']
+        otp: ['26', '27', '28', '29']
+        rebar3: ['3.25.0']
     steps:
       - uses: actions/checkout@v4
 
@@ -53,8 +53,8 @@ jobs:
 
       - uses: erlef/setup-beam@v1
         with:
-          otp-version: '27'
-          rebar3-version: '3.24.0'
+          otp-version: '29'
+          rebar3-version: '3.25.0'
 
       - name: Build docs
         run: rebar3 ex_doc
