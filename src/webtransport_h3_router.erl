@@ -81,7 +81,9 @@ client_connect(Router, Host, Port, H3Opts) ->
 -spec open_bidi_stream(pid(), non_neg_integer()) ->
     {ok, non_neg_integer()} | {error, term()}.
 open_bidi_stream(Router, SessionId) ->
-    gen_server:call(Router, {open_bidi_stream, SessionId}, infinity).
+    %% Bounded: this runs inside the session gen_statem's call handler, so an
+    %% unresponsive H3 connection must not stall the session indefinitely.
+    gen_server:call(Router, {open_bidi_stream, SessionId}, 30000).
 
 %% @doc Return the H3 connection pid, or undefined if not yet connected.
 -spec get_h3_conn(pid()) -> undefined | pid().
