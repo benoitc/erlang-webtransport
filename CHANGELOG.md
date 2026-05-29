@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.2.6
+
+- Fix: failed h3 `connect/4` no longer leaks its per-connection router. The router is `start_link`'d to the caller but traps exits, so the caller link never reaped it; `connect_h3` now stops it on the connect-failure path, and closes the H3 connection (which reaps the router via its monitor) when the session fails to start.
+- Fix: the h2 CONNECT-stream data loop now monitors both the h2 connection and the session and exits on either `'DOWN'`, instead of blocking forever if the connection dies without a `closed` message or the session goes away. Server and client now spawn it the same way.
+- Bound the router `open_bidi_stream` call (was `infinity`) so an unresponsive H3 connection cannot stall the session process.
+- Tests: regressions for the router leak and the data-loop termination.
+
 ## 0.2.5
 
 - Bump `quic` dep to 1.4.5, `h2` dep to 0.6.1.

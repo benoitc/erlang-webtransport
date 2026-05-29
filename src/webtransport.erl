@@ -77,6 +77,12 @@
 -export([close_session/1, close_session/2, close_session/3]).
 -export([session_info/1]).
 
+-ifdef(TEST).
+%% Exported for eunit: lets tests drive the h2 CONNECT-stream data loop with
+%% fake connection/session pids to assert it self-terminates.
+-export([h2_data_loop/3]).
+-endif.
+
 %% Types
 -type session() :: pid().
 -type stream() :: non_neg_integer().
@@ -952,6 +958,14 @@ allowed_by_listener(_, _) -> false.
 %% ============================================================================
 
 h2_data_loop(Conn, StreamId, Session) ->
+    %% Monitor both ends so the loop can never orphan: if the h2 connection
+    %% dies without a `closed' message, or the session goes away, we exit
+    %% instead of blocking in `receive' forever.
+    ConnRef = erlang:monitor(process, Conn),
+    SessionRef = erlang:monitor(process, Session),
+    h2_data_loop(Conn, StreamId, Session, ConnRef, SessionRef).
+
+h2_data_loop(Conn, StreamId, Session, ConnRef, SessionRef) ->
     receive
         {h2, Conn, {data, StreamId, Data, _IsFin}} ->
             %% Decode capsules and dispatch
@@ -966,14 +980,28 @@ h2_data_loop(Conn, StreamId, Session) ->
                     logger:warning("h2 capsule decode error: ~p", [Reason]),
                     webtransport_session:close(Session, 0, <<"malformed capsule">>)
             end,
-            h2_data_loop(Conn, StreamId, Session);
+            h2_data_loop(Conn, StreamId, Session, ConnRef, SessionRef);
         {h2, Conn, {stream_reset, StreamId, _ErrorCode}} ->
+            cleanup_data_loop(ConnRef, SessionRef),
             webtransport_session:close(Session, 0, <<"stream reset">>);
         {h2, Conn, closed} ->
+            cleanup_data_loop(ConnRef, SessionRef),
             webtransport_session:close(Session, 0, <<"connection closed">>);
+        {'DOWN', ConnRef, process, Conn, _Reason} ->
+            erlang:demonitor(SessionRef, [flush]),
+            webtransport_session:close(Session, 0, <<"connection closed">>);
+        {'DOWN', SessionRef, process, Session, _Reason} ->
+            %% Session is gone; nothing left to forward to. Exit so we don't
+            %% leak this process for the life of the h2 connection.
+            erlang:demonitor(ConnRef, [flush]),
+            ok;
         _ ->
-            h2_data_loop(Conn, StreamId, Session)
+            h2_data_loop(Conn, StreamId, Session, ConnRef, SessionRef)
     end.
+
+cleanup_data_loop(ConnRef, SessionRef) ->
+    erlang:demonitor(ConnRef, [flush]),
+    erlang:demonitor(SessionRef, [flush]).
 
 dispatch_h2_capsule(Session, {wt_stream, WtStreamId, Data}) ->
     %% h2 multiplexes WT streams over CONNECT; peer-opened streams don't get
@@ -1026,7 +1054,7 @@ connect_h2(Host, Port, Path, Opts, Handler) ->
                 {ok, Session} ->
                     H2Conn = webtransport_h2:h2_conn(TransportState),
                     StreamId = webtransport_h2:connect_stream_id(TransportState),
-                    LoopPid = spawn_link(fun() -> h2_data_loop(H2Conn, StreamId, Session) end),
+                    LoopPid = spawn(fun() -> h2_data_loop(H2Conn, StreamId, Session) end),
                     _ = h2:set_stream_handler(H2Conn, StreamId, LoopPid),
                     {ok, Session};
                 {error, _} = Err ->
@@ -1048,6 +1076,10 @@ connect_h3(Host, Port, Path, Opts0, Handler) ->
         {ok, H3Conn} ->
             h3_validate_and_request(H3Conn, HostBin, Port, Path, Opts, Handler, Router);
         {error, Reason} ->
+            %% No H3 connection was established, so the router never started
+            %% monitoring one and would otherwise linger (it traps exits, so
+            %% the caller link won't reap it). Stop it explicitly.
+            _ = gen_server:stop(Router, normal, 5000),
             {error, Reason}
     end.
 
@@ -1201,6 +1233,10 @@ h3_start_session(H3Conn, SessionId, Authority, Path, Headers, Opts, Handler, Rou
             webtransport_h3_router:register_session(Router, SessionId, Session),
             {ok, Session};
         {error, _} = Err ->
+            %% Session failed to start after a successful CONNECT. Closing the
+            %% H3 connection makes the router stop via its h3_conn monitor, so
+            %% neither the connection nor the router is left dangling.
+            quic_h3:close(H3Conn),
             Err
     end.
 
