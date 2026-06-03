@@ -7,6 +7,12 @@ An Erlang implementation of the [WebTransport](https://www.w3.org/TR/webtranspor
 
 WebTransport provides bidirectional communication between a client and server using reliable streams and unreliable datagrams over HTTP/3 or HTTP/2.
 
+Listeners and clients support IPv4 and IPv6 (bind via `ip`/`family`; the client
+accepts IP-literal hosts and address tuples with Happy Eyeballs racing).
+`webtransport:listener_sockname/1` reports the bound address. 0-RTT support
+covers session-ticket capture and connection-level acceptance reporting
+(`webtransport:early_data_accepted/1`); see [docs/configuration.md](docs/configuration.md).
+
 ## Requirements
 
 - Erlang/OTP 26.0 or later
