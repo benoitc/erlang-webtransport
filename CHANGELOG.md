@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.3.1
+
+- Bump `quic` dep to 1.6.3.
+
 ## 0.3.0
 
 - Bump `quic` dep to 1.6.2, `h2` dep to 0.8.0.
