@@ -2,7 +2,7 @@
 
 ## 0.3.0
 
-- Bump `quic` dep to 1.6.2, `h2` dep to 0.7.0.
+- Bump `quic` dep to 1.6.2, `h2` dep to 0.8.0.
 - IPv6: listeners bind via `ip` / `family` (h3 and h2); clients accept IP-literal hosts and `inet:ip_address()` tuples, with `family` / `happy_eyeballs` / `connection_attempt_delay` controls (h3). IPv6 literals are bracketed in the `:authority` header.
 - `webtransport:listener_sockname/1` returns the bound `{Ip, Port}` (also surfaced as `sockname` in `listener_info/1`). Resolved from the socket for h3; best-effort (requested addr + bound port) for h2, which exposes only the port.
 - 0-RTT: session-ticket capture (`{webtransport, session_ticket, _}` to the connecting process) and connection-level acceptance reporting via `webtransport:early_data_accepted/1`. The `session_ticket` connect option plumbs a stored ticket through to QUIC. Full 0-RTT resumption is not yet supported through the synchronous connect path.
