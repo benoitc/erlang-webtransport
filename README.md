@@ -614,11 +614,14 @@ echo_client:test("localhost", 4433).
 ## Testing
 
 ```sh
-# Unit tests (298 tests)
+# Unit tests (301 tests)
 rebar3 eunit
 
-# Integration tests (54 tests, both h2 and h3)
+# Integration tests (67 tests, both h2 and h3)
 rebar3 ct --suite=test/webtransport_SUITE
+
+# IPv6, sockname and 0-RTT integration tests
+rebar3 ct --suite=test/webtransport_ipv6_SUITE
 
 # Docker interop (erlang vs erlang)
 cd interop && docker compose up --abort-on-container-exit --build
