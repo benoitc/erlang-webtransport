@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.3.0
+
+- Bump `quic` dep to 1.6.2, `h2` dep to 0.8.0.
+- IPv6: listeners bind via `ip` / `family` (h3 and h2); clients accept IP-literal hosts and `inet:ip_address()` tuples, with `family` / `happy_eyeballs` / `connection_attempt_delay` controls (h3). IPv6 literals are bracketed in the `:authority` header.
+- `webtransport:listener_sockname/1` returns the bound `{Ip, Port}` (also surfaced as `sockname` in `listener_info/1`). Resolved from the socket for h3; best-effort (requested addr + bound port) for h2, which exposes only the port.
+- 0-RTT: session-ticket capture (`{webtransport, session_ticket, _}` to the connecting process) and connection-level acceptance reporting via `webtransport:early_data_accepted/1`. The `session_ticket` connect option plumbs a stored ticket through to QUIC. Full 0-RTT resumption is not yet supported through the synchronous connect path.
+- Tests: IPv6 round-trip (h3 + h2), sockname, and session-ticket capture.
+
 ## 0.2.6
 
 - Fix: failed h3 `connect/4` no longer leaks its per-connection router. The router is `start_link`'d to the caller but traps exits, so the caller link never reaped it; `connect_h3` now stops it on the connect-failure path, and closes the H3 connection (which reaps the router via its monitor) when the session fails to start.

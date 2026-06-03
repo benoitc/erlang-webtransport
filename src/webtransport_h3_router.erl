@@ -72,7 +72,7 @@ unregister_session(Router, SessionId) ->
     gen_server:call(Router, {unregister, SessionId}).
 
 %% @doc Connect to an H3 server. The router becomes the H3 connection owner.
--spec client_connect(pid(), string() | binary(), inet:port_number(), map()) ->
+-spec client_connect(pid(), string() | binary() | inet:ip_address(), inet:port_number(), map()) ->
     {ok, pid()} | {error, term()}.
 client_connect(Router, Host, Port, H3Opts) ->
     gen_server:call(Router, {client_connect, Host, Port, H3Opts}, infinity).
@@ -165,11 +165,26 @@ handle_quic_h3({quic_h3, _Conn, {stream_type_stop_sending, _Direction, StreamId,
 handle_quic_h3({quic_h3, Conn, {datagram, StreamId, Payload}}, State0) ->
     State = ensure_h3_monitor(Conn, State0),
     {noreply, route_datagram(StreamId, Payload, State)};
+handle_quic_h3({quic_h3, _Conn, {session_ticket, Ticket}}, State) ->
+    %% Connection-scoped 0-RTT resumption ticket. Surface it to the connecting
+    %% process (the passthrough on the client side); it can store the ticket
+    %% and pass it back as `session_ticket' on a later connect.
+    notify_passthrough({webtransport, session_ticket, Ticket}, State),
+    {noreply, State};
+handle_quic_h3({quic_h3, _Conn, {early_data_rejected, StreamIds}}, State) ->
+    notify_passthrough({webtransport, early_data_rejected, StreamIds}, State),
+    {noreply, State};
 handle_quic_h3({quic_h3, _, _} = Msg, #state{passthrough = Pid} = State) when is_pid(Pid) ->
     Pid ! Msg,
     {noreply, State};
 handle_quic_h3(_Msg, State) ->
     {noreply, State}.
+
+notify_passthrough(Msg, #state{passthrough = Pid}) when is_pid(Pid) ->
+    Pid ! Msg,
+    ok;
+notify_passthrough(_Msg, _State) ->
+    ok.
 
 terminate(_Reason, _State) ->
     ok.

@@ -21,6 +21,7 @@
 -export([reset_stream/3, stop_sending/3]).
 -export([drain/1, close/3]).
 -export([get_info/1]).
+-export([early_data_accepted/1]).
 
 %% Internal API (called by transport layers)
 -export([handle_capsule/2, handle_stream_data/4, handle_datagram_data/2]).
@@ -122,6 +123,13 @@ close(Session, ErrorCode, Reason) ->
 -spec get_info(session()) -> {ok, map()} | {error, term()}.
 get_info(Session) ->
     gen_statem:call(Session, get_info).
+
+%% @doc Report whether the underlying connection negotiated 0-RTT early data.
+%% Returns `true'/`false'/`unknown' for h3 (per RFC 9001 §4.6), or
+%% `not_supported' for h2 which has no QUIC 0-RTT.
+-spec early_data_accepted(session()) -> boolean() | unknown | not_supported.
+early_data_accepted(Session) ->
+    gen_statem:call(Session, early_data_accepted).
 
 %% Internal API
 
@@ -276,6 +284,9 @@ open({call, From}, get_info, StateData) ->
     Info = build_info(StateData),
     {keep_state, StateData, [{reply, From, {ok, Info}}]};
 
+open({call, From}, early_data_accepted, StateData) ->
+    {keep_state, StateData, [{reply, From, do_early_data_accepted(StateData)}]};
+
 open(cast, {capsule, Capsule}, StateData) ->
     case handle_incoming_capsule(Capsule, StateData) of
         {session_error, Code, Reason} ->
@@ -427,6 +438,9 @@ draining({call, From}, {open_stream, _Type}, StateData) ->
 draining({call, From}, get_info, StateData) ->
     Info = build_info(StateData),
     {keep_state, StateData, [{reply, From, {ok, Info}}]};
+
+draining({call, From}, early_data_accepted, StateData) ->
+    {keep_state, StateData, [{reply, From, do_early_data_accepted(StateData)}]};
 
 draining({call, From}, _, StateData) ->
     {keep_state, StateData, [{reply, From, {error, session_draining}}]};
@@ -993,6 +1007,11 @@ maybe_stop_if_drained(#data{streams = Streams} = StateData, Actions) ->
         0 -> {stop, normal, StateData};
         _ -> {keep_state, StateData, Actions}
     end.
+
+do_early_data_accepted(#data{transport = h3, transport_state = H3State}) ->
+    quic_h3:early_data_accepted(webtransport_h3:h3_conn(H3State));
+do_early_data_accepted(#data{transport = h2}) ->
+    not_supported.
 
 build_info(#data{transport = Transport, streams = Streams,
                   local_max_data = LocalMaxData, remote_max_data = RemoteMaxData,

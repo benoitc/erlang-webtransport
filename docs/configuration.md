@@ -17,7 +17,32 @@ webtransport:start_listener(Name, Opts).
 | `max_data` | no | 1048576 (1 MB) | Session-level flow-control window (bytes) |
 | `max_streams_bidi` | no | 100 | Max concurrent bidirectional streams |
 | `max_streams_uni` | no | 100 | Max concurrent unidirectional streams |
+| `ip` | no | wildcard | Bind address (`inet:ip_address()`; IPv4 4-tuple or IPv6 8-tuple) |
+| `family` | no | `inet` | `inet` or `inet6`; forces the family when no `ip` is given (e.g. the IPv6 wildcard) |
+| `socket_opts` | no | `[]` | Extra options for the underlying listener socket (h3 only) |
 | `compat_mode` | no | `auto` | HTTP/3 draft selection (see below) |
+
+### IPv6 binding
+
+```erlang
+%% IPv6 wildcard
+webtransport:start_listener(srv, Opts#{transport => h3, family => inet6}).
+
+%% A specific IPv6 address
+webtransport:start_listener(srv, Opts#{transport => h3,
+                                       ip => {0,0,0,0,0,0,0,1}}).
+```
+
+Works for both `h3` and `h2`. (h2 IPv6 binding requires the `h2` library
+0.7.0 or later, which this release depends on.)
+
+### Bound address
+
+`webtransport:listener_sockname/1` returns the bound `{Ip, Port}`; it is also
+included as `sockname` in `listener_info/1`. For h3 the address is resolved
+live from the QUIC socket (correct even with `port => 0` or `inet6`). For h2 it
+is best-effort: the requested bind address paired with the actual bound port,
+because the h2 library exposes only the port.
 
 ## Client Options
 
@@ -35,7 +60,34 @@ webtransport:connect(Host, Port, Path, Opts).
 | `headers` | `[]` | Extra headers on the CONNECT request |
 | `timeout` | 30000 | Connection timeout (ms) |
 | `handler_opts` | `#{}` | Map passed to handler's `init/3` |
+| `family` | `any` | `inet`, `inet6`, or `any` (h3 only) |
+| `happy_eyeballs` | `true` | RFC 8305 v6/v4 racing for multi-address hosts (h3 only) |
+| `connection_attempt_delay` | 250 | Happy Eyeballs stagger between attempts, ms (h3 only) |
+| `session_ticket` | -- | Stored 0-RTT resumption ticket (h3 only; see below) |
 | `compat_mode` | `latest` | HTTP/3 draft selection (see below) |
+
+`Host` accepts a hostname (string/binary), an IP-literal string, or an
+`inet:ip_address()` tuple. IPv6 literals are bracketed in the `:authority`
+header automatically.
+
+## 0-RTT / Session Tickets
+
+After a connection completes, the connecting process receives the connection's
+resumption ticket as:
+
+```erlang
+{webtransport, session_ticket, Ticket}
+```
+
+`Ticket` is an opaque term; store it and pass it back as `session_ticket` on a
+later `connect/4` to the same server. `webtransport:early_data_accepted/1`
+reports whether the connection negotiated 0-RTT (`true` | `false` | `unknown`
+for h3, `not_supported` for h2). If early data is rejected, the connecting
+process receives `{webtransport, early_data_rejected, StreamIds}`.
+
+This release implements session-ticket capture and connection-level acceptance
+reporting. Full 0-RTT resumption (sending the WebTransport CONNECT as early
+data) is not supported through the current synchronous connect path.
 
 ## Compatibility Mode
 

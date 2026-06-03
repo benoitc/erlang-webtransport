@@ -61,7 +61,7 @@
 
 %% Server API (convenience: standalone listener)
 -export([start_listener/2, stop_listener/1]).
--export([listeners/0, listener_info/1]).
+-export([listeners/0, listener_info/1, listener_sockname/1]).
 -export([listener_loop/1]).
 
 %% Client API
@@ -76,6 +76,7 @@
 -export([drain_session/1]).
 -export([close_session/1, close_session/2, close_session/3]).
 -export([session_info/1]).
+-export([early_data_accepted/1]).
 
 -ifdef(TEST).
 %% Exported for eunit: lets tests drive the h2 CONNECT-stream data loop with
@@ -103,6 +104,13 @@
     max_data => non_neg_integer(),
     max_streams_bidi => non_neg_integer(),
     max_streams_uni => non_neg_integer(),
+    %% Bind address / family. `ip' binds the listener socket to a specific
+    %% address (IPv4 4-tuple or IPv6 8-tuple); `family' forces `inet' or
+    %% `inet6' when no `ip' is given (e.g. the IPv6 wildcard). `socket_opts'
+    %% are passed verbatim to the underlying UDP (h3) listener socket.
+    ip => inet:ip_address(),
+    family => inet | inet6,
+    socket_opts => list(),
     %% `compat_mode' selects which WebTransport HTTP/3 draft the listener
     %% accepts. Default `auto' accepts draft-15 and draft-02 and picks the
     %% matching code path per CONNECT. Pin to `latest' to refuse draft-02
@@ -118,6 +126,16 @@
     verify => verify_none | verify_peer,
     headers => [{binary(), binary()}],
     timeout => timeout(),
+    %% Address-family / dual-stack controls (h3 only), passed through to the
+    %% QUIC client. `family' restricts resolution; `happy_eyeballs' toggles
+    %% RFC 8305 v6/v4 racing; `connection_attempt_delay' is the stagger in ms.
+    family => inet | inet6 | any,
+    happy_eyeballs => boolean(),
+    connection_attempt_delay => non_neg_integer(),
+    %% 0-RTT: a session ticket captured from a prior connection
+    %% (`{webtransport, session_ticket, Ticket}'). Opaque term, passed back to
+    %% the QUIC layer as-is. h3 only.
+    session_ticket => term(),
     %% Clients pick an explicit compat mode. Default `latest' sends
     %% draft-15 SETTINGS and `:protocol = webtransport-h3'. Use
     %% `legacy_browser_compat' only when talking to a known draft-02 peer
@@ -488,11 +506,42 @@ listeners() ->
     [Name || {{webtransport_listener, Name}, _} <- persistent_term:get()].
 
 %% @doc Get information about a listener.
+%%
+%% The `sockname' field is the bound `{Ip, Port}'. For h3 it is resolved live
+%% from the QUIC socket (correct even when bound with port 0 or `inet6'). For
+%% h2 it is best-effort (requested address + bound port), since the h2 library
+%% does not expose the bound IP.
 -spec listener_info(listener_name()) -> {ok, map()} | {error, not_found}.
 listener_info(Name) ->
     case persistent_term:get({webtransport_listener, Name}, undefined) of
-        undefined -> {error, not_found};
-        Info -> {ok, maps:without([server_ref], Info)}
+        undefined ->
+            {error, not_found};
+        Info ->
+            Base = maps:without([server_ref], Info),
+            WithSockname = case listener_sockname(Name) of
+                {ok, Sockname} -> Base#{sockname => Sockname};
+                {error, _} -> Base
+            end,
+            {ok, WithSockname}
+    end.
+
+%% @doc Get the bound `{Ip, Port}' of a listener.
+%%
+%% For h3, resolved live from the QUIC listener socket. For h2 this is
+%% best-effort: the requested bind address (defaulting to the family wildcard)
+%% paired with the actual bound port, because the h2 library exposes only the
+%% port, not the bound IP.
+-spec listener_sockname(listener_name()) ->
+    {ok, {inet:ip_address(), inet:port_number()}} | {error, term()}.
+listener_sockname(Name) ->
+    case persistent_term:get({webtransport_listener, Name}, undefined) of
+        undefined ->
+            {error, not_found};
+        #{transport := h3} ->
+            quic:get_server_sockname(Name);
+        #{transport := h2, server_ref := ServerRef} = Info ->
+            Ip = maps:get(bind_ip, Info, {0, 0, 0, 0}),
+            {ok, {Ip, h2:server_port(ServerRef)}}
     end.
 
 %% ============================================================================
@@ -509,7 +558,7 @@ listener_info(Name) ->
 %% - `timeout' - Optional. Connection timeout in ms (default: 30000)
 %%
 -spec connect(Host, Port, Path, Opts) -> {ok, session()} | {error, term()} when
-    Host :: string() | binary(),
+    Host :: string() | binary() | inet:ip_address(),
     Port :: inet:port_number(),
     Path :: binary(),
     Opts :: connect_opts().
@@ -518,7 +567,7 @@ connect(Host, Port, Path, Opts) ->
 
 %% @doc Connect to a WebTransport server with a custom handler.
 -spec connect(Host, Port, Path, Opts, Handler) -> {ok, session()} | {error, term()} when
-    Host :: string() | binary(),
+    Host :: string() | binary() | inet:ip_address(),
     Port :: inet:port_number(),
     Path :: binary(),
     Opts :: connect_opts(),
@@ -599,6 +648,16 @@ close_session(Session, ErrorCode, Reason) ->
 session_info(Session) ->
     webtransport_session:get_info(Session).
 
+%% @doc Report whether the session's connection negotiated 0-RTT early data.
+%%
+%% Returns `true', `false', or `unknown' for h3 sessions (RFC 9001 §4.6), and
+%% `not_supported' for h2. This is connection-level: it reflects whether the
+%% QUIC connection used 0-RTT, regardless of whether the WebTransport CONNECT
+%% itself rode as early data.
+-spec early_data_accepted(session()) -> boolean() | unknown | not_supported.
+early_data_accepted(Session) ->
+    webtransport_session:early_data_accepted(Session).
+
 %% ============================================================================
 %% Internal Functions - Listener Setup
 %% ============================================================================
@@ -609,6 +668,57 @@ validate_listener_opts(Opts) ->
     case Missing of
         [] -> ok;
         _ -> {error, {missing_options, Missing}}
+    end.
+
+%% Build the `extra_socket_opts' list passed to quic for the h3 listener.
+%% `quic_listener' infers the socket family from this list (the `inet6' atom
+%% or an IPv6 `ip' tuple), so we just assemble the right entries:
+%%   - `family => inet6' or an 8-tuple `ip' selects IPv6
+%%   - `ip' adds `{ip, Addr}'
+%%   - user `socket_opts' are appended verbatim
+build_extra_socket_opts(Opts) ->
+    Ip = maps:get(ip, Opts, undefined),
+    Family = maps:get(family, Opts, inet),
+    UserOpts = maps:get(socket_opts, Opts, []),
+    Inet6 = (Family =:= inet6) orelse is_ipv6_addr(Ip),
+    FamilyOpts = case Inet6 of
+        true -> [inet6];
+        false -> []
+    end,
+    IpOpts = case Ip of
+        undefined -> [];
+        _ -> [{ip, Ip}]
+    end,
+    FamilyOpts ++ IpOpts ++ UserOpts.
+
+is_ipv6_addr({_, _, _, _, _, _, _, _}) -> true;
+is_ipv6_addr(_) -> false.
+
+%% Map our `ip' / `family' listener opts onto the `ip' / `inet6' keys that
+%% h2:start_server understands.
+add_h2_bind_opts(ServerOpts, Opts) ->
+    Ip = maps:get(ip, Opts, undefined),
+    Inet6 = (maps:get(family, Opts, inet) =:= inet6) orelse is_ipv6_addr(Ip),
+    WithIp = case Ip of
+        undefined -> ServerOpts;
+        _ -> ServerOpts#{ip => Ip}
+    end,
+    case Inet6 of
+        true -> WithIp#{inet6 => true};
+        false -> WithIp
+    end.
+
+%% Resolved default bind address for the stored listener record, used by
+%% `listener_sockname/1' / `listener_info/1' when no explicit `ip' was given.
+default_bind_ip(Opts) ->
+    case maps:get(ip, Opts, undefined) of
+        undefined ->
+            case (maps:get(family, Opts, inet) =:= inet6) of
+                true -> {0, 0, 0, 0, 0, 0, 0, 0};
+                false -> {0, 0, 0, 0}
+            end;
+        Ip ->
+            Ip
     end.
 
 start_h2_listener(Name, Opts) ->
@@ -633,13 +743,16 @@ start_h2_listener(Name, Opts) ->
         wt_initial_max_streams_uni =>
             maps:get(max_streams_uni, Opts, ?DEFAULT_MAX_STREAMS_UNI)
     },
-    ServerOpts = #{
+    ServerOpts0 = #{
         cert => CertFile,
         key => KeyFile,
         handler => H2Handler,
         enable_connect_protocol => true,
         settings => WtSettings
     },
+    %% h2:start_server reads `ip' / `inet6' from its server-opts map. Map our
+    %% `ip' / `family' listener opts onto those keys.
+    ServerOpts = add_h2_bind_opts(ServerOpts0, Opts),
 
     %% h2:start_server spawn_link's acceptor/manager processes to its caller.
     %% Delegating to a persistent owner process keeps those links on a
@@ -649,6 +762,7 @@ start_h2_listener(Name, Opts) ->
             persistent_term:put({webtransport_listener, Name}, #{
                 transport => h2,
                 port => Port,
+                bind_ip => default_bind_ip(Opts),
                 handler => Handler,
                 server_ref => ServerRef
             }),
@@ -738,7 +852,8 @@ start_h3_listener(Name, Opts) ->
                 settings => AdvertisedSettings,
                 quic_opts => #{
                     max_datagram_frame_size => 65535,
-                    reset_stream_at => true
+                    reset_stream_at => true,
+                    extra_socket_opts => build_extra_socket_opts(Opts)
                 },
                 stream_type_handler => Claim,
                 connection_handler => ConnectionHandler
@@ -751,6 +866,7 @@ start_h3_listener(Name, Opts) ->
                     persistent_term:put({webtransport_listener, Name}, #{
                         transport => h3,
                         port => Port,
+                        bind_ip => default_bind_ip(Opts),
                         handler => Handler,
                         server_ref => ServerRef
                     }),
@@ -1042,7 +1158,7 @@ connect_h2(Host, Port, Path, Opts, Handler) ->
             end,
             Request = #{
                 path => Path,
-                authority => iolist_to_binary([Host, ":", integer_to_list(Port)]),
+                authority => authority(Host, Port),
                 headers => maps:get(headers, Opts, [])
             },
             SessionOpts = #{
@@ -1069,12 +1185,12 @@ connect_h3(Host, Port, Path, Opts0, Handler) ->
     UserHandlerOpts = maps:get(handler_opts, Opts0, #{}),
     HandlerOpts = maps:merge(#{owner => Caller}, UserHandlerOpts),
     Opts = Opts0#{handler_opts => HandlerOpts},
-    HostBin = if is_list(Host) -> list_to_binary(Host); true -> Host end,
+    Authority = authority(Host, Port),
     {ok, Router} = webtransport_h3_router:start_link(Caller),
     H3ConnOpts = build_h3_connect_opts(Opts),
     case webtransport_h3_router:client_connect(Router, Host, Port, H3ConnOpts) of
         {ok, H3Conn} ->
-            h3_validate_and_request(H3Conn, HostBin, Port, Path, Opts, Handler, Router);
+            h3_validate_and_request(H3Conn, Authority, Path, Opts, Handler, Router);
         {error, Reason} ->
             %% No H3 connection was established, so the router never started
             %% monitoring one and would otherwise linger (it traps exits, so
@@ -1126,10 +1242,7 @@ build_h3_connect_opts(Opts) ->
         sync => true,
         connect_timeout => maps:get(timeout, Opts, 30000),
         verify => maps:get(verify, Opts, verify_peer),
-        quic_opts => #{
-            max_datagram_frame_size => 65535,
-            reset_stream_at => true
-        },
+        quic_opts => build_client_quic_opts(Opts),
         h3_datagram_enabled => true,
         stream_type_handler => fun
             (uni,  _, 16#54) -> claim;
@@ -1174,12 +1287,45 @@ build_h3_connect_opts(Opts) ->
             WithKey
     end.
 
-h3_validate_and_request(H3Conn, HostBin, Port, Path, Opts, Handler, Router) ->
+%% Build the `quic_opts' map for a client h3 connect. Threads the optional
+%% IPv6 / Happy Eyeballs controls and a stored 0-RTT `session_ticket' through
+%% to quic:connect/4 alongside the WebTransport transport defaults.
+build_client_quic_opts(Opts) ->
+    Base = #{
+        max_datagram_frame_size => 65535,
+        reset_stream_at => true
+    },
+    PassThrough = [family, happy_eyeballs, connection_attempt_delay, session_ticket],
+    lists:foldl(fun(Key, Acc) ->
+        case maps:find(Key, Opts) of
+            {ok, Value} -> Acc#{Key => Value};
+            error -> Acc
+        end
+    end, Base, PassThrough).
+
+%% Format an HTTP `:authority' from a host (string/binary/IP tuple) and port.
+%% IPv6 literals and 8-tuple addresses are bracketed per RFC 3986.
+authority(Host, Port) when is_tuple(Host) ->
+    authority(inet:ntoa(Host), Port);
+authority(Host, Port) when is_list(Host) ->
+    authority(list_to_binary(Host), Port);
+authority(Host, Port) when is_binary(Host) ->
+    PortBin = integer_to_binary(Port),
+    case is_ipv6_literal(Host) of
+        true -> <<"[", Host/binary, "]:", PortBin/binary>>;
+        false -> <<Host/binary, ":", PortBin/binary>>
+    end.
+
+%% An IPv6 literal contains a colon and no brackets (a bare host or IPv4
+%% literal never does). Already-bracketed input is left as-is.
+is_ipv6_literal(<<"[", _/binary>>) -> false;
+is_ipv6_literal(Host) -> binary:match(Host, <<":">>) =/= nomatch.
+
+h3_validate_and_request(H3Conn, Authority, Path, Opts, Handler, Router) ->
     CompatMode = maps:get(compat_mode, Opts, latest),
     QuicConn = quic_h3:get_quic_conn(H3Conn),
     case wt_h3:validate_wt_support(H3Conn, QuicConn, CompatMode) of
         ok ->
-            Authority = <<HostBin/binary, ":", (integer_to_binary(Port))/binary>>,
             h3_send_connect(H3Conn, Authority, Path, Opts, Handler, Router, CompatMode);
         {error, Reason} ->
             quic_h3:close(H3Conn),

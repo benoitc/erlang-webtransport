@@ -81,17 +81,21 @@ peer_settings(#state{peer_settings = PeerSettings}) ->
 %% ============================================================================
 
 %% @doc Establish an HTTP/2 WebTransport session to the given host, port, and path.
--spec connect(string() | binary(), inet:port_number(), binary(), map()) ->
+-spec connect(string() | binary() | inet:ip_address(), inet:port_number(), binary(), map()) ->
     {ok, state()} | {error, term()}.
 connect(Host, Port, Path, Opts) ->
-    HostBin = if is_list(Host) -> list_to_binary(Host); true -> Host end,
+    %% h2:connect hands the host to ssl:connect, which accepts an
+    %% inet:ip_address() tuple directly and infers the family from it. h2's
+    %% client opts have no family control and its ssl-opt merge rejects bare
+    %% socket atoms, so for IPv6 we resolve to an address tuple here.
+    H2Host = h2_host(Host),
     SSLOpts = maps:get(ssl_opts, Opts, []),
     H2Opts = #{
         ssl_opts => [{alpn_advertised_protocols, [<<"h2">>]} | SSLOpts]
     },
-    case h2:connect(Host, Port, H2Opts) of
+    case h2:connect(H2Host, Port, H2Opts) of
         {ok, H2Conn} ->
-            Authority = <<HostBin/binary, ":", (integer_to_binary(Port))/binary>>,
+            Authority = authority(Host, Port),
             Headers = request_headers(Authority, Path, maps:get(headers, Opts, [])),
             case h2:request(H2Conn, <<"CONNECT">>, Path, Headers) of
                 {ok, StreamId} ->
@@ -119,6 +123,40 @@ connect(Host, Port, Path, Opts) ->
             end;
         {error, Reason} ->
             {error, Reason}
+    end.
+
+%% Format an HTTP `:authority' from a host (string/binary/IP tuple) and port.
+%% IPv6 literals and 8-tuple addresses are bracketed per RFC 3986.
+authority(Host, Port) when is_tuple(Host) ->
+    authority(inet:ntoa(Host), Port);
+authority(Host, Port) when is_list(Host) ->
+    authority(list_to_binary(Host), Port);
+authority(Host, Port) when is_binary(Host) ->
+    PortBin = integer_to_binary(Port),
+    case is_ipv6_literal(Host) of
+        true -> <<"[", Host/binary, "]:", PortBin/binary>>;
+        false -> <<Host/binary, ":", PortBin/binary>>
+    end.
+
+is_ipv6_literal(<<"[", _/binary>>) -> false;
+is_ipv6_literal(Host) -> binary:match(Host, <<":">>) =/= nomatch.
+
+%% Resolve the host into a form ssl:connect can reach. An IP tuple passes
+%% through; an IPv6 literal string/binary is parsed to a tuple so ssl picks
+%% the v6 family (a bare literal string would otherwise resolve as a v4
+%% hostname and fail). Plain hostnames and IPv4 literals are returned as-is.
+h2_host(Host) when is_tuple(Host) ->
+    Host;
+h2_host(Host) ->
+    HostBin = if is_list(Host) -> list_to_binary(Host); true -> Host end,
+    case is_ipv6_literal(HostBin) of
+        true ->
+            case inet:parse_address(binary_to_list(HostBin)) of
+                {ok, Addr} -> Addr;
+                {error, _} -> Host
+            end;
+        false ->
+            Host
     end.
 
 %% @doc Build CONNECT request headers for an H2 WebTransport session.
