@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.3.2
+
+- Bump `quic` dep to 1.6.4.
+
 ## 0.3.1
 
 - Bump `quic` dep to 1.6.3.
