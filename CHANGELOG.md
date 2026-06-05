@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.3.2
+## 0.3.2 - 2026-06-05
 
 - Bump `quic` dep to 1.6.4.
 
