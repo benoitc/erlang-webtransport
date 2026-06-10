@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.3.3 - 2026-06-10
+
+- Bump `h2` dep to 0.9.0.
+
 ## 0.3.2 - 2026-06-05
 
 - Bump `quic` dep to 1.6.4.
