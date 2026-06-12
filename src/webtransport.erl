@@ -111,12 +111,27 @@
     ip => inet:ip_address(),
     family => inet | inet6,
     socket_opts => list(),
+    %% Per-SNI certificate selection. Invoked per connection with the
+    %% ClientHello SNI (RFC 6066 §3); the returned cert/key override the
+    %% static `certfile'/`keyfile' for that handshake, letting one listener
+    %% present different certificates per hostname. `cert' is a DER binary,
+    %% `key' a decoded private-key term, `cert_chain' the DER intermediates.
+    %% For h3 it is forwarded to `quic' (>= 1.6.5); for h2 it is adapted to
+    %% an `ssl' `sni_fun'. When the callback returns `{error, _}' (or raises)
+    %% the static cert is used for h2; for h3 the handshake fails.
+    sni_callback => sni_callback(),
     %% `compat_mode' selects which WebTransport HTTP/3 draft the listener
     %% accepts. Default `auto' accepts draft-15 and draft-02 and picks the
     %% matching code path per CONNECT. Pin to `latest' to refuse draft-02
     %% clients or to `legacy_browser_compat' to refuse draft-15 clients.
     compat_mode => latest | legacy_browser_compat | auto
 }.
+
+-type sni_callback() :: fun(
+    (ServerName :: binary() | undefined) ->
+        {ok, #{cert := binary(), key := term(), cert_chain => [binary()]}}
+        | {error, term()}
+).
 
 -type connect_opts() :: #{
     transport => h2 | h3,
@@ -144,7 +159,7 @@
 }.
 
 -export_type([session/0, stream/0, request/0]).
--export_type([listener_name/0, listener_opts/0, connect_opts/0]).
+-export_type([listener_name/0, listener_opts/0, connect_opts/0, sni_callback/0]).
 
 -include("webtransport.hrl").
 
@@ -708,6 +723,49 @@ add_h2_bind_opts(ServerOpts, Opts) ->
         false -> WithIp
     end.
 
+%% Forward a `sni_callback' into the h3 `quic_opts' map so it reaches
+%% `quic:start_server' (quic >= 1.6.5 selects the cert per ClientHello SNI).
+maybe_put_sni(Opts, QuicOpts) ->
+    case maps:find(sni_callback, Opts) of
+        {ok, Fun} -> QuicOpts#{sni_callback => Fun};
+        error -> QuicOpts
+    end.
+
+%% Adapt a quic-style `sni_callback' to an `ssl' `sni_fun' for the h2 path.
+%% `ssl' invokes `sni_fun' only when the ClientHello carries an SNI, so a
+%% client with no SNI keeps the static certfile/keyfile.
+add_h2_sni_opts(ServerOpts, Opts) ->
+    case maps:find(sni_callback, Opts) of
+        {ok, Fun} ->
+            SniFun = sni_fun_from_callback(Fun),
+            UserSslOpts = maps:get(ssl_opts, ServerOpts, []),
+            ServerOpts#{ssl_opts => [{sni_fun, SniFun} | UserSslOpts]};
+        error ->
+            ServerOpts
+    end.
+
+%% Wrap the quic-style callback as an `ssl' `sni_fun'. `ssl' passes the
+%% ServerName as a charlist; we hand the user a binary. On `{ok, _}' we
+%% return the leaf+chain and re-encode the decoded key to the `{Tag, DER}'
+%% form `ssl' expects via a `certs_keys' entry. Any other result (or a
+%% raised error) aborts the handshake, matching h3's `handshake_failure'.
+sni_fun_from_callback(Fun) ->
+    fun(ServerName) ->
+        ServerNameBin = case ServerName of
+            undefined -> undefined;
+            _ when is_list(ServerName) -> list_to_binary(ServerName);
+            _ when is_binary(ServerName) -> ServerName
+        end,
+        case Fun(ServerNameBin) of
+            {ok, #{cert := Cert, key := Key} = CertMap} when is_binary(Cert) ->
+                Chain = maps:get(cert_chain, CertMap, []),
+                KeyDer = {element(1, Key), public_key:der_encode(element(1, Key), Key)},
+                [{certs_keys, [#{cert => [Cert | Chain], key => KeyDer}]}];
+            Other ->
+                error({sni_callback_rejected, ServerNameBin, Other})
+        end
+    end.
+
 %% Resolved default bind address for the stored listener record, used by
 %% `listener_sockname/1' / `listener_info/1' when no explicit `ip' was given.
 default_bind_ip(Opts) ->
@@ -752,7 +810,11 @@ start_h2_listener(Name, Opts) ->
     },
     %% h2:start_server reads `ip' / `inet6' from its server-opts map. Map our
     %% `ip' / `family' listener opts onto those keys.
-    ServerOpts = add_h2_bind_opts(ServerOpts0, Opts),
+    ServerOpts1 = add_h2_bind_opts(ServerOpts0, Opts),
+    %% Per-SNI cert selection: adapt the quic-style `sni_callback' to an `ssl'
+    %% `sni_fun' and pass it through `ssl_opts' (h2 merges these on top of its
+    %% defaults). When no callback is set the static certfile/keyfile is used.
+    ServerOpts = add_h2_sni_opts(ServerOpts1, Opts),
 
     %% h2:start_server spawn_link's acceptor/manager processes to its caller.
     %% Delegating to a persistent owner process keeps those links on a
@@ -850,11 +912,14 @@ start_h3_listener(Name, Opts) ->
                 key => PrivateKey,
                 handler => make_h3_handler(Handler, HandlerOpts, Opts, undefined),
                 settings => AdvertisedSettings,
-                quic_opts => #{
+                %% `sni_callback' rides inside `quic_opts' so it reaches
+                %% `quic:start_server'; `quic_h3' only lifts cert/key from
+                %% the top level. quic selects the cert per ClientHello SNI.
+                quic_opts => maybe_put_sni(Opts, #{
                     max_datagram_frame_size => 65535,
                     reset_stream_at => true,
                     extra_socket_opts => build_extra_socket_opts(Opts)
-                },
+                }),
                 stream_type_handler => Claim,
                 connection_handler => ConnectionHandler
             },

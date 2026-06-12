@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.4.0 - 2026-06-12
+
+- Bump `quic` dep to 1.6.5.
+- Per-SNI certificate selection. Listeners accept an `sni_callback` option
+  (`fun((ServerName) -> {ok, #{cert, key, cert_chain}} | {error, _})`) that
+  picks the server certificate per ClientHello SNI (RFC 6066 §3), so one
+  listener can present different certs per hostname. For h3 the callback is
+  forwarded to `quic`; for h2 it is adapted to an `ssl` `sni_fun`. A callback
+  error fails the handshake on both transports. When a client sends no SNI, h2
+  serves the static `certfile`/`keyfile` (ssl never calls the callback) while
+  h3 invokes the callback with `undefined`.
+- Test: SNI round-trip on both h3 and h2 groups.
+
 ## 0.3.3 - 2026-06-10
 
 - Bump `h2` dep to 0.9.0.

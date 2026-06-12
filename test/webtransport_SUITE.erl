@@ -67,7 +67,8 @@
     listeners_lists_active_listener_test/1,
     start_listener_invalid_certfile_test/1,
     start_listener_invalid_keyfile_test/1,
-    start_listener_bad_pem_test/1
+    start_listener_bad_pem_test/1,
+    sni_callback_round_trip_test/1
 ]).
 
 %% ============================================================================
@@ -114,7 +115,8 @@ groups() ->
         listeners_lists_active_listener_test,
         start_listener_invalid_certfile_test,
         start_listener_invalid_keyfile_test,
-        start_listener_bad_pem_test
+        start_listener_bad_pem_test,
+        sni_callback_round_trip_test
     ],
     %% Embedding via h3_settings/0 + accept/4 is HTTP/3-only.
     H3Only = [embedded_accept_round_trip_test],
@@ -1003,6 +1005,63 @@ start_listener_bad_pem_test(Config) ->
         handler => wt_echo_handler
     }),
     ?assertMatch({error, _}, Result).
+
+%% A listener configured with an `sni_callback' selects its cert per
+%% ClientHello SNI (RFC 6066 §3). The callback reports the SNI it saw and
+%% returns the test cert/key; the session must still round-trip on both
+%% transports, and the callback must have been invoked with `<<"localhost">>'.
+sni_callback_round_trip_test(Config) ->
+    Transport = proplists:get_value(transport, Config),
+    CertFile = proplists:get_value(certfile, Config),
+    KeyFile = proplists:get_value(keyfile, Config),
+    {ok, CertKey} = load_cert_key(CertFile, KeyFile),
+    Self = self(),
+    SniFun = fun(ServerName) ->
+        Self ! {sni_seen, ServerName},
+        {ok, CertKey}
+    end,
+    Name = sni_test_listener,
+    Port = test_helpers:find_free_port(),
+    {ok, _} = webtransport:start_listener(Name, #{
+        transport => Transport,
+        port => Port,
+        certfile => CertFile,
+        keyfile => KeyFile,
+        handler => wt_echo_handler,
+        sni_callback => SniFun
+    }),
+    timer:sleep(100),
+    try
+        {ok, Session} = webtransport:connect("localhost", Port, <<"/test">>, #{
+            transport => Transport,
+            verify => verify_none,
+            handler_opts => #{owner => self()}
+        }),
+        {ok, StreamId} = webtransport:open_stream(Session, bidi),
+        Payload = <<"sni-ping">>,
+        ok = webtransport:send(Session, StreamId, Payload, fin),
+        Echoed = collect_stream_echo(Session, StreamId, <<>>, 2000),
+        ?assertEqual(Payload, Echoed),
+        receive
+            {sni_seen, Seen} ->
+                ?assertEqual(<<"localhost">>, Seen)
+        after 2000 ->
+            ct:fail(sni_callback_not_invoked)
+        end,
+        webtransport:close_session(Session)
+    after
+        webtransport:stop_listener(Name)
+    end.
+
+%% Load a PEM cert/key into the quic-style `sni_callback' result shape:
+%% `cert' as a DER binary, `key' as a decoded private-key term.
+load_cert_key(CertFile, KeyFile) ->
+    {ok, CertPem} = file:read_file(CertFile),
+    {ok, KeyPem} = file:read_file(KeyFile),
+    [{_, CertDer, _} | _] = public_key:pem_decode(CertPem),
+    [{KeyType, KeyDer, _} | _] = public_key:pem_decode(KeyPem),
+    KeyTerm = public_key:der_decode(KeyType, KeyDer),
+    {ok, #{cert => CertDer, key => KeyTerm}}.
 
 listener_name_for(h3) -> test_h3_listener;
 listener_name_for(h2) -> test_h2_listener.
