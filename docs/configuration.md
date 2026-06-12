@@ -20,7 +20,31 @@ webtransport:start_listener(Name, Opts).
 | `ip` | no | wildcard | Bind address (`inet:ip_address()`; IPv4 4-tuple or IPv6 8-tuple) |
 | `family` | no | `inet` | `inet` or `inet6`; forces the family when no `ip` is given (e.g. the IPv6 wildcard) |
 | `socket_opts` | no | `[]` | Extra options for the underlying listener socket (h3 only) |
+| `sni_callback` | no | -- | Per-SNI certificate selection (see below) |
 | `compat_mode` | no | `auto` | HTTP/3 draft selection (see below) |
+
+### Per-SNI certificates
+
+`sni_callback` picks the server certificate per connection from the ClientHello
+SNI (RFC 6066 §3), so one listener can present different certs per hostname:
+
+```erlang
+SniFun = fun(ServerName) ->
+    case lookup_cert(ServerName) of
+        {ok, Cert, Key} -> {ok, #{cert => Cert, key => Key}};
+        error -> {error, unknown_host}
+    end
+end,
+webtransport:start_listener(srv, Opts#{sni_callback => SniFun}).
+```
+
+`ServerName` is a binary hostname (or `undefined` on h3 when the client sends no
+SNI). The result `cert` is a DER binary, `key` a decoded private-key term, and
+optional `cert_chain` the DER intermediates. For h3 the callback is forwarded to
+`quic`; for h2 it is adapted to an `ssl` `sni_fun`. A callback returning
+`{error, _}` (or raising) fails the handshake on both transports. When a client
+sends no SNI, h2 serves the static `certfile`/`keyfile`. The static cert remains
+the default when no callback is set.
 
 ### IPv6 binding
 
