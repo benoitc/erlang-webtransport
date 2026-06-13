@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.4.1 - 2026-06-14
+
+- Bump `h2` dep to 0.10.1.
+- Accept patch releases of deps via `~>` constraints: `h2 ~> 0.10.1`,
+  `quic ~> 1.6.5` (locked at 0.10.1 / 1.6.5).
+
 ## 0.4.0 - 2026-06-12
 
 - Bump `quic` dep to 1.6.5.
