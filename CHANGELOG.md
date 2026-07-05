@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.4.3 - 2026-07-06
+
+- Bump `quic` dep to 1.7.0 (`~> 1.7.0`, locked at 1.7.0).
+
 ## 0.4.2 - 2026-07-05
 
 - Bump `h2` dep to 0.10.4 (`~> 0.10.4`, locked at 0.10.4).
