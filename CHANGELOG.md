@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.4.4 - 2026-08-06
+
+- Bump `quic` dep to 1.8.0 (`~> 1.8.0`, locked at 1.8.0). Picks up RFC 6125
+  wildcard SAN matching for client hostname checks, Happy Eyeballs backlog
+  delivery on the winning attempt, Retry packet-number continuity, Version
+  Negotiation handling, and a `max_udp_payload_size` that reflects what we
+  accept rather than the probing ceiling.
+- Bump `h2` dep to 0.11.0 (`~> 0.11.0`, locked at 0.11.0). Adds
+  `h2:peername/1`.
+
 ## 0.4.3 - 2026-07-06
 
 - Bump `quic` dep to 1.7.0 (`~> 1.7.0`, locked at 1.7.0).
