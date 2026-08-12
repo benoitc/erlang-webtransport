@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.4.5 - 2026-08-12
+
+- Bump `h2` dep to 0.12.0. The constraint is now `~> 0.12` (0.12 and up within
+  0.x) instead of a patch-pinned `~> 0.12.0`. Picks up `h2:serve_socket/2` for
+  embedders owning their own TLS listener, and moves the TLS handshake into the
+  per-connection process so a stalled client no longer blocks the acceptor
+  queue. `start_server/2` behaviour is unchanged; no source changes needed.
+
 ## 0.4.4 - 2026-08-06
 
 - Bump `quic` dep to 1.8.0 (`~> 1.8.0`, locked at 1.8.0). Picks up RFC 6125
