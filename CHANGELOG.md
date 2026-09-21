@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.4.6 - 2026-09-21
+
+- Bump `quic` dep to 1.10.0. The constraint is now `~> 1.10` (1.10 and up
+  within 1.x) instead of a patch-pinned `~> 1.8.0`, so a project can take
+  newer quic releases without a webtransport release. Picks up the RFC 9002
+  loss detection and recovery rework, connection ID binding to paths, and the
+  1.9 fixes for multi-datagram Initial flights and frames that waited for the
+  next event after the handshake. No source changes needed.
+
 ## 0.4.5 - 2026-08-12
 
 - Bump `h2` dep to 0.12.0. The constraint is now `~> 0.12` (0.12 and up within
