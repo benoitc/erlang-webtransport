@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.4.7 - 2026-09-24
+
+- Bump `quic` dep to 2.0.0, constraint `~> 2.0`.
+- Lock `h2` to 0.12.3 (constraint unchanged, `~> 0.12`).
+- A connection that closes while a client waits for its CONNECT response is
+  reported again. quic 2.0.0 always sends the close reason with the event,
+  and the receive only matched the older shape without one, so the close was
+  not seen and the caller waited out its timeout. Both shapes are matched.
+
 ## 0.4.6 - 2026-09-21
 
 - Bump `quic` dep to 1.10.0. The constraint is now `~> 1.10` (1.10 and up

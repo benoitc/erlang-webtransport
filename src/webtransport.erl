@@ -1415,6 +1415,10 @@ h3_await_response(H3Conn, SessionId, Authority, Path, Opts, Handler, Router) ->
         {quic_h3, H3Conn, {response, SessionId, Status, _Headers}} ->
             quic_h3:close(H3Conn),
             {error, {http_error, Status}};
+        %% quic 2.0.0 always reports the reason; older ones send the bare
+        %% atom from two of their three close paths.
+        {quic_h3, H3Conn, {closed, _Reason}} ->
+            {error, connection_closed};
         {quic_h3, H3Conn, closed} ->
             {error, connection_closed}
     after Timeout ->
