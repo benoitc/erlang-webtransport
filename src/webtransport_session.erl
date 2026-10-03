@@ -50,6 +50,8 @@
     remote_max_streams_uni :: non_neg_integer(),
     bytes_sent = 0 :: non_neg_integer(),
     bytes_received = 0 :: non_neg_integer(),
+    %% Size of the session receive window we advertise and replenish (h2).
+    session_window :: non_neg_integer(),
     %% Flags
     is_server :: boolean(),
     close_info :: undefined | {non_neg_integer(), binary()}
@@ -185,6 +187,7 @@ init({Transport, TransportState, Handler, Opts}) ->
         next_uni_id = NextUni,
         local_max_data = maps:get(max_data, Opts, ?DEFAULT_MAX_DATA),
         remote_max_data = maps:get(max_data, Opts, ?DEFAULT_MAX_DATA),
+        session_window = maps:get(max_data, Opts, ?DEFAULT_MAX_DATA),
         local_max_streams_bidi = maps:get(max_streams_bidi, Opts, ?DEFAULT_MAX_STREAMS_BIDI),
         local_max_streams_uni = maps:get(max_streams_uni, Opts, ?DEFAULT_MAX_STREAMS_UNI),
         remote_max_streams_bidi = maps:get(max_streams_bidi, Opts, ?DEFAULT_MAX_STREAMS_BIDI),
@@ -497,40 +500,151 @@ augment_reason(Reason, {Code, Msg}) -> {Reason, {closed, Code, Msg}}.
 %% Internal functions
 %% ============================================================================
 
-do_send(StreamId, Data, Fin,
-        #data{streams = Streams, transport = Transport,
-              bytes_sent = SessSent, remote_max_data = SessMax} = StateData) ->
+%% Per-stream WebTransport windows only exist on h2 (draft-14 §6). On h3 the
+%% QUIC transport does flow control, so the WT-level window is unbounded
+%% there; applying the h2 default on h3 used to cut every payload at 256 KiB.
+-define(H3_STREAM_WINDOW, 1 bsl 62).
+
+-spec initial_stream_window(#data{}) -> non_neg_integer().
+initial_stream_window(#data{transport = h3}) -> ?H3_STREAM_WINDOW;
+initial_stream_window(#data{transport = h2}) -> ?DEFAULT_MAX_STREAM_DATA.
+
+do_send(StreamId, Data, Fin, #data{streams = Streams, transport = Transport} = StateData) ->
     case maps:find(StreamId, Streams) of
         {ok, Stream} ->
-            DataSize = byte_size(Data),
-            case Transport =:= h2 andalso SessSent + DataSize > SessMax of
-                true ->
-                    %% draft-14 §6.1: peer would overrun session window.
-                    %% Signal backpressure before refusing.
-                    _ = emit_data_blocked(StateData, SessMax),
-                    {error, flow_control_blocked};
-                false ->
-                    case webtransport_stream:send(Stream, Data) of
-                        {ok, ToSend, Stream1} ->
-                            maybe_emit_stream_data_blocked(Transport, StreamId, Stream1, StateData),
-                            ok = transport_send(StreamId, ToSend, Fin, StateData),
-                            Stream2 = case Fin of
-                                          true ->
-                                              {ok, S} = webtransport_stream:close_local(Stream1),
-                                              S;
-                                          false ->
-                                              Stream1
-                                      end,
-                            {ok, StateData#data{
-                                   streams = Streams#{StreamId => Stream2},
-                                   bytes_sent = SessSent + byte_size(ToSend)}};
-                        {error, _} = Err ->
-                            Err
-                    end
+            case Transport of
+                h3 -> send_h3(StreamId, Data, Fin, Stream, StateData);
+                h2 -> send_h2(StreamId, Data, Fin, Stream, StateData)
             end;
         error ->
             {error, unknown_stream}
     end.
+
+%% h3: hand the whole payload to QUIC; it blocks or buffers as its own
+%% flow control dictates.
+send_h3(StreamId, Data, Fin, Stream,
+        #data{streams = Streams, bytes_sent = SessSent} = StateData) ->
+    case webtransport_stream:send(Stream, Data) of
+        {ok, ToSend, Stream1} ->
+            case transport_send(StreamId, ToSend, Fin, StateData) of
+                ok ->
+                    Stream2 = maybe_close_local(Fin, Stream1),
+                    {ok, StateData#data{streams = Streams#{StreamId => Stream2},
+                                        bytes_sent = SessSent + byte_size(ToSend)}};
+                {error, _} = Err ->
+                    Err
+            end;
+        {error, _} = Err ->
+            Err
+    end.
+
+%% h2: honour the session and per-stream windows. Bytes that do not fit are
+%% queued on the stream, in order, and go out from flush_h2_streams/1 when
+%% the peer raises a window. A FIN is held back until the queue drains, so
+%% the peer never sees FIN before the last byte.
+send_h2(StreamId, Data, Fin, Stream, #data{streams = Streams} = StateData) ->
+    case webtransport_stream:send_buffer(Stream) of
+        <<>> ->
+            push_h2(StreamId, Data, Fin, Stream, StateData);
+        _ ->
+            %% Earlier bytes are still waiting for credit: queue behind them.
+            case webtransport_stream:is_writable(Stream) andalso
+                 not webtransport_stream:fin_pending(Stream) of
+                true ->
+                    Stream1 = webtransport_stream:buffer_send(Stream, Data),
+                    Stream2 = maybe_set_fin_pending(Fin, Stream1),
+                    {ok, StateData#data{streams = Streams#{StreamId => Stream2}}};
+                false ->
+                    {error, stream_fin_sent}
+            end
+    end.
+
+push_h2(StreamId, Data, Fin, Stream,
+        #data{streams = Streams, bytes_sent = SessSent,
+              remote_max_data = SessMax} = StateData) ->
+    SessAvail = max(SessMax - SessSent, 0),
+    {Now, Later} = split_binary_at(Data, SessAvail),
+    case webtransport_stream:send(Stream, Now) of
+        {ok, ToSend, Stream1} ->
+            Stream2 = webtransport_stream:buffer_send(Stream1, Later),
+            Drained = webtransport_stream:send_buffer(Stream2) =:= <<>>,
+            FinNow = Fin andalso Drained,
+            Stream3 = maybe_set_fin_pending(Fin andalso not Drained, Stream2),
+            case ToSend =:= <<>> andalso not FinNow of
+                true ->
+                    %% Nothing fits right now; tell the peer we are blocked.
+                    StateData1 = StateData#data{streams = Streams#{StreamId => Stream3}},
+                    emit_blocked(StreamId, Stream3, SessAvail, StateData1),
+                    {ok, StateData1};
+                false ->
+                    case transport_send(StreamId, ToSend, FinNow, StateData) of
+                        ok ->
+                            Stream4 = maybe_close_local(FinNow, Stream3),
+                            StateData1 = StateData#data{
+                                streams = Streams#{StreamId => Stream4},
+                                bytes_sent = SessSent + byte_size(ToSend)},
+                            case Drained of
+                                true -> ok;
+                                false -> emit_blocked(StreamId, Stream4,
+                                                      SessAvail - byte_size(ToSend),
+                                                      StateData1)
+                            end,
+                            {ok, StateData1};
+                        {error, _} = Err ->
+                            Err
+                    end
+            end;
+        {error, _} = Err ->
+            Err
+    end.
+
+%% Retry queued bytes on every h2 stream after the peer raised a window.
+-spec flush_h2_streams(#data{}) -> #data{}.
+flush_h2_streams(#data{transport = h2, streams = Streams} = StateData) ->
+    maps:fold(fun flush_h2_stream/3, StateData, Streams);
+flush_h2_streams(StateData) ->
+    StateData.
+
+flush_h2_stream(StreamId, Stream, #data{streams = Streams} = StateData) ->
+    case webtransport_stream:send_buffer(Stream) of
+        <<>> ->
+            StateData;
+        Buf ->
+            {_, Stream0} = webtransport_stream:flush_send_buffer(Stream),
+            Fin = webtransport_stream:fin_pending(Stream0),
+            Stream1 = webtransport_stream:clear_fin_pending(Stream0),
+            StateData1 = StateData#data{streams = Streams#{StreamId => Stream1}},
+            case push_h2(StreamId, Buf, Fin, Stream1, StateData1) of
+                {ok, StateData2} ->
+                    StateData2;
+                {error, Reason} ->
+                    logger:warning("webtransport: flush of stream ~p failed: ~p",
+                                   [StreamId, Reason]),
+                    StateData
+            end
+    end.
+
+maybe_close_local(true, Stream) ->
+    {ok, S} = webtransport_stream:close_local(Stream),
+    S;
+maybe_close_local(false, Stream) ->
+    Stream.
+
+maybe_set_fin_pending(true, Stream) -> webtransport_stream:set_fin_pending(Stream);
+maybe_set_fin_pending(false, Stream) -> Stream.
+
+split_binary_at(Bin, At) when At >= byte_size(Bin) ->
+    {Bin, <<>>};
+split_binary_at(Bin, At) ->
+    <<Now:At/binary, Later/binary>> = Bin,
+    {Now, Later}.
+
+emit_blocked(StreamId, Stream, SessAvail, StateData) ->
+    case SessAvail =< 0 of
+        true -> _ = emit_data_blocked(StateData, StateData#data.remote_max_data);
+        false -> ok
+    end,
+    maybe_emit_stream_data_blocked(h2, StreamId, Stream, StateData).
 
 %% h2 peers learn about local backpressure via DATA_BLOCKED / STREAM_DATA_BLOCKED
 %% capsules. h3 uses native QUIC flow control; the drafts don't define these
@@ -549,9 +663,7 @@ maybe_emit_stream_data_blocked(h2, StreamId, Stream, #data{transport_state = H2S
                                          wt_h2_capsule:stream_data_blocked(StreamId, Window));
         _ ->
             ok
-    end;
-maybe_emit_stream_data_blocked(_Transport, _StreamId, _Stream, _StateData) ->
-    ok.
+    end.
 
 do_send_datagram(Data, StateData) ->
     case transport_send_datagram(Data, StateData) of
@@ -566,7 +678,7 @@ do_open_stream(bidi, #data{streams = Streams, next_bidi_id = NextId,
         true ->
             case transport_open_stream(NextId, bidi, StateData) of
                 {ok, StreamId} ->
-                    Stream = webtransport_stream:new(StreamId, bidi, ?DEFAULT_MAX_STREAM_DATA),
+                    Stream = webtransport_stream:new(StreamId, bidi, initial_stream_window(StateData)),
                     Streams1 = Streams#{StreamId => Stream},
                     {ok, StreamId, StateData#data{
                         streams = Streams1,
@@ -586,7 +698,7 @@ do_open_stream(uni, #data{streams = Streams, next_uni_id = NextId,
         true ->
             case transport_open_stream(NextId, uni, StateData) of
                 {ok, StreamId} ->
-                    Stream = webtransport_stream:new(StreamId, uni, ?DEFAULT_MAX_STREAM_DATA),
+                    Stream = webtransport_stream:new(StreamId, uni, initial_stream_window(StateData)),
                     Streams1 = Streams#{StreamId => Stream},
                     {ok, StreamId, StateData#data{
                         streams = Streams1,
@@ -662,7 +774,7 @@ handle_incoming_capsule({max_data, Limit}, #data{remote_max_data = Prev} = State
         true ->
             {session_error, ?WT_FLOW_CONTROL_ERROR, <<"max_data decreased">>};
         false ->
-            StateData#data{remote_max_data = Limit}
+            flush_h2_streams(StateData#data{remote_max_data = Limit})
     end;
 handle_incoming_capsule({max_stream_data, _StreamId, _Limit},
                         #data{transport = h3} = _StateData) ->
@@ -681,7 +793,7 @@ handle_incoming_capsule({max_stream_data, StreamId, Limit},
                      <<"max_stream_data decreased">>};
                 false ->
                     Stream1 = webtransport_stream:update_send_window(Stream, Limit),
-                    StateData#data{streams = Streams#{StreamId => Stream1}}
+                    flush_h2_streams(StateData#data{streams = Streams#{StreamId => Stream1}})
             end;
         error ->
             StateData
@@ -780,13 +892,53 @@ handle_incoming_stream_data(StreamId, Data, Fin,
                         false -> fun() -> Handler:handle_stream(StreamId, Type, Data, HState) end
                     end,
                     StateData1 = StateData#data{bytes_received = SessRecv + byte_size(Data)},
-                    apply_stream_callback(Callback(), StreamId, Stream2, Streams, StateData1);
-                {error, _Reason} ->
+                    %% The handler consumes the bytes synchronously, so credit
+                    %% can be returned to the peer right away.
+                    {Stream3, StateData2} = grant_credit(StreamId, Stream2, StateData1),
+                    apply_stream_callback(Callback(), StreamId, Stream3, Streams, StateData2);
+                {error, Reason} ->
+                    logger:warning("webtransport: dropping ~p bytes on stream ~p: ~p",
+                                   [byte_size(Data), StreamId, Reason]),
                     {StateData, continue}
             end;
         error ->
             {StateData, continue}
     end.
+
+%% h2 receive-side flow control (draft-14 §6): once half of a window has
+%% been consumed, advertise a new limit so the peer can keep sending. h3
+%% leaves this to QUIC.
+-spec grant_credit(non_neg_integer(), webtransport_stream:stream(), #data{}) ->
+    {webtransport_stream:stream(), #data{}}.
+grant_credit(StreamId, Stream,
+             #data{transport = h2, transport_state = H2State,
+                   bytes_received = SessRecv, local_max_data = LocalMax,
+                   session_window = SessWindow} = StateData) ->
+    Window = webtransport_stream:recv_window(Stream),
+    Received = webtransport_stream:bytes_received(Stream),
+    Stream1 =
+        case webtransport_stream:is_readable(Stream) andalso
+             Received >= Window - (?DEFAULT_MAX_STREAM_DATA div 2) of
+            true ->
+                NewWindow = Received + ?DEFAULT_MAX_STREAM_DATA,
+                _ = webtransport_h2:send_capsule(
+                      H2State, wt_h2_capsule:max_stream_data(StreamId, NewWindow)),
+                webtransport_stream:update_recv_window(Stream, NewWindow);
+            false ->
+                Stream
+        end,
+    StateData1 =
+        case SessRecv >= LocalMax - (SessWindow div 2) of
+            true ->
+                NewMax = SessRecv + SessWindow,
+                _ = webtransport_h2:send_capsule(H2State, wt_h2_capsule:max_data(NewMax)),
+                StateData#data{local_max_data = NewMax};
+            false ->
+                StateData
+        end,
+    {Stream1, StateData1};
+grant_credit(_StreamId, Stream, StateData) ->
+    {Stream, StateData}.
 
 apply_stream_callback({ok, HState1}, StreamId, Stream2, Streams, StateData) ->
     {StateData#data{streams = Streams#{StreamId => Stream2},
@@ -823,7 +975,7 @@ handle_remote_stream_opened(StreamId, Type, #data{streams = Streams} = StateData
             Count = count_peer_streams(Type, Streams, StateData#data.is_server),
             case Count < Limit of
                 true ->
-                    Stream = webtransport_stream:new(StreamId, Type, ?DEFAULT_MAX_STREAM_DATA),
+                    Stream = webtransport_stream:new(StreamId, Type, initial_stream_window(StateData)),
                     StateData#data{streams = Streams#{StreamId => Stream}};
                 false ->
                     %% Peer exceeded our advertised stream limit.

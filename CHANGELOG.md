@@ -1,5 +1,29 @@
 # Changelog
 
+## Unreleased
+
+- Payloads larger than one HTTP/2 DATA frame are no longer truncated on h2.
+  A WT_STREAM capsule carries a whole `send/4` payload and h2 splits it into
+  16 KiB frames, but the CONNECT-stream reader decoded each frame on its own
+  and dropped the partial tail. The reader now carries the tail over to the
+  next frame. A single capsule over 64 MiB closes the session.
+- Sends larger than the per-stream window no longer lose data. The stream
+  cut the payload at its window (256 KiB by default), kept the rest in a
+  buffer nothing drained, and still sent FIN. On h3 the WebTransport window
+  is now unbounded, since QUIC does the flow control there. On h2 the bytes
+  that do not fit are queued in order, FIN waits until the queue drains, and
+  the queue is flushed when the peer raises `WT_MAX_DATA` or
+  `WT_MAX_STREAM_DATA`.
+- The h2 receiver now returns flow-control credit: once half of a stream or
+  session window is consumed it sends `WT_MAX_STREAM_DATA` or `WT_MAX_DATA`.
+  Before, a peer that honoured our windows stalled for good after 256 KiB
+  on a stream or 1 MiB on a session.
+- New tests: a 1 MiB bidi echo on both transports, and unit tests for the
+  frame reassembly.
+- The per-connection router reaper no longer crashes with `badarg` when the
+  `webtransport_routers` table is already gone, which happens when an
+  embedder stops its listener while connections are still closing.
+
 ## 0.4.7 - 2026-09-24
 
 - Bump `quic` dep to 2.0.0, constraint `~> 2.0`.

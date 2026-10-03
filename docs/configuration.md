@@ -203,6 +203,15 @@ The library enforces these rules from the
   ([draft-14 section 4.3.2](https://datatracker.ietf.org/doc/html/draft-ietf-webtrans-http2-14#section-4.3.2))
   carries initial flow-control windows. When both SETTINGS and the header are
   present, the greater value is used.
+- **Large sends** -- `send/4` accepts a payload of any size and returns `ok`
+  once it is queued. On HTTP/3 the bytes go straight to QUIC, which does the
+  flow control. On HTTP/2 the bytes that exceed the session or stream window
+  (256 KB per stream by default) wait in order on the stream, FIN is held
+  until they are out, and the queue drains as the peer raises `WT_MAX_DATA`
+  or `WT_MAX_STREAM_DATA`.
+- **Credit on receive** -- on HTTP/2 the library sends `WT_MAX_STREAM_DATA`
+  and `WT_MAX_DATA` on its own once half of a window has been consumed, so a
+  peer that honours our windows is never left waiting.
 
 ## Datagram Limits
 
