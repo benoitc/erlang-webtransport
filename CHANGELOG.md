@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.4.8 - 2026-10-03
 
 - Payloads larger than one HTTP/2 DATA frame are no longer truncated on h2.
   A WT_STREAM capsule carries a whole `send/4` payload and h2 splits it into
