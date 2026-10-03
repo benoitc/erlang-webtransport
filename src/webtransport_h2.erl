@@ -110,6 +110,8 @@ connect(Host, Port, Path, Opts) ->
                         {h2, H2Conn, {stream_reset, StreamId, ErrorCode}} ->
                             h2:close(H2Conn),
                             {error, {stream_reset, ErrorCode}};
+                        {h2, H2Conn, {closed, _Reason}} ->
+                            {error, connection_closed};
                         {h2, H2Conn, closed} ->
                             {error, connection_closed}
                     after

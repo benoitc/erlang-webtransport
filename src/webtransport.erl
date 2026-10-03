@@ -163,6 +163,11 @@
 
 -include("webtransport.hrl").
 
+%% Largest partial capsule the h2 CONNECT-stream reader buffers before
+%% treating the peer as misbehaving (a WT_STREAM capsule is one send/4
+%% payload, so this bounds the biggest single send a peer may make).
+-define(H2_CAPSULE_BUFFER_MAX, 64 * 1024 * 1024).
+
 %% ============================================================================
 %% Integration API
 %% ============================================================================
@@ -444,7 +449,12 @@ reap_router(QuicConnPid, Router) ->
     Ref = erlang:monitor(process, QuicConnPid),
     receive
         {'DOWN', Ref, process, _, _} ->
-            ets:match_delete(webtransport_routers, {QuicConnPid, Router}),
+            %% The table belongs to whichever process first created it; when
+            %% an embedder stops its whole listener that owner may be gone
+            %% already, and there is nothing left to clean up.
+            try ets:match_delete(webtransport_routers, {QuicConnPid, Router})
+            catch error:badarg -> ok
+            end,
             try gen_server:stop(Router, normal, 5000) catch _:_ -> ok end,
             ok
     end.
@@ -1144,27 +1154,43 @@ h2_data_loop(Conn, StreamId, Session) ->
     %% instead of blocking in `receive' forever.
     ConnRef = erlang:monitor(process, Conn),
     SessionRef = erlang:monitor(process, Session),
-    h2_data_loop(Conn, StreamId, Session, ConnRef, SessionRef).
+    h2_data_loop(Conn, StreamId, Session, ConnRef, SessionRef, <<>>).
 
-h2_data_loop(Conn, StreamId, Session, ConnRef, SessionRef) ->
+%% `Buf' holds the tail of the previous DATA frame that did not end on a
+%% capsule boundary. A WT_STREAM capsule carries a whole send/4 payload, and
+%% h2 splits it into DATA frames of at most SETTINGS_MAX_FRAME_SIZE (16 KiB
+%% by default), so most capsules over that size arrive in pieces. Dropping
+%% the tail, as earlier versions did, truncated every such payload.
+h2_data_loop(Conn, StreamId, Session, ConnRef, SessionRef, Buf) ->
     receive
         {h2, Conn, {data, StreamId, Data, _IsFin}} ->
-            %% Decode capsules and dispatch
-            case webtransport_h2:decode_capsules(Data) of
-                {ok, Capsules, _Rest} ->
+            %% Decode every complete capsule, keep the partial tail.
+            case webtransport_h2:decode_capsules(<<Buf/binary, Data/binary>>) of
+                {ok, Capsules, Rest} when byte_size(Rest) =< ?H2_CAPSULE_BUFFER_MAX ->
                     lists:foreach(fun(Capsule) ->
                         dispatch_h2_capsule(Session, Capsule)
-                    end, Capsules);
+                    end, Capsules),
+                    h2_data_loop(Conn, StreamId, Session, ConnRef, SessionRef, Rest);
+                {ok, _Capsules, _Rest} ->
+                    %% A single capsule larger than we are willing to hold
+                    %% in memory. Treat as a protocol violation.
+                    logger:warning("h2 capsule exceeds ~p bytes", [?H2_CAPSULE_BUFFER_MAX]),
+                    cleanup_data_loop(ConnRef, SessionRef),
+                    webtransport_session:close(Session, 0, <<"capsule too large">>);
                 {error, Reason} ->
                     %% Malformed capsule framing on the CONNECT stream is
                     %% a protocol violation. Close the session.
                     logger:warning("h2 capsule decode error: ~p", [Reason]),
+                    cleanup_data_loop(ConnRef, SessionRef),
                     webtransport_session:close(Session, 0, <<"malformed capsule">>)
-            end,
-            h2_data_loop(Conn, StreamId, Session, ConnRef, SessionRef);
+            end;
         {h2, Conn, {stream_reset, StreamId, _ErrorCode}} ->
             cleanup_data_loop(ConnRef, SessionRef),
             webtransport_session:close(Session, 0, <<"stream reset">>);
+        %% h2 0.12 always reports the reason; older ones sent the bare atom.
+        {h2, Conn, {closed, _Reason}} ->
+            cleanup_data_loop(ConnRef, SessionRef),
+            webtransport_session:close(Session, 0, <<"connection closed">>);
         {h2, Conn, closed} ->
             cleanup_data_loop(ConnRef, SessionRef),
             webtransport_session:close(Session, 0, <<"connection closed">>);
@@ -1177,7 +1203,7 @@ h2_data_loop(Conn, StreamId, Session, ConnRef, SessionRef) ->
             erlang:demonitor(ConnRef, [flush]),
             ok;
         _ ->
-            h2_data_loop(Conn, StreamId, Session, ConnRef, SessionRef)
+            h2_data_loop(Conn, StreamId, Session, ConnRef, SessionRef, Buf)
     end.
 
 cleanup_data_loop(ConnRef, SessionRef) ->

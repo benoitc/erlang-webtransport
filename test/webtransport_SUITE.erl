@@ -26,6 +26,7 @@
     open_uni_stream_test/1,
     bidi_echo_test/1,
     bidi_large_data_test/1,
+    bidi_1mb_echo_test/1,
     multi_stream_test/1,
     close_stream_test/1,
 
@@ -91,6 +92,7 @@ groups() ->
         open_uni_stream_test,
         bidi_echo_test,
         bidi_large_data_test,
+        bidi_1mb_echo_test,
         multi_stream_test,
         close_stream_test,
         datagram_echo_test,
@@ -300,6 +302,28 @@ bidi_large_data_test(Config) ->
     %% Wait for processing
     timer:sleep(1000),
 
+    webtransport:close_session(Session).
+
+%% A 1 MiB payload must come back byte for byte on both transports. On h2
+%% the payload is one WT_STREAM capsule split over ~64 DATA frames, which
+%% the CONNECT-stream reader has to reassemble (see h2_data_loop/6).
+bidi_1mb_echo_test(Config) ->
+    Port = proplists:get_value(port, Config),
+    {ok, Session} = webtransport:connect("localhost", Port, <<"/test">>, #{
+        transport => proplists:get_value(transport, Config),
+        verify => verify_none
+    }),
+    {ok, StreamId} = webtransport:open_stream(Session, bidi),
+    Payload = test_helpers:random_data(1024 * 1024),
+    ok = webtransport:send(Session, StreamId, Payload, fin),
+    Echoed = collect_stream_echo(Session, StreamId, <<>>, 10000),
+    %% wt_echo_handler echoes each chunk as it arrives and then the whole
+    %% payload again at FIN, so the echo is <prefix of Payload> ++ Payload.
+    Size = byte_size(Payload),
+    ?assert(byte_size(Echoed) >= Size),
+    PrefixLen = byte_size(Echoed) - Size,
+    ?assertEqual(Payload, binary:part(Echoed, PrefixLen, Size)),
+    ?assertEqual(binary:part(Payload, 0, PrefixLen), binary:part(Echoed, 0, PrefixLen)),
     webtransport:close_session(Session).
 
 multi_stream_test(Config) ->

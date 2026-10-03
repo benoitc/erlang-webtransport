@@ -36,6 +36,7 @@
 %% Buffer management
 -export([flush_send_buffer/1, flush_recv_buffer/1]).
 -export([buffer_send/2]).
+-export([fin_pending/1, set_fin_pending/1, clear_fin_pending/1]).
 
 %% Stream ID helpers
 -export([stream_type/1, initiator/1]).
@@ -56,6 +57,9 @@
     recv_buffer = <<>> :: binary(),
     %% Flags
     local_fin = false :: boolean(),
+    %% FIN requested by the application while bytes were still waiting for
+    %% flow-control credit; sent once the send buffer drains (h2 only).
+    fin_pending = false :: boolean(),
     remote_fin = false :: boolean(),
     reset_code :: undefined | non_neg_integer(),
     %% We sent STOP_SENDING to the peer: our read side is finished.
@@ -159,6 +163,8 @@ send(#stream{state = closed}, _Data) ->
 send(#stream{state = half_closed_local}, _Data) ->
     {error, stream_half_closed};
 send(#stream{local_fin = true}, _Data) ->
+    {error, stream_fin_sent};
+send(#stream{fin_pending = true}, _Data) ->
     {error, stream_fin_sent};
 send(#stream{send_window = Window, bytes_sent = Sent} = Stream, Data) ->
     Available = Window - Sent,
@@ -286,6 +292,17 @@ flush_recv_buffer(#stream{recv_buffer = Buffer} = Stream) ->
     {Buffer, Stream#stream{recv_buffer = <<>>}}.
 
 %% @doc Append data to the send buffer without actually sending.
+-spec fin_pending(stream()) -> boolean().
+fin_pending(#stream{fin_pending = P}) -> P.
+
+%% @doc Remember that the application asked for FIN after bytes that are
+%% still waiting for credit. `send/2' refuses further data once set.
+-spec set_fin_pending(stream()) -> stream().
+set_fin_pending(Stream) -> Stream#stream{fin_pending = true}.
+
+-spec clear_fin_pending(stream()) -> stream().
+clear_fin_pending(Stream) -> Stream#stream{fin_pending = false}.
+
 -spec buffer_send(stream(), binary()) -> stream().
 buffer_send(#stream{send_buffer = Buffer} = Stream, Data) ->
     Stream#stream{send_buffer = <<Buffer/binary, Data/binary>>}.
