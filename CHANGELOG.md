@@ -23,6 +23,10 @@
 - The per-connection router reaper no longer crashes with `badarg` when the
   `webtransport_routers` table is already gone, which happens when an
   embedder stops its listener while connections are still closing.
+- Closing a session whose transport is already gone no longer crashes the
+  session with `noproc`. The stream resets and the CLOSE_SESSION send are
+  skipped when the connection process has exited, so `close_session/1`
+  always completes.
 
 ## 0.4.7 - 2026-09-24
 

@@ -752,21 +752,40 @@ do_drain(#data{transport = h3, transport_state = H3State}) ->
 
 do_close(ErrorCode, Reason, StateData) ->
     %% Reset all live streams with WT_SESSION_GONE, then send CLOSE_SESSION.
+    %% The transport may already be gone (connection lost, peer closed
+    %% first); closing is then a no-op, not a crash of the session.
     reset_all_streams(?WT_SESSION_GONE, StateData),
-    case StateData of
-        #data{transport = h2, transport_state = H2State} ->
-            webtransport_h2:close_session(H2State, ErrorCode, Reason);
-        #data{transport = h3, transport_state = H3State} ->
-            webtransport_h3:close_session(H3State, ErrorCode, Reason)
-    end.
+    transport_call(fun() ->
+        case StateData of
+            #data{transport = h2, transport_state = H2State} ->
+                webtransport_h2:close_session(H2State, ErrorCode, Reason);
+            #data{transport = h3, transport_state = H3State} ->
+                webtransport_h3:close_session(H3State, ErrorCode, Reason)
+        end
+    end).
 
 reset_all_streams(ErrorCode, #data{streams = Streams} = StateData) ->
     maps:foreach(fun(StreamId, Stream) ->
         case webtransport_stream:is_open(Stream) of
-            true -> transport_reset_stream(StreamId, ErrorCode, StateData);
-            false -> ok
+            true ->
+                transport_call(fun() ->
+                    transport_reset_stream(StreamId, ErrorCode, StateData)
+                end);
+            false ->
+                ok
         end
     end, Streams).
+
+%% A call into a transport process that has already exited.
+transport_call(Fun) ->
+    try
+        Fun()
+    catch
+        exit:{noproc, _} -> {error, closed};
+        exit:{normal, _} -> {error, closed};
+        exit:{shutdown, _} -> {error, closed};
+        exit:{{shutdown, _}, _} -> {error, closed}
+    end.
 
 handle_incoming_capsule({max_data, Limit}, #data{remote_max_data = Prev} = StateData) ->
     %% Drafts: MUST close session with WT_FLOW_CONTROL_ERROR on decrease.
