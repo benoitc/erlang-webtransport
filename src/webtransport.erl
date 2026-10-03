@@ -1165,6 +1165,10 @@ h2_data_loop(Conn, StreamId, Session, ConnRef, SessionRef) ->
         {h2, Conn, {stream_reset, StreamId, _ErrorCode}} ->
             cleanup_data_loop(ConnRef, SessionRef),
             webtransport_session:close(Session, 0, <<"stream reset">>);
+        %% h2 0.12 always reports the reason; older ones sent the bare atom.
+        {h2, Conn, {closed, _Reason}} ->
+            cleanup_data_loop(ConnRef, SessionRef),
+            webtransport_session:close(Session, 0, <<"connection closed">>);
         {h2, Conn, closed} ->
             cleanup_data_loop(ConnRef, SessionRef),
             webtransport_session:close(Session, 0, <<"connection closed">>);

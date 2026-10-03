@@ -38,3 +38,15 @@ loop_exits_when_session_dies_test() ->
     exit(Session, kill),
     ?assertEqual(ok, wait_down(LoopRef)),
     Conn ! stop.
+
+%% h2 0.12 reports a close as `{h2, Conn, {closed, Reason}}'. The loop must
+%% exit on it while the connection process is still alive.
+loop_exits_on_closed_with_reason_test() ->
+    Conn = spawn_idle(),
+    Session = spawn_idle(),
+    Loop = spawn(fun() -> webtransport:h2_data_loop(Conn, 1, Session) end),
+    LoopRef = erlang:monitor(process, Loop),
+    Loop ! {h2, Conn, {closed, normal}},
+    ?assertEqual(ok, wait_down(LoopRef)),
+    Conn ! stop,
+    Session ! stop.
