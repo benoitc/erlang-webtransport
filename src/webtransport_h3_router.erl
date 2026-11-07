@@ -22,6 +22,9 @@
 
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
 
+%% Datagrams held for sessions that are not registered yet.
+-define(MAX_PARKED_DATAGRAMS, 64).
+
 -record(state, {
     sessions = #{} :: #{non_neg_integer() => pid()},
     monitors = #{} :: #{reference() => non_neg_integer()},
@@ -33,6 +36,17 @@
     %% Data on these streams is delivered straight to the session, skipping
     %% the session-id varint decode that peer-initiated streams go through.
     local_streams = #{} :: #{non_neg_integer() => pid()},
+    %% Peer streams by the session they belong to, set once their header
+    %% is read.
+    stream_sessions = #{} :: #{non_neg_integer() => non_neg_integer()},
+    %% http3-17 §4.6: events for a session that is not registered yet, held
+    %% newest first and replayed when it registers. Counted against
+    %% max_pending_streams (streams) and ?MAX_PARKED_DATAGRAMS.
+    parked = #{} :: #{non_neg_integer() => [term()]},
+    parked_datagrams = 0 :: non_neg_integer(),
+    %% Sessions that were registered and have ended: their streams are
+    %% reset with WT_SESSION_GONE instead of held.
+    gone = #{} :: #{non_neg_integer() => true},
     %% Client side: CONNECT streams whose session is not registered yet.
     %% Their data is held here, in arrival order, and replayed to the session
     %% when it registers.
@@ -126,8 +140,10 @@ handle_call({register, SessionId, SessionPid}, _From, State) ->
         error -> {[], State#state.expected}
     end,
     [SessionPid ! Msg || Msg <- Held],
-    {reply, ok, State#state{sessions = Sessions, monitors = Monitors,
-                            expected = Expected}};
+    State1 = replay_parked(SessionId, SessionPid,
+                           State#state{sessions = Sessions, monitors = Monitors,
+                                       expected = Expected}),
+    {reply, ok, State1};
 handle_call({session_count, SessionId}, _From, #state{sessions = Sessions} = State) ->
     {reply, map_size(maps:remove(SessionId, Sessions)), State};
 handle_call({expect, SessionId}, _From, #state{expected = Expected} = State) ->
@@ -300,7 +316,8 @@ route_peer_stream_data(StreamId, Data, Fin, #state{pending = Pending} = State) -
             forward_to_session_by_stream(StreamId, Data, Fin, State)
     end.
 
-deliver_open_and_data(SessionId, StreamId, Direction, Rest, Fin, State) ->
+deliver_open_and_data(SessionId, StreamId, Direction, Rest, Fin, State0) ->
+    State = State0#state{stream_sessions = (State0#state.stream_sessions)#{StreamId => SessionId}},
     case maps:find(SessionId, State#state.sessions) of
         {ok, Session} ->
             webtransport_session:handle_stream_opened(Session, StreamId, Direction),
@@ -310,11 +327,64 @@ deliver_open_and_data(SessionId, StreamId, Direction, Rest, Fin, State) ->
             end,
             State;
         error ->
-            %% draft-15 §5: peer-initiated stream references an unknown or
-            %% closed session: reset with WT_SESSION_GONE so the peer sees
-            %% why we dropped it instead of silently stalling.
-            reset_unknown_session_stream(StreamId, State)
+            case maps:is_key(SessionId, State#state.gone) of
+                true ->
+                    %% The session has ended: reset with WT_SESSION_GONE so
+                    %% the peer sees why instead of stalling (http3-17 §6).
+                    reset_unknown_session_stream(StreamId, State);
+                false ->
+                    park_stream(SessionId, StreamId, Direction, Rest, Fin, State)
+            end
     end.
+
+%% http3-17 §4.6: a stream may arrive before its session is established
+%% (the client may open streams before it sees the 2xx, the server before
+%% the client registered the session). Hold it, within the stream cap.
+park_stream(SessionId, StreamId, Direction, Rest, Fin, #state{parked = Parked} = State) ->
+    case parked_streams(Parked) >= State#state.max_pending_streams of
+        true ->
+            _ = cancel_parked(StreamId, State),
+            State#state{stream_sessions = maps:remove(StreamId, State#state.stream_sessions)};
+        false ->
+            park(SessionId, {opened, StreamId, Direction, Rest, Fin}, State)
+    end.
+
+cancel_parked(_StreamId, #state{h3_conn = undefined}) ->
+    ok;
+cancel_parked(StreamId, #state{h3_conn = H3Conn}) ->
+    cancel_stream(H3Conn, StreamId, ?WT_BUFFERED_STREAM_REJECTED).
+
+park(SessionId, Event, #state{parked = Parked} = State) ->
+    State#state{parked = Parked#{SessionId => [Event | maps:get(SessionId, Parked, [])]}}.
+
+parked_streams(Parked) ->
+    maps:fold(fun(_, Events, Acc) ->
+        Acc + length([E || E <- Events, element(1, E) =:= opened])
+    end, 0, Parked).
+
+replay_parked(SessionId, Session, #state{parked = Parked} = State) ->
+    case maps:take(SessionId, Parked) of
+        {Events, Parked1} ->
+            Datagrams = length([E || E <- Events, element(1, E) =:= datagram]),
+            lists:foreach(fun(E) -> replay(Session, E) end, lists:reverse(Events)),
+            State#state{parked = Parked1,
+                        parked_datagrams = State#state.parked_datagrams - Datagrams};
+        error ->
+            State
+    end.
+
+replay(Session, {opened, StreamId, Direction, Data, Fin}) ->
+    webtransport_session:handle_stream_opened(Session, StreamId, Direction),
+    case Data of
+        <<>> when not Fin -> ok;
+        _ -> webtransport_session:handle_stream_data(Session, StreamId, Data, Fin)
+    end;
+replay(Session, {data, StreamId, Data, Fin}) ->
+    webtransport_session:handle_stream_data(Session, StreamId, Data, Fin);
+replay(Session, {closed, StreamId, Reason}) ->
+    webtransport_session:handle_stream_closed(Session, StreamId, Reason);
+replay(Session, {datagram, Payload}) ->
+    webtransport_session:handle_datagram_data(Session, Payload).
 
 reset_unknown_session_stream(_StreamId, #state{h3_conn = undefined} = State) ->
     State;
@@ -337,25 +407,28 @@ cancel_stream(H3Conn, StreamId, ErrorCode) ->
     end.
 
 forward_to_session_by_stream(StreamId, Data, Fin, State) ->
-    %% After header parsing the stream stays bound to its session; we look it
-    %% up by walking sessions. For the (rare) hot path, a stream-id index
-    %% could be added later.
     case find_session_for_stream(StreamId, State) of
         {ok, Session} ->
             webtransport_session:handle_stream_data(Session, StreamId, Data, Fin),
             State;
+        {parked, SessionId} ->
+            park(SessionId, {data, StreamId, Data, Fin}, State);
         error ->
             State
     end.
 
-route_stream_closed(StreamId, Reason, State) ->
-    case find_session_for_stream(StreamId, State) of
+route_stream_closed(StreamId, Reason, State0) ->
+    State = case find_session_for_stream(StreamId, State0) of
         {ok, Session} ->
-            webtransport_session:handle_stream_closed(Session, StreamId, Reason);
+            webtransport_session:handle_stream_closed(Session, StreamId, Reason),
+            State0;
+        {parked, SessionId} ->
+            park(SessionId, {closed, StreamId, Reason}, State0);
         error ->
-            ok
+            State0
     end,
     State#state{
+        stream_sessions = maps:remove(StreamId, State#state.stream_sessions),
         pending = maps:remove(StreamId, State#state.pending),
         local_streams = maps:remove(StreamId, State#state.local_streams)
     }.
@@ -366,16 +439,37 @@ route_datagram(QuarterOrStreamId, Payload, State) ->
     %% WebTransport's CONNECT stream.
     case maps:find(QuarterOrStreamId, State#state.sessions) of
         {ok, Session} ->
-            webtransport_session:handle_datagram_data(Session, Payload);
+            webtransport_session:handle_datagram_data(Session, Payload),
+            State;
         error ->
-            ok
-    end,
-    State.
+            %% http3-17 §4.6: hold a few datagrams for a session that is not
+            %% registered yet; drop the rest.
+            case maps:is_key(QuarterOrStreamId, State#state.gone) orelse
+                 State#state.parked_datagrams >= ?MAX_PARKED_DATAGRAMS of
+                true ->
+                    State;
+                false ->
+                    State1 = park(QuarterOrStreamId, {datagram, Payload}, State),
+                    State1#state{parked_datagrams = State1#state.parked_datagrams + 1}
+            end
+    end.
 
+%% `{ok, Pid}' for a stream of a registered session, `{parked, SessionId}'
+%% for one held until its session registers.
 find_session_for_stream(StreamId, #state{local_streams = Local} = State) ->
     case maps:find(StreamId, Local) of
-        {ok, _} = Found -> Found;
-        error -> find_session_for_peer_stream(StreamId, State)
+        {ok, _} = Found ->
+            Found;
+        error ->
+            case maps:find(StreamId, State#state.stream_sessions) of
+                {ok, SessionId} ->
+                    case maps:find(SessionId, State#state.sessions) of
+                        {ok, _} = Found -> Found;
+                        error -> {parked, SessionId}
+                    end;
+                error ->
+                    find_session_for_peer_stream(StreamId, State)
+            end
     end.
 
 find_session_for_peer_stream(_StreamId, #state{sessions = Sessions}) when map_size(Sessions) =:= 0 ->
@@ -403,7 +497,11 @@ find_session_for_peer_stream(StreamId, #state{sessions = Sessions}) ->
 drop_session(SessionId, #state{sessions = Sessions, monitors = Monitors} = State) ->
     Sessions1 = maps:remove(SessionId, Sessions),
     Monitors1 = maps:filter(fun(_Ref, Sid) -> Sid =/= SessionId end, Monitors),
-    State#state{sessions = Sessions1, monitors = Monitors1}.
+    StreamSessions = maps:filter(fun(_S, Sid) -> Sid =/= SessionId end,
+                                 State#state.stream_sessions),
+    State#state{sessions = Sessions1, monitors = Monitors1,
+                stream_sessions = StreamSessions,
+                gone = (State#state.gone)#{SessionId => true}}.
 
 %% draft-15 §3.3: QUIC error codes inside the reserved WebTransport range
 %% map back to app-level codes. Anything outside stays opaque for the
