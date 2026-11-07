@@ -17,6 +17,8 @@
 %% A limit that is never reached: flow control off, or per-stream windows
 %% on h3, where QUIC does them.
 -define(UNLIMITED, 1 bsl 62).
+%% Largest capsule we buffer on the h3 CONNECT stream.
+-define(CONNECT_BUFFER_MAX, 64 * 1024 * 1024).
 %% Largest Maximum Streams value (http3-17 §5.6.2, http2-16 §6.7).
 -define(MAX_STREAMS, 1 bsl 60).
 
@@ -74,6 +76,8 @@
     opened_uni = 0 :: non_neg_integer(),
     peer_opened_bidi = 0 :: non_neg_integer(),
     peer_opened_uni = 0 :: non_neg_integer(),
+    %% h3: CONNECT stream bytes that do not end on a capsule boundary yet.
+    connect_buf = <<>> :: binary(),
     %% Peer streams whose stream credit was already returned.
     credited = #{} :: #{non_neg_integer() => true},
     %% Stream types we failed to open for lack of credit; the handler is told
@@ -396,41 +400,19 @@ open(cast, {close, ErrorCode, Reason}, StateData) ->
     do_close(ErrorCode, Reason, StateData),
     {stop, normal, StateData#data{close_info = {ErrorCode, Reason}}};
 
-%% On h3 the CONNECT stream is registered with quic_h3:set_stream_handler,
-%% so session-management capsules (CLOSE_SESSION, DRAIN_SESSION) arrive as
-%% raw bytes in `{quic_h3, _, {data, StreamId, Data, Fin}}'. Decode and
-%% dispatch them through the same handle_incoming_capsule path as h2.
+%% h3 CONNECT stream: capsules (http3-17 §6, RFC 9297) and its end. The
+%% server receives it as the stream handler; the client through the router.
 open(info, {quic_h3, _Conn, {data, StreamId, Data, Fin}},
      #data{transport = h3, transport_state = H3State} = StateData) ->
-    %% draft-15 §5: session-management capsules ride the CONNECT stream.
-    %% Decode and dispatch like the h2 capsule path; non-CONNECT streams
-    %% are handled by the h3 router and never reach us here.
     case webtransport_h3:session_id(H3State) of
-        StreamId ->
-            case wt_h3_capsule:decode_all(Data) of
-                {ok, Capsules, _} ->
-                    Result = apply_capsule_list(Capsules, StateData),
-                    %% draft-14 §3.4: "A WebTransport session is terminated
-                    %% when either endpoint closes the stream". If the peer
-                    %% FINs the CONNECT stream without sending CLOSE_SESSION,
-                    %% treat as session close.
-                    case {Fin, Result} of
-                        {true, {keep_state, SD}} ->
-                            reset_all_streams(SD),
-                            {stop, normal, SD#data{close_info = {0, <<"peer closed CONNECT">>}}};
-                        _ ->
-                            Result
-                    end;
-                {error, Reason} ->
-                    %% Malformed capsule framing is a protocol error.
-                    logger:warning("h3 CONNECT capsule decode error: ~p", [Reason]),
-                    do_close(?WT_REQUIREMENTS_NOT_MET, <<"malformed capsule">>, StateData),
-                    {stop, {shutdown, {session_error, ?WT_REQUIREMENTS_NOT_MET}},
-                     StateData#data{close_info = {?WT_REQUIREMENTS_NOT_MET,
-                                                  <<"malformed capsule">>}}}
-            end;
-        _ ->
-            {keep_state, StateData}
+        StreamId -> handle_connect_data(Data, Fin, StateData);
+        _ -> {keep_state, StateData}
+    end;
+open(info, {quic_h3, _Conn, {stream_reset, StreamId, _Code}},
+     #data{transport = h3, transport_state = H3State} = StateData) ->
+    case webtransport_h3:session_id(H3State) of
+        StreamId -> connect_stream_gone(<<"CONNECT stream reset">>, StateData);
+        _ -> {keep_state, StateData}
     end;
 
 open(info, Msg, #data{handler = Handler, handler_state = HState} = StateData) ->
@@ -449,6 +431,55 @@ open(info, Msg, #data{handler = Handler, handler_state = HState} = StateData) ->
             {keep_state, StateData}
     end.
 
+%% Bytes on the h3 CONNECT stream. Capsules may span DATA frames, so the
+%% tail that does not end on a capsule boundary waits for the next chunk.
+%% A malformed capsule, a bad WT_CLOSE_SESSION reason, or anything after
+%% WT_CLOSE_SESSION resets the stream with H3_MESSAGE_ERROR (http3-17 §6).
+%% The stream ending without WT_CLOSE_SESSION ends the session too.
+handle_connect_data(Data, Fin, #data{connect_buf = Buf} = StateData) ->
+    case wt_h3_capsule:decode_all(<<Buf/binary, Data/binary>>) of
+        {ok, _Capsules, Rest} when byte_size(Rest) > ?CONNECT_BUFFER_MAX ->
+            connect_message_error(<<"capsule too large">>, StateData);
+        {ok, Capsules, Rest} ->
+            case lists:splitwith(fun(C) -> element(1, C) =/= close_session end, Capsules) of
+                {_, [_Close, _ | _]} ->
+                    connect_message_error(<<"data after WT_CLOSE_SESSION">>, StateData);
+                {_, [_Close]} when Rest =/= <<>> ->
+                    connect_message_error(<<"data after WT_CLOSE_SESSION">>, StateData);
+                _ when Fin, Rest =/= <<>> ->
+                    connect_message_error(<<"CONNECT stream ended inside a capsule">>, StateData);
+                _ ->
+                    Result = apply_capsule_list(Capsules, StateData#data{connect_buf = Rest}),
+                    case {Fin, Result} of
+                        {true, {keep_state, SD}} ->
+                            connect_stream_gone(<<"peer closed CONNECT">>, SD);
+                        {true, {next_state, draining, SD}} ->
+                            connect_stream_gone(<<"peer closed CONNECT">>, SD);
+                        _ ->
+                            Result
+                    end
+            end;
+        {error, Reason} ->
+            logger:warning("h3 CONNECT capsule decode error: ~p", [Reason]),
+            connect_message_error(<<"malformed capsule">>, StateData)
+    end.
+
+connect_message_error(Reason, #data{transport_state = H3State} = StateData) ->
+    reset_all_streams(StateData),
+    _ = transport_call(fun() ->
+            webtransport_h3:reset_stream(H3State, webtransport_h3:session_id(H3State),
+                                         {wt, ?H3_MESSAGE_ERROR}, 0)
+        end),
+    {stop, {shutdown, {session_error, ?H3_MESSAGE_ERROR}},
+     StateData#data{close_info = {?H3_MESSAGE_ERROR, Reason}}}.
+
+%% The session's stream ended without WT_CLOSE_SESSION: the session is over
+%% (http3-17 §6, http2-16 §3.4).
+connect_stream_gone(Reason, StateData) ->
+    reset_all_streams(StateData),
+    finish_connect(StateData),
+    {stop, normal, StateData#data{close_info = {0, Reason}}}.
+
 apply_capsule_list([], StateData) ->
     {keep_state, StateData};
 apply_capsule_list([{datagram, Data} | Rest], StateData) ->
@@ -464,6 +495,15 @@ apply_capsule_list([Capsule | Rest], StateData) ->
     end.
 
 %% Apply one capsule from the peer and return the gen_statem result.
+%% h2: the CONNECT stream ended (FIN) or was reset by the peer.
+apply_capsule(connect_fin, StateData) ->
+    connect_stream_gone(<<"peer closed CONNECT">>, StateData);
+apply_capsule({malformed, Reason}, StateData) ->
+    %% RFC 9297 §3.3: a malformed capsule stream is a session error.
+    stop_with_session_error(?WT_ERROR_GENERIC, Reason, StateData);
+apply_capsule(connect_reset, StateData) ->
+    reset_all_streams(StateData),
+    {stop, normal, StateData#data{close_info = {0, <<"CONNECT stream reset">>}}};
 apply_capsule({reset_stream, StreamId, Code, ReliableSize}, StateData) ->
     transition_result(handle_peer_reset(StreamId, Code, ReliableSize, StateData));
 apply_capsule({stop_sending, StreamId, Code}, StateData) ->
@@ -633,8 +673,10 @@ open_apply_transition({stop, Reason}, StateData) ->
 %% draft-14 §4.6 / draft-15 §5: CLOSE_SESSION is terminal.
 %% draft-14 §4.7 / draft-15 §5.1: DRAIN_SESSION moves us to draining.
 apply_capsule_transition({close_session, _Code, _Reason}, StateData) ->
-    %% Reset all live streams with WT_SESSION_GONE before stopping.
+    %% Reset all live streams with WT_SESSION_GONE, close our side of the
+    %% CONNECT stream (http2-16 §6.12 requires END_STREAM), then stop.
     reset_all_streams(StateData),
+    finish_connect(StateData),
     {stop, normal, StateData};
 apply_capsule_transition({drain_session}, StateData) ->
     {next_state, draining, StateData};
@@ -682,8 +724,27 @@ draining(cast, {stream_closed, StreamId, Reason}, StateData) ->
     {StateData1, Transition} = handle_remote_stream_closed(StreamId, Reason, StateData),
     draining_apply_transition(Transition, StateData1);
 
+draining(cast, {capsule, Capsule}, StateData) ->
+    after_draining(apply_capsule(Capsule, StateData));
+draining(cast, {close, ErrorCode, Reason}, StateData) ->
+    do_close(ErrorCode, Reason, StateData),
+    {stop, normal, StateData#data{close_info = {ErrorCode, Reason}}};
+draining(cast, {stream_opened, StreamId, Type}, StateData) ->
+    {StateData1, Transition} = handle_remote_stream_opened(StreamId, Type, StateData),
+    draining_apply_transition(Transition, StateData1);
 draining(cast, _, StateData) ->
-    maybe_stop_if_drained(StateData, []).
+    maybe_stop_if_drained(StateData, []);
+draining(info, Msg, StateData) ->
+    %% Same handling as `open' (CONNECT stream, handler messages); a result
+    %% that asks to go back to open stays draining.
+    after_draining(open(info, Msg, StateData)).
+
+after_draining({keep_state, StateData}) ->
+    maybe_stop_if_drained(StateData, []);
+after_draining({next_state, _, StateData}) ->
+    maybe_stop_if_drained(StateData, []);
+after_draining(Other) ->
+    Other.
 
 %% In the draining state we never go backwards: drain stays drain,
 %% a `stop' transition takes immediate effect, and a `continue' just
@@ -696,27 +757,54 @@ draining_apply_transition(_Transition, StateData) ->
 terminate(Reason, _State, #data{handler = Handler, handler_state = HState,
                                 close_info = CloseInfo,
                                 transport = Transport,
-                                transport_state = TransportState}) ->
+                                transport_state = TransportState,
+                                is_server = IsServer}) ->
     %% Close the underlying connection gracefully so quic_h3_connection
     %% enters its `closing' state and exits with `normal' instead of
     %% `quic_closed'. Without this, the QUIC connection drop races with
     %% our process exit and produces noisy crash reports.
-    close_transport(Transport, TransportState),
+    close_transport(Transport, TransportState, IsServer),
     %% Surface close_info to the handler so it can distinguish a clean
     %% local/remote close (with error code + reason) from an abnormal exit.
     Handler:terminate(augment_reason(Reason, CloseInfo), HState),
     ok.
 
-close_transport(h3, H3State) ->
-    %% Tell the h3_connection to enter its `closing' state (which exits
-    %% with `normal'). Without this the QUIC connection drop can race
-    %% our exit. On the server side the peer may have already closed
-    %% the QUIC connection before this cast arrives; the upstream fix
-    %% (quic_h3_connection using `{shutdown, quic_closed}' instead of
-    %% bare `quic_closed') eliminates the remaining noise.
-    try quic_h3:close(webtransport_h3:h3_conn(H3State)) catch _:_ -> ok end;
-close_transport(h2, _H2State) ->
+%% Close our side of the CONNECT stream once the peer ended the session.
+%% On h3 our WT_CLOSE_SESSION is not sent in that case and the stream is
+%% finished with an empty FIN; on h2 END_STREAM is required (http2-16
+%% §6.12).
+finish_connect(#data{transport = h2, transport_state = H2State}) ->
+    try webtransport_h2:finish(H2State) catch _:_ -> ok end;
+finish_connect(#data{transport = h3, transport_state = H3State}) ->
+    try quic_h3:send_data(webtransport_h3:h3_conn(H3State),
+                          webtransport_h3:session_id(H3State), <<>>, true)
+    catch _:_ -> ok
+    end.
+
+close_transport(h3, H3State, _IsServer) ->
+    %% Close the connection once its last session is gone, so the
+    %% h3_connection exits `normal' instead of racing our exit. Other
+    %% sessions on the same connection keep it (http3-17 §6).
+    case other_sessions(H3State) of
+        0 -> try quic_h3:close(webtransport_h3:h3_conn(H3State)) catch _:_ -> ok end;
+        _ -> ok
+    end;
+%% A client owns its h2 connection, one per session: close it. A server's
+%% h2 connection carries other requests and is left to the client.
+close_transport(h2, H2State, false) ->
+    try h2:close(webtransport_h2:h2_conn(H2State)) catch _:_ -> ok end;
+close_transport(h2, _H2State, true) ->
     ok.
+
+other_sessions(H3State) ->
+    case webtransport_h3:router(H3State) of
+        undefined ->
+            0;
+        Router ->
+            try webtransport_h3_router:session_count(Router, webtransport_h3:session_id(H3State))
+            catch _:_ -> 0
+            end
+    end.
 
 augment_reason(Reason, undefined) -> Reason;
 augment_reason(normal, {Code, Msg}) -> {closed, Code, Msg};
@@ -995,15 +1083,27 @@ do_close(ErrorCode, Reason, StateData) ->
         end
     end).
 
-%% http3-17 §6: on termination every stream of the session is reset with
-%% WT_SESSION_GONE, a protocol code sent as is.
+%% http3-17 §6: on termination every stream of the session has its send side
+%% reset and its receive side aborted with WT_SESSION_GONE, a protocol code
+%% sent as is. On h2 the streams end with the CONNECT stream.
 reset_all_streams(#data{streams = Streams} = StateData) ->
     maps:foreach(fun(StreamId, Stream) ->
-        case webtransport_stream:is_open(Stream) of
+        case webtransport_stream:is_writable(Stream) andalso
+             has_local_send_side(StreamId, StateData) of
             true ->
                 transport_call(fun() ->
                     transport_reset_stream(StreamId, {wt, ?WT_SESSION_GONE},
                                            Stream, StateData)
+                end);
+            false ->
+                ok
+        end,
+        case StateData#data.transport =:= h3 andalso
+             webtransport_stream:is_readable(Stream) andalso
+             has_peer_send_side(StreamId, StateData) of
+            true ->
+                transport_call(fun() ->
+                    transport_stop_sending(StreamId, {wt, ?WT_SESSION_GONE}, StateData)
                 end);
             false ->
                 ok
@@ -1671,6 +1771,18 @@ stream_state_capsule_test_() ->
         ?_assertMatch({session_error, ?WT_STREAM_STATE_ERROR, _},
                       handle_incoming_capsule({stream_data_blocked, 12, 100}, Data))
     ].
+
+%% RFC 9297: a capsule split across two DATA frames is applied once whole.
+connect_capsule_split_test() ->
+    Data = (test_data())#data{transport = h3},
+    Wire = wt_h3_capsule:encode({max_data, 4096}),
+    <<A:3/binary, B/binary>> = Wire,
+    {keep_state, D1} = handle_connect_data(A, false, Data),
+    ?assertEqual(A, D1#data.connect_buf),
+    ?assertEqual(0, D1#data.remote_max_data),
+    {keep_state, D2} = handle_connect_data(B, false, D1),
+    ?assertEqual(<<>>, D2#data.connect_buf),
+    ?assertEqual(4096, D2#data.remote_max_data).
 
 %% Which side of a stream sends: both on bidi, the opener on uni.
 send_sides_test_() ->

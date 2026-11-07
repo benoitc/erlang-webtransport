@@ -14,6 +14,7 @@
 
 -export([start_link/0, start_link/1, start/1]).
 -export([register_session/3, unregister_session/2, expect_session/2]).
+-export([session_count/2]).
 -export([client_connect/4]).
 -export([set_passthrough/2]).
 -export([open_bidi_stream/2]).
@@ -79,6 +80,12 @@ register_session(Router, SessionId, SessionPid) ->
 expect_session(Router, SessionId) ->
     gen_server:call(Router, {expect, SessionId}).
 
+%% @doc Number of sessions registered on this connection other than
+%% `SessionId'.
+-spec session_count(pid(), non_neg_integer()) -> non_neg_integer().
+session_count(Router, SessionId) ->
+    gen_server:call(Router, {session_count, SessionId}, 5000).
+
 -spec unregister_session(pid(), non_neg_integer()) -> ok.
 unregister_session(Router, SessionId) ->
     gen_server:call(Router, {unregister, SessionId}).
@@ -121,6 +128,8 @@ handle_call({register, SessionId, SessionPid}, _From, State) ->
     [SessionPid ! Msg || Msg <- Held],
     {reply, ok, State#state{sessions = Sessions, monitors = Monitors,
                             expected = Expected}};
+handle_call({session_count, SessionId}, _From, #state{sessions = Sessions} = State) ->
+    {reply, map_size(maps:remove(SessionId, Sessions)), State};
 handle_call({expect, SessionId}, _From, #state{expected = Expected} = State) ->
     {reply, ok, State#state{expected = Expected#{SessionId => []}}};
 handle_call({unregister, SessionId}, _From, State) ->
@@ -185,6 +194,12 @@ handle_quic_h3({quic_h3, _Conn, {stream_type_stop_sending, _Direction, StreamId,
 handle_quic_h3({quic_h3, Conn, {datagram, StreamId, Payload}}, State0) ->
     State = ensure_h3_monitor(Conn, State0),
     {noreply, route_datagram(StreamId, Payload, State)};
+%% A reset of a session's CONNECT stream ends that session.
+handle_quic_h3({quic_h3, _Conn, {stream_reset, StreamId, _Code}} = Msg,
+               #state{sessions = Sessions} = State)
+  when is_map_key(StreamId, Sessions) ->
+    maps:get(StreamId, Sessions) ! Msg,
+    {noreply, State};
 %% Client side: data on a CONNECT stream belongs to its session.
 handle_quic_h3({quic_h3, _Conn, {data, StreamId, _Data, _Fin}} = Msg,
                #state{sessions = Sessions, expected = Expected} = State)
@@ -269,6 +284,11 @@ route_peer_stream_data(StreamId, Data, Fin, #state{pending = Pending} = State) -
         {ok, {Direction, Buffered}} ->
             Combined = <<Buffered/binary, Data/binary>>,
             case h2_varint:decode(Combined) of
+                {ok, SessionId, _Rest} when SessionId band 3 =/= 0 ->
+                    %% http3-17 §4: a session id must be a client-initiated
+                    %% bidirectional stream id.
+                    close_connection(?H3_ID_ERROR, State),
+                    State#state{pending = maps:remove(StreamId, Pending)};
                 {ok, SessionId, Rest} ->
                     State1 = State#state{pending = maps:remove(StreamId, Pending)},
                     deliver_open_and_data(SessionId, StreamId, Direction, Rest, Fin, State1);
@@ -301,6 +321,11 @@ reset_unknown_session_stream(_StreamId, #state{h3_conn = undefined} = State) ->
 reset_unknown_session_stream(StreamId, #state{h3_conn = H3Conn} = State) ->
     _ = cancel_stream(H3Conn, StreamId, ?WT_SESSION_GONE),
     State.
+
+close_connection(_Code, #state{h3_conn = undefined}) ->
+    ok;
+close_connection(Code, #state{h3_conn = H3Conn}) ->
+    try quic_h3:close(H3Conn, Code) catch _:_ -> ok end.
 
 cancel_stream(H3Conn, StreamId, ErrorCode) ->
     case is_process_alive(H3Conn) of

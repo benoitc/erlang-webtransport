@@ -1167,61 +1167,105 @@ allowed_by_listener(_, _) -> false.
 %% ============================================================================
 
 h2_data_loop(Conn, StreamId, Session) ->
+    h2_data_loop(Conn, StreamId, Session, []).
+
+%% `Prefix' are events for the CONNECT stream that reached another process
+%% before this loop became the stream's handler; they are handled first, so
+%% the order is kept.
+h2_data_loop(Conn, StreamId, Session, Prefix) ->
     %% Monitor both ends so the loop can never orphan: if the h2 connection
     %% dies without a `closed' message, or the session goes away, we exit
     %% instead of blocking in `receive' forever.
     ConnRef = erlang:monitor(process, Conn),
     SessionRef = erlang:monitor(process, Session),
-    h2_data_loop(Conn, StreamId, Session, ConnRef, SessionRef, <<>>).
+    Loop = {Conn, StreamId, Session, ConnRef, SessionRef},
+    case h2_data_events(Prefix, Loop, <<>>) of
+        {continue, Buf} -> h2_data_loop_receive(Loop, Buf);
+        stop -> ok
+    end.
+
+h2_data_events([], _Loop, Buf) ->
+    {continue, Buf};
+h2_data_events([Msg | Rest], Loop, Buf) ->
+    case h2_data_event(Msg, Loop, Buf) of
+        {continue, Buf1} -> h2_data_events(Rest, Loop, Buf1);
+        stop -> stop
+    end.
+
+h2_data_loop_receive(Loop, Buf) ->
+    receive
+        Msg ->
+            case h2_data_event(Msg, Loop, Buf) of
+                {continue, Buf1} -> h2_data_loop_receive(Loop, Buf1);
+                stop -> ok
+            end
+    end.
 
 %% `Buf' holds the tail of the previous DATA frame that did not end on a
 %% capsule boundary. A WT_STREAM capsule carries a whole send/4 payload, and
 %% h2 splits it into DATA frames of at most SETTINGS_MAX_FRAME_SIZE (16 KiB
-%% by default), so most capsules over that size arrive in pieces. Dropping
-%% the tail, as earlier versions did, truncated every such payload.
-h2_data_loop(Conn, StreamId, Session, ConnRef, SessionRef, Buf) ->
-    receive
-        {h2, Conn, {data, StreamId, Data, _IsFin}} ->
-            %% Decode every complete capsule, keep the partial tail.
-            case webtransport_h2:decode_capsules(<<Buf/binary, Data/binary>>) of
-                {ok, Capsules, Rest} when byte_size(Rest) =< ?H2_CAPSULE_BUFFER_MAX ->
-                    lists:foreach(fun(Capsule) ->
-                        dispatch_h2_capsule(Session, Capsule)
-                    end, Capsules),
-                    h2_data_loop(Conn, StreamId, Session, ConnRef, SessionRef, Rest);
-                {ok, _Capsules, _Rest} ->
-                    %% A single capsule larger than we are willing to hold
-                    %% in memory. Treat as a protocol violation.
-                    logger:warning("h2 capsule exceeds ~p bytes", [?H2_CAPSULE_BUFFER_MAX]),
+%% by default), so most capsules over that size arrive in pieces.
+h2_data_event({h2, Conn, {data, StreamId, Data, IsFin}},
+              {Conn, StreamId, Session, ConnRef, SessionRef}, Buf) ->
+    case webtransport_h2:decode_capsules(<<Buf/binary, Data/binary>>) of
+        {ok, Capsules, Rest} when byte_size(Rest) =< ?H2_CAPSULE_BUFFER_MAX ->
+            lists:foreach(fun(Capsule) -> dispatch_h2_capsule(Session, Capsule) end,
+                          Capsules),
+            case IsFin of
+                true ->
+                    %% http2-16 §3.4: the peer closing the stream ends the
+                    %% session.
                     cleanup_data_loop(ConnRef, SessionRef),
-                    webtransport_session:close(Session, 0, <<"capsule too large">>);
-                {error, Reason} ->
-                    %% Malformed capsule framing on the CONNECT stream is
-                    %% a protocol violation. Close the session.
-                    logger:warning("h2 capsule decode error: ~p", [Reason]),
-                    cleanup_data_loop(ConnRef, SessionRef),
-                    webtransport_session:close(Session, 0, <<"malformed capsule">>)
+                    webtransport_session:handle_capsule(Session, connect_fin),
+                    stop;
+                false ->
+                    {continue, Rest}
             end;
-        {h2, Conn, {stream_reset, StreamId, _ErrorCode}} ->
+        {ok, _Capsules, _Rest} ->
+            %% A single capsule larger than we are willing to hold.
+            logger:warning("h2 capsule exceeds ~p bytes", [?H2_CAPSULE_BUFFER_MAX]),
             cleanup_data_loop(ConnRef, SessionRef),
-            webtransport_session:close(Session, 0, <<"stream reset">>);
-        %% h2 0.12 always reports the reason; older ones sent the bare atom.
-        {h2, Conn, {closed, _Reason}} ->
+            webtransport_session:handle_capsule(Session, {malformed, <<"capsule too large">>}),
+            stop;
+        {error, Reason} ->
+            logger:warning("h2 capsule decode error: ~p", [Reason]),
             cleanup_data_loop(ConnRef, SessionRef),
-            webtransport_session:close(Session, 0, <<"connection closed">>);
-        {h2, Conn, closed} ->
-            cleanup_data_loop(ConnRef, SessionRef),
-            webtransport_session:close(Session, 0, <<"connection closed">>);
-        {'DOWN', ConnRef, process, Conn, _Reason} ->
-            erlang:demonitor(SessionRef, [flush]),
-            webtransport_session:close(Session, 0, <<"connection closed">>);
-        {'DOWN', SessionRef, process, Session, _Reason} ->
-            %% Session is gone; nothing left to forward to. Exit so we don't
-            %% leak this process for the life of the h2 connection.
-            erlang:demonitor(ConnRef, [flush]),
-            ok;
-        _ ->
-            h2_data_loop(Conn, StreamId, Session, ConnRef, SessionRef, Buf)
+            webtransport_session:handle_capsule(Session, {malformed, <<"malformed capsule">>}),
+            stop
+    end;
+h2_data_event({h2, Conn, {stream_reset, StreamId, _ErrorCode}},
+              {Conn, StreamId, Session, ConnRef, SessionRef}, _Buf) ->
+    cleanup_data_loop(ConnRef, SessionRef),
+    webtransport_session:handle_capsule(Session, connect_reset),
+    stop;
+%% h2 0.12 always reports the reason; older ones sent the bare atom.
+h2_data_event({h2, Conn, Closed}, {Conn, _, Session, ConnRef, SessionRef}, _Buf)
+  when Closed =:= closed; element(1, Closed) =:= closed ->
+    cleanup_data_loop(ConnRef, SessionRef),
+    webtransport_session:close(Session, 0, <<"connection closed">>),
+    stop;
+h2_data_event({'DOWN', ConnRef, process, _, _}, {_, _, Session, ConnRef, SessionRef}, _Buf) ->
+    erlang:demonitor(SessionRef, [flush]),
+    webtransport_session:close(Session, 0, <<"connection closed">>),
+    stop;
+h2_data_event({'DOWN', SessionRef, process, _, _}, {_, _, _, ConnRef, SessionRef}, _Buf) ->
+    %% Session is gone; nothing left to forward to. Exit so we don't leak
+    %% this process for the life of the h2 connection.
+    erlang:demonitor(ConnRef, [flush]),
+    stop;
+h2_data_event(_Msg, _Loop, Buf) ->
+    {continue, Buf}.
+
+%% Client side: events for the CONNECT stream that reached the connecting
+%% process between the 2xx and the data loop taking over the stream.
+take_h2_stream_events(Conn, StreamId, Acc) ->
+    receive
+        {h2, Conn, {Tag, StreamId, _, _}} = Msg when Tag =:= data ->
+            take_h2_stream_events(Conn, StreamId, [Msg | Acc]);
+        {h2, Conn, {stream_reset, StreamId, _}} = Msg ->
+            take_h2_stream_events(Conn, StreamId, [Msg | Acc])
+    after 0 ->
+        lists:reverse(Acc)
     end.
 
 cleanup_data_loop(ConnRef, SessionRef) ->
@@ -1290,8 +1334,15 @@ h2_start_session(TransportState, Path, Authority, RespHeaders, Protocol, Opts, H
         {ok, Session} ->
             H2Conn = webtransport_h2:h2_conn(TransportState),
             StreamId = webtransport_h2:connect_stream_id(TransportState),
-            LoopPid = spawn(fun() -> h2_data_loop(H2Conn, StreamId, Session) end),
+            %% Data the server sent right after the 2xx went to us. The loop
+            %% waits for it before reading its own mailbox.
+            LoopPid = spawn(fun() ->
+                receive
+                    {prefix, Prefix} -> h2_data_loop(H2Conn, StreamId, Session, Prefix)
+                end
+            end),
             _ = h2:set_stream_handler(H2Conn, StreamId, LoopPid),
+            LoopPid ! {prefix, take_h2_stream_events(H2Conn, StreamId, [])},
             {ok, Session};
         {error, _} = Err ->
             Err

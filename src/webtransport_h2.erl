@@ -24,7 +24,7 @@
 -export([open_stream/3]).
 -export([send/4, send_datagram/2]).
 -export([close_session/3, drain_session/1]).
--export([send_capsule/2, session_error/4]).
+-export([send_capsule/2, session_error/4, finish/1]).
 -export([reset_stream/3, reset_stream/4, stop_sending/3]).
 -export([decode_capsule/1, decode_capsules/1]).
 
@@ -310,6 +310,11 @@ close_session(#state{h2_conn = H2Conn, connect_stream_id = ConnectStreamId}, Err
         Capsule ->
             h2:send_data(H2Conn, ConnectStreamId, wt_h2_capsule:encode(Capsule), true)
     end.
+
+%% @doc Close our side of the CONNECT stream with END_STREAM.
+-spec finish(state()) -> ok | {error, term()}.
+finish(#state{h2_conn = H2Conn, connect_stream_id = ConnectStreamId}) ->
+    h2:send_data(H2Conn, ConnectStreamId, <<>>, true).
 
 %% @doc End the session after a protocol violation (http2-16 §3.4):
 %% WT_CLOSE_SESSION with `Code' and `Reason', then RST_STREAM on the CONNECT

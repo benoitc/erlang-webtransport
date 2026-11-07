@@ -60,6 +60,8 @@
     origin_check_reject_test/1,
     protocol_negotiation_test/1,
     flow_control_credit_test/1,
+    server_close_reaches_client_test/1,
+    server_drain_reaches_client_test/1,
     stream_credit_replenish_test/1,
     server_without_wt_enabled_test/1,
     invalid_webtransport_init_test/1,
@@ -94,6 +96,8 @@ groups() ->
         protocol_negotiation_test,
         server_without_wt_enabled_test,
         flow_control_credit_test,
+        server_close_reaches_client_test,
+        server_drain_reaches_client_test,
         stream_credit_replenish_test,
         connect_disconnect_test,
         session_info_test,
@@ -913,6 +917,65 @@ flow_control_credit_test(Config) ->
     ?assert(byte_size(Echoed) >= Size),
     ?assertEqual(Payload, binary:part(Echoed, byte_size(Echoed) - Size, Size)),
     webtransport:close_session(Session).
+
+%% A WT_CLOSE_SESSION from the server reaches the client session with its
+%% code and reason (http3-17 §6, http2-16 §6.12).
+server_close_reaches_client_test(Config) ->
+    with_observer_listener(close, Config, fun(Port, Transport) ->
+        {ok, Session} = webtransport:connect("localhost", Port, <<"/test">>, #{
+            transport => Transport,
+            verify => verify_none,
+            handler_opts => #{owner => self()}
+        }, wt_close_observer_handler),
+        {ok, S} = webtransport:open_stream(Session, bidi),
+        ok = webtransport:send(Session, S, <<"close">>, fin),
+        receive
+            {terminated, Session, Reason} ->
+                ?assertEqual({closed, 5, <<"bye">>}, Reason)
+        after 5000 ->
+            error(client_session_not_closed)
+        end
+    end).
+
+%% A WT_DRAIN_SESSION from the server puts the client session in draining:
+%% new streams are refused, existing ones keep working (http3-17 §4.7).
+server_drain_reaches_client_test(Config) ->
+    with_observer_listener(drain, Config, fun(Port, Transport) ->
+        {ok, Session} = webtransport:connect("localhost", Port, <<"/test">>, #{
+            transport => Transport,
+            verify => verify_none,
+            handler_opts => #{owner => self()}
+        }, wt_close_observer_handler),
+        {ok, Keep} = webtransport:open_stream(Session, bidi),
+        {ok, S} = webtransport:open_stream(Session, bidi),
+        ok = webtransport:send(Session, S, <<"drain">>, fin),
+        ok = wait_for_draining(Session, 5000),
+        ?assertEqual({error, session_draining}, webtransport:open_stream(Session, bidi)),
+        ok = webtransport:send(Session, Keep, <<"still here">>, fin),
+        webtransport:close_session(Session)
+    end).
+
+with_observer_listener(Tag, Config, Fun) ->
+    process_flag(trap_exit, true),
+    Transport = proplists:get_value(transport, Config),
+    Port = test_helpers:find_free_port(),
+    Name = list_to_atom(lists:concat(["observer_", Tag, "_", Transport])),
+    {ok, _} = webtransport:start_listener(Name, #{
+        transport => Transport,
+        port => Port,
+        certfile => proplists:get_value(certfile, Config),
+        keyfile => proplists:get_value(keyfile, Config),
+        handler => wt_close_observer_handler
+    }),
+    try
+        timer:sleep(100),
+        Fun(Port, Transport)
+    after
+        webtransport:stop_listener(Name),
+        timer:sleep(100),
+        flush_exits(),
+        process_flag(trap_exit, false)
+    end.
 
 %% http3-17 §5.6.2, http2-16 §6.7: stream limits are cumulative. The server
 %% allows 2 bidi streams and returns credit (WT_MAX_STREAMS) as each one

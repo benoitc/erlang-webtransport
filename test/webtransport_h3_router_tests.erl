@@ -95,6 +95,15 @@ reset_event_reported_test() ->
     Session ! stop,
     gen_server:stop(Router).
 
+%% http3-17 §4: a session id that is not a client-initiated bidi stream id
+%% closes the connection with H3_ID_ERROR.
+bad_session_id_test() ->
+    {ok, Router} = webtransport_h3_router:start_link(),
+    Router ! {quic_h3, self(), {stream_type_open, uni, 14, 16#54}},
+    Router ! {quic_h3, self(), {stream_type_data, uni, 14, <<1>>, false}},
+    ?assertEqual({'$gen_cast', {close, ?H3_ID_ERROR}}, recv(200)),
+    gen_server:stop(Router).
+
 datagram_routed_test() ->
     {ok, Router} = webtransport_h3_router:start_link(),
     Session = start_fake_session(self()),
