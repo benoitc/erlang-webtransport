@@ -3,7 +3,7 @@
 ## Unreleased
 
 - quic bumped to 2.2.1. The version constraint is now `~> 2.2`.
-- h2 bumped to 0.12.5.
+- h2 bumped to 0.12.7. It caps the stream resets a client can provoke on the server (MadeYouReset, CVE-2025-8671). The version constraint is now `~> 0.12.7`.
 
 ## 0.4.8 - 2026-10-03
 
