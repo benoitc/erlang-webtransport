@@ -119,6 +119,48 @@ bad_session_id_test() ->
     ?assertEqual({'$gen_cast', {close, ?H3_ID_ERROR}}, recv(200)),
     gen_server:stop(Router).
 
+%% A refused CONNECT frees its slot and resets streams held for it.
+session_gone_resets_parked_test() ->
+    {ok, Router} = webtransport_h3_router:start_link(),
+    Router ! {quic_h3, self(), {stream_type_open, uni, 14, 16#54}},
+    Router ! {quic_h3, self(), {stream_type_data, uni, 14, <<4, "early">>, false}},
+    ok = webtransport_h3_router:session_gone(Router, 4),
+    ?assertMatch({'$gen_cast', {cancel_stream, 14, ?WT_SESSION_GONE}}, recv(200)),
+    gen_server:stop(Router).
+
+%% Held stream data is capped; beyond the cap the stream is refused.
+parked_bytes_cap_test() ->
+    {ok, Router} = webtransport_h3_router:start_link(),
+    Router ! {quic_h3, self(), {stream_type_open, uni, 14, 16#54}},
+    Big = binary:copy(<<0>>, 600 * 1024),
+    Router ! {quic_h3, self(), {stream_type_data, uni, 14, <<4, Big/binary>>, false}},
+    Router ! {quic_h3, self(), {stream_type_data, uni, 14, Big, false}},
+    ?assertMatch({'$gen_cast', {cancel_stream, 14, ?WT_BUFFERED_STREAM_REJECTED}}, recv(200)),
+    gen_server:stop(Router).
+
+%% http3-17 §4.7: GOAWAY is passed to every session.
+goaway_forwarded_test() ->
+    {ok, Router} = webtransport_h3_router:start_link(),
+    Session = start_fake_session(self()),
+    ok = webtransport_h3_router:register_session(Router, 0, Session),
+    Router ! {quic_h3, self(), {goaway, 8}},
+    ?assertEqual({goaway, 8}, recv(200)),
+    Session ! stop,
+    gen_server:stop(Router).
+
+%% http3-17 §6: data on a CONNECT stream after the peer's WT_CLOSE_SESSION
+%% resets it with H3_MESSAGE_ERROR.
+data_after_peer_close_test() ->
+    {ok, Router} = webtransport_h3_router:start_link(),
+    Session = start_fake_session(self()),
+    Router ! {quic_h3, self(), {stream_type_open, uni, 14, 16#54}},
+    ok = webtransport_h3_router:register_session(Router, 0, Session),
+    ok = webtransport_h3_router:session_ended(Router, 0, true),
+    Router ! {quic_h3, self(), {data, 0, <<"late">>, false}},
+    ?assertMatch({'$gen_cast', {cancel_stream, 0, ?H3_MESSAGE_ERROR}}, recv(200)),
+    Session ! stop,
+    gen_server:stop(Router).
+
 datagram_routed_test() ->
     {ok, Router} = webtransport_h3_router:start_link(),
     Session = start_fake_session(self()),

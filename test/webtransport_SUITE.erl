@@ -61,6 +61,11 @@
     protocol_negotiation_test/1,
     flow_control_credit_test/1,
     server_close_reaches_client_test/1,
+    init_actions_after_accept_test/1,
+    handler_stop_closes_session_test/1,
+    drain_completes_test/1,
+    reset_unseen_stream_test/1,
+    close_stream_with_queue_test/1,
     server_drain_reaches_client_test/1,
     stream_credit_replenish_test/1,
     server_without_wt_enabled_test/1,
@@ -97,6 +102,11 @@ groups() ->
         server_without_wt_enabled_test,
         flow_control_credit_test,
         server_close_reaches_client_test,
+        init_actions_after_accept_test,
+        handler_stop_closes_session_test,
+        drain_completes_test,
+        reset_unseen_stream_test,
+        close_stream_with_queue_test,
         server_drain_reaches_client_test,
         stream_credit_replenish_test,
         connect_disconnect_test,
@@ -946,7 +956,10 @@ server_drain_reaches_client_test(Config) ->
             verify => verify_none,
             handler_opts => #{owner => self()}
         }, wt_close_observer_handler),
+        %% A stream the server knows and that stays open, so the drain has
+        %% something to wait for.
         {ok, Keep} = webtransport:open_stream(Session, bidi),
+        ok = webtransport:send(Session, Keep, <<"keep ">>, nofin),
         {ok, S} = webtransport:open_stream(Session, bidi),
         ok = webtransport:send(Session, S, <<"drain">>, fin),
         ok = wait_for_draining(Session, 5000),
@@ -954,6 +967,119 @@ server_drain_reaches_client_test(Config) ->
         ok = webtransport:send(Session, Keep, <<"still here">>, fin),
         webtransport:close_session(Session)
     end).
+
+%% Actions returned by a server handler's init go out once the session is
+%% established, after the 2xx: the client sees the datagram and the stream.
+init_actions_after_accept_test(Config) ->
+    with_listener(init_actions, wt_init_actions_handler, Config, fun(Port, Transport) ->
+        {ok, Session} = webtransport:connect("localhost", Port, <<"/test">>, #{
+            transport => Transport,
+            verify => verify_none
+        }),
+        receive
+            {webtransport, Session, {datagram, D}} -> ?assertEqual(<<"hello from init">>, D)
+        after 5000 ->
+            error(no_datagram_from_init)
+        end,
+        {ok, Info} = webtransport:session_info(Session),
+        %% overview-14 §4.2: the largest datagram we can send.
+        ?assert(maps:get(max_datagram_size, Info) > 0),
+        webtransport:close_session(Session)
+    end).
+
+%% A server handler that stops without closing still ends the session for
+%% the client (http3-17 §6, http2-16 §3.4).
+handler_stop_closes_session_test(Config) ->
+    with_observer_listener(stop, Config, fun(Port, Transport) ->
+        {ok, Session} = webtransport:connect("localhost", Port, <<"/test">>, #{
+            transport => Transport,
+            verify => verify_none,
+            handler_opts => #{owner => self()}
+        }, wt_close_observer_handler),
+        {ok, S} = webtransport:open_stream(Session, bidi),
+        ok = webtransport:send(Session, S, <<"stop">>, fin),
+        receive
+            {terminated, Session, {closed, 0, _}} -> ok
+        after 5000 ->
+            error(client_session_not_closed)
+        end
+    end).
+
+%% A draining server session stops once its streams are done, uni streams
+%% included, and the client learns the session ended.
+drain_completes_test(Config) ->
+    with_observer_listener(drain_done, Config, fun(Port, Transport) ->
+        {ok, Session} = webtransport:connect("localhost", Port, <<"/test">>, #{
+            transport => Transport,
+            verify => verify_none,
+            handler_opts => #{owner => self()}
+        }, wt_close_observer_handler),
+        {ok, U} = webtransport:open_stream(Session, uni),
+        ok = webtransport:send(Session, U, <<"uni data">>, fin),
+        {ok, S} = webtransport:open_stream(Session, bidi),
+        ok = webtransport:send(Session, S, <<"drain">>, fin),
+        %% The server's WT_DRAIN_SESSION drains the client too; with all its
+        %% streams done the client session ends, whichever close comes first.
+        receive
+            {terminated, Session, _Reason} -> ok
+        after 5000 ->
+            error(drain_did_not_complete)
+        end
+    end).
+
+%% A reset on a stream the peer has not seen yet opens it, as in QUIC
+%% (http2-16 §5.2): the session stays up.
+reset_unseen_stream_test(Config) ->
+    Port = proplists:get_value(port, Config),
+    {ok, Session} = webtransport:connect("localhost", Port, <<"/test">>, #{
+        transport => proplists:get_value(transport, Config),
+        verify => verify_none
+    }),
+    {ok, S} = webtransport:open_stream(Session, bidi),
+    ok = webtransport:reset_stream(Session, S, 3),
+    ?assertEqual({error, invalid_error_code},
+                 webtransport:reset_stream(Session, S, 1 bsl 32)),
+    assert_session_usable(Session),
+    webtransport:close_session(Session).
+
+%% close_stream after a send larger than the peer's window: the FIN waits
+%% for the queued bytes, so the peer gets the whole stream.
+close_stream_with_queue_test(Config) ->
+    Port = proplists:get_value(port, Config),
+    {ok, Session} = webtransport:connect("localhost", Port, <<"/test">>, #{
+        transport => proplists:get_value(transport, Config),
+        verify => verify_none
+    }),
+    {ok, S} = webtransport:open_stream(Session, bidi),
+    Payload = test_helpers:random_data(1536 * 1024),
+    ok = webtransport:send(Session, S, Payload, nofin),
+    ok = webtransport:close_stream(Session, S),
+    Echoed = collect_stream_echo(Session, S, <<>>, 15000),
+    Size = byte_size(Payload),
+    ?assertEqual(Payload, binary:part(Echoed, byte_size(Echoed) - Size, Size)),
+    webtransport:close_session(Session).
+
+with_listener(Tag, Handler, Config, Fun) ->
+    process_flag(trap_exit, true),
+    Transport = proplists:get_value(transport, Config),
+    Port = test_helpers:find_free_port(),
+    Name = list_to_atom(lists:concat(["listener_", Tag, "_", Transport])),
+    {ok, _} = webtransport:start_listener(Name, #{
+        transport => Transport,
+        port => Port,
+        certfile => proplists:get_value(certfile, Config),
+        keyfile => proplists:get_value(keyfile, Config),
+        handler => Handler
+    }),
+    try
+        timer:sleep(100),
+        Fun(Port, Transport)
+    after
+        webtransport:stop_listener(Name),
+        timer:sleep(100),
+        flush_exits(),
+        process_flag(trap_exit, false)
+    end.
 
 with_observer_listener(Tag, Config, Fun) ->
     process_flag(trap_exit, true),

@@ -125,6 +125,12 @@ open_bidi_stream(#state{h3_conn = H3Conn, quic_conn = QuicConn, session_id = Ses
 
 %% @doc Open a new unidirectional WebTransport stream on the QUIC connection.
 -spec open_uni_stream(state()) -> {ok, non_neg_integer(), state()} | {error, term()}.
+open_uni_stream(#state{router = Router, session_id = SessionId} = State) when is_pid(Router) ->
+    %% Through the router, so events on the stream reach the session.
+    case webtransport_h3_router:open_uni_stream(Router, SessionId) of
+        {ok, StreamId} -> {ok, StreamId, State};
+        {error, _} = Error -> Error
+    end;
 open_uni_stream(#state{quic_conn = QuicConn, session_id = SessionId} = State) ->
     case quic:open_unidirectional_stream(QuicConn) of
         {ok, StreamId} ->

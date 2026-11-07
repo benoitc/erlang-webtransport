@@ -337,7 +337,7 @@ accept_connect(Transport, Conn, StreamId, Headers, Handler, HandlerOpts, Opts, R
         fun(Ctx) -> check_session_limit(Transport, Router, StreamId, Opts, Ctx) end,
         fun(Ctx) -> select_protocol(Ctx, Handler, Headers, HandlerOpts) end
     ],
-    case run_steps(Steps) of
+    Result = case run_steps(Steps) of
         {ok, Ctx} ->
             start_accepted(Transport, Conn, StreamId, Headers,
                            Handler, HandlerOpts, Opts, Router, Ctx);
@@ -348,14 +348,30 @@ accept_connect(Transport, Conn, StreamId, Headers, Handler, HandlerOpts, Opts, R
             %% A malformed request (RFC 9114 §4.1.2): reset the stream.
             _ = quic_h3:cancel(Conn, StreamId, Code),
             {error, Reason}
-    end.
+    end,
+    case {Result, Router} of
+        {{error, _}, R} when is_pid(R) ->
+            %% No session will come for this CONNECT stream: free its slot
+            %% and reset any stream that arrived for it.
+            ok = webtransport_h3_router:session_gone(R, StreamId);
+        _ ->
+            ok
+    end,
+    Result.
 
 run_steps([First | Rest]) ->
     lists:foldl(fun(Step, {ok, Ctx}) -> Step(Ctx);
                    (_Step, Stop) -> Stop
                 end, First(), Rest).
 
-check_connect_request(h3, _Conn, Headers, Opts) ->
+%% http3-17 §3.2, http2-16 §3.2: `:scheme' MUST be https.
+check_connect_request(Transport, Conn, Headers, Opts) ->
+    case proplists:get_value(<<":scheme">>, Headers) of
+        <<"https">> -> check_connect_protocol(Transport, Conn, Headers, Opts);
+        _ -> {reject, 400, <<"Bad Request: :scheme must be https">>, bad_scheme}
+    end.
+
+check_connect_protocol(h3, _Conn, Headers, Opts) ->
     case classify_h3_connect(Headers, maps:get(compat_mode, Opts, auto)) of
         {ok, ClientMode} ->
             {ok, #{compat_mode => ClientMode}};
@@ -363,7 +379,7 @@ check_connect_request(h3, _Conn, Headers, Opts) ->
             {reject, 400, iolist_to_binary(io_lib:format("Bad Request: ~p", [Reason])),
              Reason}
     end;
-check_connect_request(h2, _Conn, Headers, _Opts) ->
+check_connect_protocol(h2, _Conn, Headers, _Opts) ->
     case is_webtransport_request(Headers) of
         true -> {ok, #{}};
         false -> {reject, 400, <<"Bad Request">>, not_webtransport}
@@ -421,8 +437,17 @@ check_peer(h2, Conn, Headers, Ctx) ->
 %% http3-17 §5.1: without flow control a connection carries one session; a
 %% server resets further CONNECT streams with H3_REQUEST_REJECTED. Flow
 %% control is in force when both sides sent a non-zero initial limit.
-check_session_limit(h3, Router, StreamId, Opts, #{compat_mode := latest} = Ctx)
-  when is_pid(Router) ->
+%% Every h3 session holds a slot in the router from here until it registers,
+%% so concurrent requests are counted too.
+check_session_limit(h3, Router, StreamId, Opts, Ctx) when is_pid(Router) ->
+    case webtransport_h3_router:reserve_session(Router, StreamId, alone_required(Opts, Ctx)) of
+        ok -> {ok, Ctx};
+        {error, busy} -> {reset, ?H3_REQUEST_REJECTED, second_session_without_flow_control}
+    end;
+check_session_limit(_Transport, _Router, _StreamId, _Opts, Ctx) ->
+    {ok, Ctx}.
+
+alone_required(Opts, #{compat_mode := latest} = Ctx) ->
     Peer = maps:get(peer_settings, Ctx, #{}),
     PeerDeclares = lists:any(fun(Id) ->
         case wt_h3:peer_setting(Peer, Id) of
@@ -432,17 +457,9 @@ check_session_limit(h3, Router, StreamId, Opts, #{compat_mode := latest} = Ctx)
     end, [16#2b61, 16#2b64, 16#2b65]),
     WeDeclare = lists:any(fun(K) -> maps:get(K, Opts, 1) > 0 end,
                           [max_data, max_streams_bidi, max_streams_uni]),
-    case PeerDeclares andalso WeDeclare of
-        true ->
-            {ok, Ctx};
-        false ->
-            case webtransport_h3_router:session_count(Router, StreamId) of
-                0 -> {ok, Ctx};
-                _ -> {reset, ?H3_REQUEST_REJECTED, second_session_without_flow_control}
-            end
-    end;
-check_session_limit(_Transport, _Router, _StreamId, _Opts, Ctx) ->
-    {ok, Ctx}.
+    not (PeerDeclares andalso WeDeclare);
+alone_required(_Opts, _Ctx) ->
+    false.
 
 %% http3-17 §3.3, http2-16 §3.3: the client lists protocols in
 %% WT-Available-Protocols; the handler may pick one, returned in
@@ -533,6 +550,7 @@ start_accepted(h3, H3Conn, StreamId, Handler, SessionOpts, RespHeaders, Router) 
             %% to the session, in order, ahead of later data.
             _ = quic_h3:set_stream_handler(H3Conn, StreamId, Session,
                                            #{drain_buffer => false}),
+            ok = webtransport_session:established(Session),
             {ok, Session};
         {error, Reason} ->
             send_reject(h3, H3Conn, StreamId, 500,
@@ -547,6 +565,7 @@ start_accepted(h2, Conn, StreamId, Handler, SessionOpts, RespHeaders, _Router) -
             %% h2 buffers server stream events until a handler registers.
             LoopPid = spawn(fun() -> h2_data_loop(Conn, StreamId, Session) end),
             _ = h2:set_stream_handler(Conn, StreamId, LoopPid),
+            ok = webtransport_session:established(Session),
             {ok, Session};
         {error, Reason} ->
             send_reject(h2, Conn, StreamId, 500,
@@ -1239,6 +1258,11 @@ h2_data_event({h2, Conn, {data, StreamId, Data, IsFin}},
             lists:foreach(fun(Capsule) -> dispatch_h2_capsule(Session, Capsule) end,
                           Capsules),
             case IsFin of
+                true when Rest =/= <<>> ->
+                    %% RFC 9297 §3.3: the stream ended inside a capsule.
+                    cleanup_data_loop(ConnRef, SessionRef),
+                    webtransport_session:handle_capsule(Session, {malformed, <<"truncated capsule">>}),
+                    stop;
                 true ->
                     %% http2-16 §3.4: the peer closing the stream ends the
                     %% session.
@@ -1370,6 +1394,7 @@ h2_start_session(TransportState, Path, Authority, RespHeaders, Protocol, Opts, H
             end),
             _ = h2:set_stream_handler(H2Conn, StreamId, LoopPid),
             LoopPid ! {prefix, take_h2_stream_events(H2Conn, StreamId, [])},
+            ok = webtransport_session:established(Session),
             {ok, Session};
         {error, _} = Err ->
             Err
@@ -1570,8 +1595,10 @@ h3_start_session(H3Conn, SessionId, Authority, Path, Headers, Opts, Handler, Rou
             h3_start_session(H3Conn, SessionId, Authority, Path, Headers, Opts,
                              Handler, Router, Protocol);
         {error, Reason} ->
-            %% http3-17 §3.3: close the session with WT_ALPN_ERROR.
-            _ = wt_h3:close_session(H3Conn, SessionId, ?WT_ALPN_ERROR, <<>>),
+            %% http3-17 §3.3: close the session with WT_ALPN_ERROR. §6: a
+            %% WT_CLOSE_SESSION is followed at once by a FIN.
+            Close = wt_h3_capsule:encode(wt_h3_capsule:close_session(?WT_ALPN_ERROR, <<>>)),
+            _ = quic_h3:send_data(H3Conn, SessionId, Close, true),
             quic_h3:close(H3Conn),
             {error, Reason}
     end.
@@ -1588,6 +1615,7 @@ h3_start_session(H3Conn, SessionId, Authority, Path, Headers, Opts, Handler, Rou
     case webtransport_session:start_link(h3, TransportState, ActualHandler, SessionOpts) of
         {ok, Session} ->
             webtransport_h3_router:register_session(Router, SessionId, Session),
+            ok = webtransport_session:established(Session),
             {ok, Session};
         {error, _} = Err ->
             %% Session failed to start after a successful CONNECT. Closing the
@@ -1759,23 +1787,26 @@ read_cacerts_file(CAFile) ->
 %% refused; with flow control declared by both sides it is accepted.
 session_limit_test_() ->
     {ok, Router} = webtransport_h3_router:start_link(),
-    Other = spawn(fun() -> receive stop -> ok end end),
-    ok = webtransport_h3_router:register_session(Router, 0, Other),
-    Ctx = #{compat_mode => latest},
-    WithFc = Ctx#{peer_settings => #{wt_initial_max_data => 1000}},
-    Results = [
-        check_session_limit(h3, Router, 4, #{}, Ctx),
-        check_session_limit(h3, Router, 4, #{}, WithFc),
-        check_session_limit(h3, Router, 0, #{}, Ctx),
-        check_session_limit(h3, Router, 4, #{}, Ctx#{compat_mode => legacy_browser_compat})
-    ],
-    Other ! stop,
+    NoFc = #{compat_mode => latest},
+    WithFc = NoFc#{peer_settings => #{wt_initial_max_data => 1000}},
+    %% Alone on the connection: accepted.
+    R1 = check_session_limit(h3, Router, 0, #{}, NoFc),
+    %% A second CONNECT racing the first, before either registered:
+    %% refused without flow control, accepted with it.
+    R2 = check_session_limit(h3, Router, 4, #{}, NoFc),
+    R3 = check_session_limit(h3, Router, 8, #{}, WithFc),
+    %% Draft-02 has no such rule.
+    R4 = check_session_limit(h3, Router, 12, #{}, NoFc#{compat_mode => legacy_browser_compat}),
+    %% A refused or failed session frees its slot.
+    [ok = webtransport_h3_router:session_gone(Router, Id) || Id <- [0, 8, 12]],
+    R5 = check_session_limit(h3, Router, 16, #{}, NoFc),
     gen_server:stop(Router),
     [
-        ?_assertMatch({reset, ?H3_REQUEST_REJECTED, _}, lists:nth(1, Results)),
-        ?_assertMatch({ok, _}, lists:nth(2, Results)),
-        ?_assertMatch({ok, _}, lists:nth(3, Results)),
-        ?_assertMatch({ok, _}, lists:nth(4, Results))
+        ?_assertMatch({ok, _}, R1),
+        ?_assertMatch({reset, ?H3_REQUEST_REJECTED, _}, R2),
+        ?_assertMatch({ok, _}, R3),
+        ?_assertMatch({ok, _}, R4),
+        ?_assertMatch({ok, _}, R5)
     ].
 
 -endif.

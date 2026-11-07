@@ -40,6 +40,8 @@
     {close_session, non_neg_integer(), binary()} |
     {drain_session} |
     {datagram, binary()} |
+    {max_stream_data, non_neg_integer(), non_neg_integer()} |
+    {stream_data_blocked, non_neg_integer(), non_neg_integer()} |
     {unknown, non_neg_integer(), binary()}.
 
 -type stream_kind() :: bidi | uni.
@@ -186,6 +188,12 @@ decode_payload(?WT_STREAMS_BLOCKED_UNI, Payload) ->
     decode_limit(streams_blocked_uni, Payload);
 decode_payload(?WT_CLOSE_SESSION, Payload) ->
     decode_close_payload(Payload);
+%% http3-17 §5.4: these two are not used on h3 and receiving one is a
+%% session error, so they are decoded for the session to reject.
+decode_payload(?WT_MAX_STREAM_DATA, Payload) ->
+    decode_pair(max_stream_data, Payload);
+decode_payload(?WT_STREAM_DATA_BLOCKED, Payload) ->
+    decode_pair(stream_data_blocked, Payload);
 decode_payload(?WT_DRAIN_SESSION, <<>>) ->
     {ok, {drain_session}};
 decode_payload(?WT_DRAIN_SESSION, _) ->
@@ -213,6 +221,18 @@ decode_all(Bin, Acc) ->
             decode_all(Rest, [Capsule | Acc]);
         {more, _} ->
             {ok, lists:reverse(Acc), Bin};
+        {error, _} = Err ->
+            Err
+    end.
+
+decode_pair(Name, Payload) ->
+    case h2_varint:decode(Payload) of
+        {ok, StreamId, Rest} ->
+            case h2_varint:decode(Rest) of
+                {ok, Limit, <<>>} -> {ok, {Name, StreamId, Limit}};
+                {ok, _, _} -> {error, extra_data};
+                {error, _} = Err -> Err
+            end;
         {error, _} = Err ->
             Err
     end.
@@ -375,6 +395,14 @@ close_session_decode_bad_reason_test_() ->
 
 drain_session_wire_format_test() ->
     ?assertEqual(h2_capsule:encode(16#78ae, <<>>), encode(drain_session())).
+
+per_stream_capsules_decoded_test_() ->
+    [
+        ?_assertEqual({ok, {max_stream_data, 4, 100}, <<>>},
+                      decode(h2_capsule:encode(16#190B4D3E, <<4, 64, 100>>))),
+        ?_assertEqual({ok, {stream_data_blocked, 4, 100}, <<>>},
+                      decode(h2_capsule:encode(16#190B4D42, <<4, 64, 100>>)))
+    ].
 
 unknown_and_datagram_capsule_test_() ->
     [

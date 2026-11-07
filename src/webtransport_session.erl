@@ -33,6 +33,7 @@
 
 %% Internal API (called by transport layers)
 -export([handle_capsule/2, handle_stream_data/4, handle_datagram_data/2]).
+-export([established/1, goaway/2]).
 -export([handle_stream_opened/3, handle_stream_closed/3]).
 
 %% gen_statem callbacks
@@ -76,10 +77,14 @@
     opened_uni = 0 :: non_neg_integer(),
     peer_opened_bidi = 0 :: non_neg_integer(),
     peer_opened_uni = 0 :: non_neg_integer(),
+    %% The peer sent WT_CLOSE_SESSION.
+    peer_closed = false :: boolean(),
+    %% Actions returned by the handler's init, run once the session is
+    %% established: after the 2xx on a server, after registration on a
+    %% client. Before that nothing may go out on the CONNECT stream.
+    pending_actions = [] :: [webtransport_handler:action()],
     %% h3: CONNECT stream bytes that do not end on a capsule boundary yet.
     connect_buf = <<>> :: binary(),
-    %% Peer streams whose stream credit was already returned.
-    credited = #{} :: #{non_neg_integer() => true},
     %% Stream types we failed to open for lack of credit; the handler is told
     %% when credit comes back (overview-14 §4.3).
     blocked = #{} :: #{bidi | uni => true},
@@ -166,6 +171,17 @@ early_data_accepted(Session) ->
 
 %% Internal API
 
+%% @doc The session is established: the server sent its 2xx, or the client
+%% registered the session. Runs the actions the handler's init returned.
+-spec established(session()) -> ok.
+established(Session) ->
+    gen_statem:cast(Session, established).
+
+%% @doc The connection received GOAWAY: no new streams (http3-17 §4.7).
+-spec goaway(session(), non_neg_integer()) -> ok.
+goaway(Session, Id) ->
+    gen_statem:cast(Session, {goaway, Id}).
+
 %% @doc Deliver a decoded capsule to the session (called by transport layers).
 -spec handle_capsule(session(), term()) -> ok.
 handle_capsule(Session, Capsule) ->
@@ -245,8 +261,7 @@ init({Transport, TransportState, Handler, Opts}) ->
         {ok, HandlerState} ->
             {ok, open, Data#data{handler_state = HandlerState}};
         {ok, HandlerState, Actions} ->
-            {Data1, Transition} = handle_actions(Actions, Data#data{handler_state = HandlerState}),
-            init_apply_transition(Transition, Data1);
+            {ok, open, Data#data{handler_state = HandlerState, pending_actions = Actions}};
         {error, Reason} ->
             {stop, Reason}
     end.
@@ -305,12 +320,6 @@ peer_limits(h2, _TransportState, Opts) ->
         max_streams_uni => maps:get(wt_initial_max_streams_uni, Settings, 0)
     }.
 
-init_apply_transition(continue, Data) ->
-    {ok, open, Data};
-init_apply_transition(drain, Data) ->
-    {ok, draining, Data};
-init_apply_transition({stop, Reason}, _Data) ->
-    {stop, Reason}.
 
 %% Open state - normal operation
 open({call, From}, {send, StreamId, Data, Fin}, #data{} = StateData) ->
@@ -370,6 +379,17 @@ open({call, From}, get_info, StateData) ->
 open({call, From}, early_data_accepted, StateData) ->
     {keep_state, StateData, [{reply, From, do_early_data_accepted(StateData)}]};
 
+open(cast, established, #data{pending_actions = Actions} = StateData) ->
+    {StateData1, Transition} = handle_actions(Actions, StateData#data{pending_actions = []}),
+    open_apply_transition(Transition, StateData1);
+open(cast, {goaway, Id}, StateData) ->
+    %% http3-17 §4.7: GOAWAY asks every session to shut down; stop opening
+    %% streams and let the handler know.
+    {StateData1, Transition} = notify_info({goaway, Id}, StateData),
+    case Transition of
+        continue -> maybe_stop_if_drained(StateData1, [], draining);
+        _ -> open_apply_transition(Transition, StateData1)
+    end;
 open(cast, {capsule, {datagram, Data}}, StateData) ->
     {StateData1, Transition} = handle_incoming_datagram(Data, StateData),
     open_apply_transition(Transition, StateData1);
@@ -394,7 +414,7 @@ open(cast, {stream_closed, StreamId, Reason}, StateData) ->
 
 open(cast, drain, StateData) ->
     do_drain(StateData),
-    {next_state, draining, StateData};
+    enter_draining(StateData);
 
 open(cast, {close, ErrorCode, Reason}, StateData) ->
     do_close(ErrorCode, Reason, StateData),
@@ -455,6 +475,8 @@ handle_connect_data(Data, Fin, #data{connect_buf = Buf} = StateData) ->
                             connect_stream_gone(<<"peer closed CONNECT">>, SD);
                         {true, {next_state, draining, SD}} ->
                             connect_stream_gone(<<"peer closed CONNECT">>, SD);
+                        {true, {stop, _, _} = Stop} ->
+                            Stop;
                         _ ->
                             Result
                     end
@@ -504,11 +526,38 @@ apply_capsule({malformed, Reason}, StateData) ->
 apply_capsule(connect_reset, StateData) ->
     reset_all_streams(StateData),
     {stop, normal, StateData#data{close_info = {0, <<"CONNECT stream reset">>}}};
-apply_capsule({reset_stream, StreamId, Code, ReliableSize}, StateData) ->
-    transition_result(handle_peer_reset(StreamId, Code, ReliableSize, StateData));
-apply_capsule({stop_sending, StreamId, Code}, StateData) ->
-    transition_result(handle_peer_stop_sending(StreamId, Code, StateData));
+apply_capsule({datagram, Data}, StateData) ->
+    {StateData1, Transition} = handle_incoming_datagram(Data, StateData),
+    open_apply_transition(Transition, StateData1);
+%% http2-16 §5.2: streams follow QUIC stream states, where RESET_STREAM,
+%% STOP_SENDING, MAX_STREAM_DATA and STREAM_DATA_BLOCKED open a stream the
+%% peer has not used yet just as data does.
+apply_capsule(Capsule, #data{transport = h2, streams = Streams} = StateData)
+  when (element(1, Capsule) =:= reset_stream orelse element(1, Capsule) =:= stop_sending
+        orelse element(1, Capsule) =:= max_stream_data
+        orelse element(1, Capsule) =:= stream_data_blocked)
+       andalso not is_map_key(element(2, Capsule), Streams) ->
+    StreamId = element(2, Capsule),
+    case is_local_stream(StreamId, StateData) orelse is_retired(StreamId, StateData) of
+        true ->
+            %% Ours and never opened, or finished: the handlers below
+            %% report it as a stream-state error.
+            apply_stream_capsule(Capsule, StateData);
+        false ->
+            case open_peer_stream(StreamId, webtransport_stream:stream_type(StreamId),
+                                  StateData) of
+                {StateData1, continue} -> apply_stream_capsule(Capsule, StateData1);
+                {StateData1, Transition} -> open_apply_transition(Transition, StateData1)
+            end
+    end;
 apply_capsule(Capsule, StateData) ->
+    apply_stream_capsule(Capsule, StateData).
+
+apply_stream_capsule({reset_stream, StreamId, Code, ReliableSize}, StateData) ->
+    transition_result(handle_peer_reset(StreamId, Code, ReliableSize, StateData));
+apply_stream_capsule({stop_sending, StreamId, Code}, StateData) ->
+    transition_result(handle_peer_stop_sending(StreamId, Code, StateData));
+apply_stream_capsule(Capsule, StateData) ->
     case handle_incoming_capsule(Capsule, StateData) of
         {session_error, Code, Reason} ->
             stop_with_session_error(Code, Reason, StateData);
@@ -535,7 +584,7 @@ handle_peer_reset(StreamId, Code, ReliableSize, #data{streams = Streams} = State
                   webtransport_stream:bytes_received(Stream) =:= ReliableSize,
                   webtransport_stream:receive_reset(Stream, Code)} of
                 {true, true, {ok, Stream1}} ->
-                    StateData1 = release_stream_credit(
+                    StateData1 = retire_stream(
                                    StreamId, StateData#data{streams = Streams#{StreamId => Stream1}}),
                     notify_stream_closed(StreamId, {reset, Code}, StateData1);
                 {_, false, _} ->
@@ -569,7 +618,7 @@ handle_peer_stop_sending(StreamId, Code, #data{streams = Streams} = StateData) -
                             transport_reset_stream(StreamId, {app, Code}, Stream1, StateData),
                             webtransport_stream:reset(Stream1, Code)
                     end,
-                    StateData1 = release_stream_credit(
+                    StateData1 = retire_stream(
                                    StreamId, StateData#data{streams = Streams#{StreamId => Stream2}}),
                     notify_stream_closed(StreamId, {stop_sending, Code}, StateData1);
                 _ ->
@@ -665,7 +714,7 @@ streams_available(uni, #data{remote_max_streams_uni = L, opened_uni = O}) -> max
 open_apply_transition(continue, StateData) ->
     {keep_state, StateData};
 open_apply_transition(drain, StateData) ->
-    {next_state, draining, StateData};
+    enter_draining(StateData);
 open_apply_transition({stop, Reason}, StateData) ->
     {stop, Reason, StateData}.
 
@@ -679,7 +728,7 @@ apply_capsule_transition({close_session, _Code, _Reason}, StateData) ->
     finish_connect(StateData),
     {stop, normal, StateData};
 apply_capsule_transition({drain_session}, StateData) ->
-    {next_state, draining, StateData};
+    enter_draining(StateData);
 apply_capsule_transition(_Capsule, StateData) ->
     {keep_state, StateData}.
 
@@ -713,6 +762,15 @@ draining({call, From}, get_info, StateData) ->
 draining({call, From}, early_data_accepted, StateData) ->
     {keep_state, StateData, [{reply, From, do_early_data_accepted(StateData)}]};
 
+%% Existing streams can still be finished, reset or stopped while
+%% draining, and datagrams still flow (http3-17 §4.7).
+draining({call, _From} = Call, {Op, _, _} = Req, StateData)
+  when Op =:= reset_stream; Op =:= stop_sending ->
+    after_draining(open(Call, Req, StateData));
+draining({call, _From} = Call, {close_stream, _} = Req, StateData) ->
+    after_draining(open(Call, Req, StateData));
+draining({call, _From} = Call, {send_datagram, _} = Req, StateData) ->
+    after_draining(open(Call, Req, StateData));
 draining({call, From}, _, StateData) ->
     {keep_state, StateData, [{reply, From, {error, session_draining}}]};
 
@@ -732,6 +790,12 @@ draining(cast, {close, ErrorCode, Reason}, StateData) ->
 draining(cast, {stream_opened, StreamId, Type}, StateData) ->
     {StateData1, Transition} = handle_remote_stream_opened(StreamId, Type, StateData),
     draining_apply_transition(Transition, StateData1);
+draining(cast, {datagram_data, Data}, StateData) ->
+    {StateData1, Transition} = handle_incoming_datagram(Data, StateData),
+    draining_apply_transition(Transition, StateData1);
+draining(cast, established, #data{pending_actions = Actions} = StateData) ->
+    {StateData1, Transition} = handle_actions(Actions, StateData#data{pending_actions = []}),
+    draining_apply_transition(Transition, StateData1);
 draining(cast, _, StateData) ->
     maybe_stop_if_drained(StateData, []);
 draining(info, Msg, StateData) ->
@@ -741,6 +805,8 @@ draining(info, Msg, StateData) ->
 
 after_draining({keep_state, StateData}) ->
     maybe_stop_if_drained(StateData, []);
+after_draining({keep_state, StateData, Actions}) ->
+    maybe_stop_if_drained(StateData, Actions);
 after_draining({next_state, _, StateData}) ->
     maybe_stop_if_drained(StateData, []);
 after_draining(Other) ->
@@ -754,16 +820,29 @@ draining_apply_transition({stop, Reason}, StateData) ->
 draining_apply_transition(_Transition, StateData) ->
     maybe_stop_if_drained(StateData, []).
 
-terminate(Reason, _State, #data{handler = Handler, handler_state = HState,
+terminate(Reason, _State, #data{close_info = undefined} = StateData) ->
+    %% The session ends without a close having been sent or received (a
+    %% handler stop, a crash, a finished drain): tell the peer, so its side
+    %% of the session does not hang (http3-17 §6, http2-16 §3.4).
+    try do_close(0, <<>>, StateData) catch _:_ -> ok end,
+    terminate_session(Reason, StateData);
+terminate(Reason, _State, StateData) ->
+    terminate_session(Reason, StateData).
+
+terminate_session(Reason, #data{handler = Handler, handler_state = HState,
                                 close_info = CloseInfo,
                                 transport = Transport,
                                 transport_state = TransportState,
-                                is_server = IsServer}) ->
+                                is_server = IsServer,
+                                peer_closed = PeerClosed}) ->
     %% Close the underlying connection gracefully so quic_h3_connection
     %% enters its `closing' state and exits with `normal' instead of
     %% `quic_closed'. Without this, the QUIC connection drop races with
     %% our process exit and produces noisy crash reports.
-    close_transport(Transport, TransportState, IsServer),
+    case Transport of
+        h3 -> close_transport(h3, TransportState, PeerClosed);
+        h2 -> close_transport(h2, TransportState, IsServer)
+    end,
     %% Surface close_info to the handler so it can distinguish a clean
     %% local/remote close (with error code + reason) from an abnormal exit.
     Handler:terminate(augment_reason(Reason, CloseInfo), HState),
@@ -781,13 +860,19 @@ finish_connect(#data{transport = h3, transport_state = H3State}) ->
     catch _:_ -> ok
     end.
 
-close_transport(h3, H3State, _IsServer) ->
-    %% Close the connection once its last session is gone, so the
-    %% h3_connection exits `normal' instead of racing our exit. Other
-    %% sessions on the same connection keep it (http3-17 §6).
-    case other_sessions(H3State) of
-        0 -> try quic_h3:close(webtransport_h3:h3_conn(H3State)) catch _:_ -> ok end;
-        _ -> ok
+%% h3: the router learns the session ended. A client closes its connection
+%% there once no session is left and the server closed the CONNECT stream
+%% (http3-17 §6); a server leaves the connection open, as it can carry other
+%% requests.
+close_transport(h3, H3State, PeerClosed) ->
+    case webtransport_h3:router(H3State) of
+        undefined ->
+            ok;
+        Router ->
+            try webtransport_h3_router:session_ended(Router, webtransport_h3:session_id(H3State),
+                                                     PeerClosed)
+            catch _:_ -> ok
+            end
     end;
 %% A client owns its h2 connection, one per session: close it. A server's
 %% h2 connection carries other requests and is left to the client.
@@ -795,16 +880,6 @@ close_transport(h2, H2State, false) ->
     try h2:close(webtransport_h2:h2_conn(H2State)) catch _:_ -> ok end;
 close_transport(h2, _H2State, true) ->
     ok.
-
-other_sessions(H3State) ->
-    case webtransport_h3:router(H3State) of
-        undefined ->
-            0;
-        Router ->
-            try webtransport_h3_router:session_count(Router, webtransport_h3:session_id(H3State))
-            catch _:_ -> 0
-            end
-    end.
 
 augment_reason(Reason, undefined) -> Reason;
 augment_reason(normal, {Code, Msg}) -> {closed, Code, Msg};
@@ -1016,20 +1091,39 @@ streams_blocked(uni, Limit) -> {streams_blocked_uni, Limit}.
 do_close_stream(StreamId, #data{streams = Streams} = StateData) ->
     case maps:find(StreamId, Streams) of
         {ok, Stream} ->
-            case webtransport_stream:close_local(Stream) of
-                {ok, Stream1} ->
-                    transport_send(StreamId, <<>>, true, StateData),
-                    {ok, release_stream_credit(
-                           StreamId, StateData#data{streams = Streams#{StreamId => Stream1}})};
-                {error, _} = Err ->
-                    Err
+            case webtransport_stream:send_buffer(Stream) of
+                <<>> -> close_stream_now(StreamId, Stream, StateData);
+                _ -> close_stream_after_queue(StreamId, Stream, StateData)
             end;
         error ->
             {error, unknown_stream}
     end.
 
+%% Bytes are still waiting for credit: the FIN goes out after them, from
+%% push_limited/5, so the peer gets the whole stream.
+close_stream_after_queue(StreamId, Stream, #data{streams = Streams} = StateData) ->
+    case webtransport_stream:fin_pending(Stream) of
+        true ->
+            {error, stream_fin_sent};
+        false ->
+            Stream1 = webtransport_stream:set_fin_pending(Stream),
+            {ok, StateData#data{streams = Streams#{StreamId => Stream1}}}
+    end.
+
+close_stream_now(StreamId, Stream, #data{streams = Streams} = StateData) ->
+    case webtransport_stream:close_local(Stream) of
+        {ok, Stream1} ->
+            transport_send(StreamId, <<>>, true, StateData),
+            {ok, retire_stream(StreamId, StateData#data{streams = Streams#{StreamId => Stream1}})};
+        {error, _} = Err ->
+            Err
+    end.
+
 %% http2-16 §6.2, §6.3: no reset once our send side has ended, and at most
 %% one STOP_SENDING per stream.
+do_reset_stream(_StreamId, ErrorCode, _StateData) when ErrorCode > 16#ffffffff ->
+    %% WebTransport application error codes are 32 bits (http3-17 §4.4).
+    {error, invalid_error_code};
 do_reset_stream(StreamId, ErrorCode, #data{streams = Streams} = StateData) ->
     case maps:find(StreamId, Streams) of
         {ok, Stream} ->
@@ -1041,13 +1135,15 @@ do_reset_stream(StreamId, ErrorCode, #data{streams = Streams} = StateData) ->
                 false ->
                     Stream1 = webtransport_stream:reset(Stream, ErrorCode),
                     transport_reset_stream(StreamId, {app, ErrorCode}, Stream, StateData),
-                    {ok, release_stream_credit(
+                    {ok, retire_stream(
                            StreamId, StateData#data{streams = Streams#{StreamId => Stream1}})}
             end;
         error ->
             {error, unknown_stream}
     end.
 
+do_stop_sending(_StreamId, ErrorCode, _StateData) when ErrorCode > 16#ffffffff ->
+    {error, invalid_error_code};
 do_stop_sending(StreamId, ErrorCode, #data{streams = Streams} = StateData) ->
     case maps:find(StreamId, Streams) of
         {ok, Stream} ->
@@ -1069,10 +1165,19 @@ do_drain(#data{transport = h2, transport_state = H2State}) ->
 do_drain(#data{transport = h3, transport_state = H3State}) ->
     webtransport_h3:drain_session(H3State).
 
-do_close(ErrorCode, Reason, StateData) ->
+do_close(ErrorCode0, Reason0, StateData) ->
     %% Reset all live streams with WT_SESSION_GONE, then send CLOSE_SESSION.
     %% The transport may already be gone (connection lost, peer closed
-    %% first); closing is then a no-op, not a crash of the session.
+    %% first); closing is then a no-op, not a crash of the session. A code or
+    %% reason the capsule cannot carry is replaced, so a close always goes out.
+    ErrorCode = case is_integer(ErrorCode0) andalso ErrorCode0 =< 16#ffffffff of
+        true -> ErrorCode0;
+        false -> 0
+    end,
+    Reason = case wt_h3_capsule:valid_close_reason(Reason0) of
+        true -> Reason0;
+        false -> <<>>
+    end,
     reset_all_streams(StateData),
     transport_call(fun() ->
         case StateData of
@@ -1122,10 +1227,12 @@ transport_call(Fun) ->
     end.
 
 %% http3-17 §5.1: without flow control, flow-control capsules are ignored.
+%% WT_MAX_STREAM_DATA and WT_STREAM_DATA_BLOCKED are not among them on h3
+%% (§5.6): receiving one stays an error (§5.4).
 handle_incoming_capsule(Capsule, #data{flow_control = false} = StateData)
-  when element(1, Capsule) =:= max_data; element(1, Capsule) =:= max_stream_data;
+  when element(1, Capsule) =:= max_data;
        element(1, Capsule) =:= max_streams_bidi; element(1, Capsule) =:= max_streams_uni;
-       element(1, Capsule) =:= data_blocked; element(1, Capsule) =:= stream_data_blocked;
+       element(1, Capsule) =:= data_blocked;
        element(1, Capsule) =:= streams_blocked_bidi;
        element(1, Capsule) =:= streams_blocked_uni ->
     StateData;
@@ -1219,7 +1326,7 @@ handle_incoming_capsule({streams_blocked_uni, Limit}, StateData) ->
 handle_incoming_capsule({padding, _}, StateData) ->
     StateData;
 handle_incoming_capsule({close_session, ErrorCode, Reason}, #data{} = StateData) ->
-    StateData#data{close_info = {ErrorCode, Reason}};
+    StateData#data{close_info = {ErrorCode, Reason}, peer_closed = true};
 handle_incoming_capsule({drain_session}, #data{} = StateData) ->
     StateData;
 handle_incoming_capsule({unknown, Type, _Payload}, StateData) ->
@@ -1227,10 +1334,34 @@ handle_incoming_capsule({unknown, Type, _Payload}, StateData) ->
     logger:debug("webtransport: dropping unknown capsule type ~p", [Type]),
     StateData.
 
-handle_incoming_stream_data(StreamId, Data, Fin,
-                             #data{streams = Streams, handler = Handler,
-                                   handler_state = HState,
-                                   bytes_received = SessRecv} = StateData) ->
+handle_incoming_stream_data(StreamId, Data, Fin, #data{streams = Streams} = StateData) ->
+    case maps:find(StreamId, Streams) of
+        {ok, _Stream} when StateData#data.transport =:= h2 ->
+            case has_peer_send_side(StreamId, StateData) of
+                true -> receive_stream_data(StreamId, Data, Fin, StateData);
+                false ->
+                    %% http2-16 §6.4: data on a uni stream only we send on.
+                    fail_session(?WT_STREAM_STATE_ERROR, <<"data on a stream the peer cannot send on">>,
+                                 StateData)
+            end;
+        {ok, _Stream} ->
+            receive_stream_data(StreamId, Data, Fin, StateData);
+        error when StateData#data.transport =:= h2 ->
+            case is_retired(StreamId, StateData) of
+                true ->
+                    %% http2-16 §6.4: data on a finished stream.
+                    fail_session(?WT_STREAM_STATE_ERROR, <<"data on a finished stream">>, StateData);
+                false ->
+                    {StateData, continue}
+            end;
+        error ->
+            {StateData, continue}
+    end.
+
+receive_stream_data(StreamId, Data, Fin,
+                    #data{streams = Streams, handler = Handler,
+                          handler_state = HState,
+                          bytes_received = SessRecv} = StateData) ->
     case maps:find(StreamId, Streams) of
         {ok, Stream} ->
             Type = webtransport_stream:type(Stream),
@@ -1254,7 +1385,7 @@ handle_incoming_stream_data(StreamId, Data, Fin,
                     {Stream3, StateData2} = grant_credit(StreamId, Stream2, StateData1),
                     {StateData3, Transition} =
                         apply_stream_callback(Callback(), StreamId, Stream3, Streams, StateData2),
-                    {release_stream_credit(StreamId, StateData3), Transition};
+                    {retire_stream(StreamId, StateData3), Transition};
                 {error, flow_control} ->
                     %% http3-17 §5.4, http2-16 §6.5/§6.6: data beyond what we
                     %% granted closes the session.
@@ -1411,35 +1542,44 @@ peer_opened(uni, #data{peer_opened_uni = N}) -> N.
 set_peer_opened(bidi, N, StateData) -> StateData#data{peer_opened_bidi = N};
 set_peer_opened(uni, N, StateData) -> StateData#data{peer_opened_uni = N}.
 
-%% A peer stream we already finished with and returned credit for.
-is_retired(StreamId, #data{credited = Credited}) ->
-    maps:is_key(StreamId, Credited).
+%% A stream that was opened and has since finished and left the map. On h2
+%% stream ids of each kind are used in order, so an id at or below the
+%% count opened so far and not in the map is finished. On h3 the router
+%% never reports a stream twice.
+is_retired(StreamId, #data{transport = h2, streams = Streams} = StateData) ->
+    not maps:is_key(StreamId, Streams) andalso
+        StreamId div 4 + 1 =< opened_count(StreamId, StateData);
+is_retired(_StreamId, _StateData) ->
+    false.
 
-%% When a peer-initiated stream is finished, give its credit back: raise
-%% our limit for that kind by one and send WT_MAX_STREAMS, so the peer can
+opened_count(StreamId, StateData) ->
+    case {is_local_stream(StreamId, StateData), webtransport_stream:stream_type(StreamId)} of
+        {true, bidi} -> StateData#data.opened_bidi;
+        {true, uni} -> StateData#data.opened_uni;
+        {false, bidi} -> StateData#data.peer_opened_bidi;
+        {false, uni} -> StateData#data.peer_opened_uni
+    end.
+
+%% A finished stream leaves the session state, so a peer cannot grow it
+%% without bound. A peer-initiated one also gives its credit back: our limit
+%% for that kind goes up by one and WT_MAX_STREAMS tells the peer, so it can
 %% always have as many streams open as we allow (http3-17 §5.6, http2-16
-%% §4.4 SHOULD). A peer uni stream is finished once it ended or was reset;
-%% a peer bidi stream once both directions are closed.
-release_stream_credit(StreamId, #data{streams = Streams, credited = Credited} = StateData) ->
+%% §4.4 SHOULD).
+retire_stream(StreamId, #data{streams = Streams} = StateData) ->
     case maps:find(StreamId, Streams) of
         {ok, Stream} ->
-            case not is_local_stream(StreamId, StateData) andalso
-                 not maps:is_key(StreamId, Credited) andalso
-                 stream_finished(Stream) of
+            case stream_done(StreamId, Stream, StateData) of
                 true ->
-                    StateData1 = StateData#data{credited = Credited#{StreamId => true}},
-                    raise_peer_limit(webtransport_stream:type(Stream), StateData1);
+                    StateData1 = StateData#data{streams = maps:remove(StreamId, Streams)},
+                    case is_local_stream(StreamId, StateData) of
+                        true -> StateData1;
+                        false -> raise_peer_limit(webtransport_stream:type(Stream), StateData1)
+                    end;
                 false ->
                     StateData
             end;
         error ->
             StateData
-    end.
-
-stream_finished(Stream) ->
-    case webtransport_stream:type(Stream) of
-        uni -> not webtransport_stream:is_readable(Stream);
-        bidi -> webtransport_stream:state(Stream) =:= closed
     end.
 
 raise_peer_limit(bidi, #data{local_max_streams_bidi = L} = StateData) ->
@@ -1454,10 +1594,10 @@ handle_remote_stream_closed(StreamId, Reason,
                                    handler_state = HState} = StateData) ->
     case maps:find(StreamId, Streams) of
         {ok, Stream} ->
-            Stream1 = webtransport_stream:close(Stream),
-            StateData1 = release_stream_credit(
+            {Stream1, Reason1} = remote_close(StreamId, Stream, Reason, StateData),
+            StateData1 = retire_stream(
                            StreamId, StateData#data{streams = Streams#{StreamId => Stream1}}),
-            case Handler:handle_stream_closed(StreamId, Reason, HState) of
+            case Handler:handle_stream_closed(StreamId, Reason1, HState) of
                 {ok, HState1} ->
                     {StateData1#data{handler_state = HState1}, continue};
                 {stop, StopReason, HState1} ->
@@ -1466,6 +1606,39 @@ handle_remote_stream_closed(StreamId, Reason,
         error ->
             {StateData, continue}
     end.
+
+%% Apply a stream event from the transport to one direction only: a peer
+%% reset ends the peer's side, a STOP_SENDING ends ours (the QUIC stack has
+%% already answered it with a reset). A stream the peer sends on that
+%% closes before its FIN was seen was reset with code 0, which the QUIC
+%% stack reports as a close; it reaches the handler as a reset without an
+%% application code (http3-17 §4.4).
+remote_close(_StreamId, Stream, {reset, Code}, _StateData) ->
+    {received_reset(Stream, Code), {reset, Code}};
+remote_close(_StreamId, Stream, {stop_sending, Code}, _StateData) ->
+    Stream1 = case webtransport_stream:peer_stop_sending(Stream, Code) of
+        {ok, S} -> S;
+        {error, duplicate} -> Stream
+    end,
+    {webtransport_stream:reset(Stream1, Code), {stop_sending, Code}};
+remote_close(StreamId, Stream, normal, StateData) ->
+    case has_peer_send_side(StreamId, StateData) andalso
+         webtransport_stream:is_readable(Stream) of
+        true -> {webtransport_stream:close(received_reset(Stream, undefined)),
+                 {reset, undefined}};
+        false -> {webtransport_stream:close(Stream), normal}
+    end;
+remote_close(_StreamId, Stream, Other, _StateData) ->
+    {webtransport_stream:close(Stream), Other}.
+
+received_reset(Stream, Code) ->
+    case webtransport_stream:receive_reset(Stream, code_or_zero(Code)) of
+        {ok, S} -> S;
+        {error, invalid_state} -> Stream
+    end.
+
+code_or_zero(undefined) -> 0;
+code_or_zero(Code) -> Code.
 
 %% Execute handler-returned actions inline on the session's own state.
 %% Runs inside the gen_statem callback so we cannot round-trip through the
@@ -1599,16 +1772,58 @@ transport_stop_sending(StreamId, {_, Code}, #data{transport = h2, transport_stat
 transport_stop_sending(StreamId, Code, #data{transport = h3, transport_state = H3State}) ->
     webtransport_h3:stop_sending(H3State, StreamId, Code).
 
-maybe_stop_if_drained(#data{streams = Streams} = StateData, Actions) ->
-    OpenCount = maps:fold(fun(_Id, Stream, Acc) ->
-        case webtransport_stream:is_open(Stream) of
-            true -> Acc + 1;
-            false -> Acc
-        end
-    end, 0, Streams),
-    case OpenCount of
-        0 -> {stop, normal, StateData};
-        _ -> {keep_state, StateData, Actions}
+%% Move to draining. A session whose streams all finished already (the last
+%% one may have ended in the same batch of actions) stops now: no later
+%% stream event would end it. One that never used a stream stays, for
+%% datagrams, until it is closed.
+enter_draining(#data{opened_bidi = OB, opened_uni = OU,
+                     peer_opened_bidi = PB, peer_opened_uni = PU} = StateData)
+  when OB + OU + PB + PU > 0 ->
+    case maybe_stop_if_drained(StateData, [], draining) of
+        {next_state, draining, SD, []} -> {next_state, draining, SD};
+        Other -> Other
+    end;
+enter_draining(StateData) ->
+    {next_state, draining, StateData}.
+
+%% Stop once every stream is finished; otherwise stay (or move) in draining.
+maybe_stop_if_drained(StateData, Actions) ->
+    maybe_stop_if_drained(StateData, Actions, keep).
+
+maybe_stop_if_drained(#data{streams = Streams} = StateData, Actions, Next) ->
+    case lists:all(fun({Id, S}) -> stream_done(Id, S, StateData) end, maps:to_list(Streams)) of
+        true -> {stop, normal, StateData};
+        false when Next =:= draining -> {next_state, draining, StateData, Actions};
+        false -> {keep_state, StateData, Actions}
+    end.
+
+%% A stream is done once every direction it has is finished: our send side
+%% on a uni stream we opened, the peer's on one it opened, both on bidi.
+stream_done(StreamId, Stream, StateData) ->
+    case webtransport_stream:type(Stream) of
+        uni ->
+            case is_local_stream(StreamId, StateData) of
+                true -> not webtransport_stream:is_writable(Stream);
+                false -> not webtransport_stream:is_readable(Stream)
+            end;
+        bidi ->
+            webtransport_stream:state(Stream) =:= closed
+    end.
+
+%% Give the handler an event through its optional handle_info/2.
+notify_info(Msg, #data{handler = Handler, handler_state = HState} = StateData) ->
+    case erlang:function_exported(Handler, handle_info, 2) of
+        true ->
+            case Handler:handle_info(Msg, HState) of
+                {ok, HState1} ->
+                    {StateData#data{handler_state = HState1}, continue};
+                {ok, HState1, Actions} ->
+                    handle_actions(Actions, StateData#data{handler_state = HState1});
+                {stop, Reason, HState1} ->
+                    {StateData#data{handler_state = HState1}, {stop, Reason}}
+            end;
+        false ->
+            {StateData, continue}
     end.
 
 do_early_data_accepted(#data{transport = h3, transport_state = H3State}) ->
@@ -1618,7 +1833,18 @@ do_early_data_accepted(#data{transport = h2}) ->
 
 build_info(#data{request = Request} = StateData) ->
     Info = build_info_base(StateData),
-    maps:merge(Info, maps:with([protocol, wt_draft], Request)).
+    maps:merge(Info#{max_datagram_size => max_datagram_size(StateData)},
+               maps:with([protocol, wt_draft], Request)).
+
+%% overview-14 §4.2: the largest datagram payload the application can send.
+max_datagram_size(#data{transport = h2}) ->
+    ?WT_H2_DATAGRAM_MAX;
+max_datagram_size(#data{transport = h3, transport_state = H3State}) ->
+    try quic_h3:max_datagram_size(webtransport_h3:h3_conn(H3State),
+                                  webtransport_h3:session_id(H3State)) of
+        N when is_integer(N) -> min(N, ?WT_H3_DATAGRAM_MAX)
+    catch _:_ -> 0
+    end.
 
 build_info_base(#data{transport = Transport, streams = Streams,
                   local_max_data = LocalMaxData, remote_max_data = RemoteMaxData,
@@ -1783,6 +2009,77 @@ connect_capsule_split_test() ->
     {keep_state, D2} = handle_connect_data(B, false, D1),
     ?assertEqual(<<>>, D2#data.connect_buf),
     ?assertEqual(4096, D2#data.remote_max_data).
+
+%% Finished streams leave the map; a finished peer stream returns credit.
+retire_stream_test() ->
+    Data0 = (test_data())#data{flow_control = false},
+    {ok, PeerUni} = webtransport_stream:receive_fin(webtransport_stream:new(2, uni, 0, 100)),
+    Data = Data0#data{streams = #{2 => PeerUni}, peer_opened_uni = 1},
+    Data1 = retire_stream(2, Data),
+    ?assertNot(maps:is_key(2, Data1#data.streams)),
+    ?assertEqual(Data#data.local_max_streams_uni + 1, Data1#data.local_max_streams_uni),
+    %% An open stream stays.
+    Open = Data#data{streams = #{2 => webtransport_stream:new(2, uni, 0, 100)}},
+    ?assert(maps:is_key(2, (retire_stream(2, Open))#data.streams)).
+
+%% h2: an id below the count already used and not in the map is finished.
+retired_by_ordinal_test_() ->
+    Data = (test_data())#data{peer_opened_bidi = 3, opened_bidi = 1},
+    [
+        ?_assert(is_retired(4, Data)),          %% client bidi #2 of 3
+        ?_assertNot(is_retired(12, Data)),      %% client bidi #4: new
+        ?_assert(is_retired(1, Data)),          %% our bidi #1
+        ?_assertNot(is_retired(5, Data)),       %% our bidi #2: never opened
+        ?_assertNot(is_retired(4, Data#data{transport = h3}))
+    ].
+
+stream_done_test_() ->
+    Server = test_data(),
+    LocalUni = webtransport_stream:new(3, uni, 100, 0),
+    {ok, LocalUniFin} = webtransport_stream:close_local(LocalUni),
+    PeerUni = webtransport_stream:new(2, uni, 0, 100),
+    {ok, PeerUniFin} = webtransport_stream:receive_fin(PeerUni),
+    Bidi = webtransport_stream:new(0, bidi, 100, 100),
+    {ok, BidiHalf} = webtransport_stream:receive_fin(Bidi),
+    {ok, BidiDone} = webtransport_stream:close_local(BidiHalf),
+    [
+        ?_assertNot(stream_done(3, LocalUni, Server)),
+        ?_assert(stream_done(3, LocalUniFin, Server)),
+        ?_assertNot(stream_done(2, PeerUni, Server)),
+        ?_assert(stream_done(2, PeerUniFin, Server)),
+        ?_assertNot(stream_done(0, BidiHalf, Server)),
+        ?_assert(stream_done(0, BidiDone, Server))
+    ].
+
+%% close_stream with bytes still queued waits for them before the FIN.
+close_stream_with_queue_test() ->
+    Stream = webtransport_stream:buffer_send(webtransport_stream:new(1, bidi, 0, 100), <<"q">>),
+    Data = (test_data())#data{streams = #{1 => Stream}},
+    {ok, Data1} = do_close_stream(1, Data),
+    ?assert(webtransport_stream:fin_pending(maps:get(1, Data1#data.streams))),
+    ?assertEqual({error, stream_fin_sent}, do_close_stream(1, Data1)).
+
+%% WebTransport application error codes are 32 bits.
+our_error_codes_test_() ->
+    Data = (test_data())#data{streams = #{1 => webtransport_stream:new(1, bidi, 100, 100)}},
+    [
+        ?_assertEqual({error, invalid_error_code}, do_reset_stream(1, 1 bsl 32, Data)),
+        ?_assertEqual({error, invalid_error_code}, do_stop_sending(1, 1 bsl 32, Data))
+    ].
+
+%% http3-17 §4.4: a stream the peer sends on that closes before its FIN
+%% was reset with code 0, which reaches the handler as no application code.
+remote_close_code_zero_test_() ->
+    Server = test_data(),
+    Open = webtransport_stream:new(2, uni, 0, 100),
+    {ok, Fin} = webtransport_stream:receive_fin(Open),
+    [
+        ?_assertMatch({_, {reset, undefined}}, remote_close(2, Open, normal, Server)),
+        ?_assertMatch({_, normal}, remote_close(2, Fin, normal, Server)),
+        ?_assertMatch({_, {stop_sending, 5}},
+                      remote_close(1, webtransport_stream:new(1, bidi, 100, 100),
+                                   {stop_sending, 5}, Server))
+    ].
 
 %% Which side of a stream sends: both on bidi, the opener on uni.
 send_sides_test_() ->

@@ -14,16 +14,21 @@
 
 -export([start_link/0, start_link/1, start/1]).
 -export([register_session/3, unregister_session/2, expect_session/2]).
--export([session_count/2]).
+-export([session_count/2, reserve_session/3, session_gone/2, session_ended/3]).
 -export([client_connect/4]).
 -export([set_passthrough/2]).
--export([open_bidi_stream/2]).
+-export([open_bidi_stream/2, open_uni_stream/2]).
 -export([get_h3_conn/1]).
 
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
 
 %% Datagrams held for sessions that are not registered yet.
 -define(MAX_PARKED_DATAGRAMS, 64).
+%% Bytes of stream data held for sessions that are not registered yet.
+-define(MAX_PARKED_BYTES, 1048576).
+%% How long a client waits for the server to close its side of a CONNECT
+%% stream before closing the connection (http3-17 §6).
+-define(CLOSE_WAIT_MS, 1000).
 
 -record(state, {
     sessions = #{} :: #{non_neg_integer() => pid()},
@@ -44,9 +49,18 @@
     %% max_pending_streams (streams) and ?MAX_PARKED_DATAGRAMS.
     parked = #{} :: #{non_neg_integer() => [term()]},
     parked_datagrams = 0 :: non_neg_integer(),
-    %% Sessions that were registered and have ended: their streams are
-    %% reset with WT_SESSION_GONE instead of held.
-    gone = #{} :: #{non_neg_integer() => true},
+    parked_bytes = 0 :: non_neg_integer(),
+    %% CONNECT streams being accepted: counted as sessions so two requests
+    %% racing on a connection without flow control cannot both pass.
+    reserved = #{} :: #{non_neg_integer() => true},
+    %% Sessions that ended or were refused: their streams are reset with
+    %% WT_SESSION_GONE instead of held. `peer_closed' when the peer sent
+    %% WT_CLOSE_SESSION, so later data on the CONNECT stream is an error.
+    gone = #{} :: #{non_neg_integer() => ended | peer_closed},
+    %% Client side: sessions that ended, waiting for the server to close the
+    %% CONNECT stream before the connection is closed.
+    closing = #{} :: #{non_neg_integer() => reference()},
+    role = server :: server | client,
     %% Client side: CONNECT streams whose session is not registered yet.
     %% Their data is held here, in arrival order, and replayed to the session
     %% when it registers.
@@ -100,6 +114,28 @@ expect_session(Router, SessionId) ->
 session_count(Router, SessionId) ->
     gen_server:call(Router, {session_count, SessionId}, 5000).
 
+%% @doc Hold a slot for a CONNECT stream being accepted. With `Alone' the
+%% session must be the only one on the connection (http3-17 §5.1, no flow
+%% control) and the call fails if another session or slot exists.
+-spec reserve_session(pid(), non_neg_integer(), boolean()) -> ok | {error, busy}.
+reserve_session(Router, SessionId, Alone) ->
+    gen_server:call(Router, {reserve, SessionId, Alone}).
+
+%% @doc The CONNECT stream was refused or its session failed to start: free
+%% its slot and reset the streams held for it with WT_SESSION_GONE.
+-spec session_gone(pid(), non_neg_integer()) -> ok.
+session_gone(Router, SessionId) ->
+    gen_server:call(Router, {gone, SessionId}).
+
+%% @doc A session has ended. `PeerClosed' when the peer sent
+%% WT_CLOSE_SESSION: later data on its CONNECT stream is then reset with
+%% H3_MESSAGE_ERROR (http3-17 §6). On a client the connection is closed once
+%% no session is left, after the server closed the CONNECT stream or a short
+%% wait.
+-spec session_ended(pid(), non_neg_integer(), boolean()) -> ok.
+session_ended(Router, SessionId, PeerClosed) ->
+    gen_server:call(Router, {ended, SessionId, PeerClosed}, 5000).
+
 -spec unregister_session(pid(), non_neg_integer()) -> ok.
 unregister_session(Router, SessionId) ->
     gen_server:call(Router, {unregister, SessionId}).
@@ -119,6 +155,12 @@ open_bidi_stream(Router, SessionId) ->
     gen_server:call(Router, {open_bidi_stream, SessionId}, 30000).
 
 %% @doc Return the H3 connection pid, or undefined if not yet connected.
+%% @doc Open a unidirectional stream for a session, write its header and
+%% remember it, so events on it reach the session.
+-spec open_uni_stream(pid(), non_neg_integer()) -> {ok, non_neg_integer()} | {error, term()}.
+open_uni_stream(Router, SessionId) ->
+    gen_server:call(Router, {open_uni_stream, SessionId}, 30000).
+
 -spec get_h3_conn(pid()) -> undefined | pid().
 get_h3_conn(Router) ->
     gen_server:call(Router, get_h3_conn).
@@ -142,10 +184,25 @@ handle_call({register, SessionId, SessionPid}, _From, State) ->
     [SessionPid ! Msg || Msg <- Held],
     State1 = replay_parked(SessionId, SessionPid,
                            State#state{sessions = Sessions, monitors = Monitors,
-                                       expected = Expected}),
+                                       expected = Expected,
+                                       reserved = maps:remove(SessionId, State#state.reserved)}),
     {reply, ok, State1};
-handle_call({session_count, SessionId}, _From, #state{sessions = Sessions} = State) ->
-    {reply, map_size(maps:remove(SessionId, Sessions)), State};
+handle_call({session_count, SessionId}, _From, State) ->
+    {reply, others(SessionId, State), State};
+handle_call({reserve, SessionId, Alone}, _From, #state{reserved = Reserved} = State) ->
+    case Alone andalso others(SessionId, State) > 0 of
+        true -> {reply, {error, busy}, State};
+        false -> {reply, ok, State#state{reserved = Reserved#{SessionId => true}}}
+    end;
+handle_call({gone, SessionId}, _From, State) ->
+    {reply, ok, refuse_session(SessionId, State)};
+handle_call({ended, SessionId, PeerClosed}, _From, State) ->
+    State1 = drop_session(SessionId, State),
+    Gone = case PeerClosed of true -> peer_closed; false -> ended end,
+    State2 = State1#state{gone = (State1#state.gone)#{SessionId => Gone}},
+    {reply, ok, start_closing(SessionId, PeerClosed, State2)};
+handle_call({open_uni_stream, SessionId}, _From, State) ->
+    do_open_local_uni(SessionId, State);
 handle_call({expect, SessionId}, _From, #state{expected = Expected} = State) ->
     {reply, ok, State#state{expected = Expected#{SessionId => []}}};
 handle_call({unregister, SessionId}, _From, State) ->
@@ -154,7 +211,7 @@ handle_call({client_connect, Host, Port, H3Opts}, _From, State) ->
     case quic_h3:connect(Host, Port, H3Opts) of
         {ok, H3Conn} = OK ->
             Ref = erlang:monitor(process, H3Conn),
-            {reply, OK, State#state{h3_conn = H3Conn, h3_monitor = Ref}};
+            {reply, OK, State#state{h3_conn = H3Conn, h3_monitor = Ref, role = client}};
         Err ->
             {reply, Err, State}
     end;
@@ -179,6 +236,8 @@ handle_info({'DOWN', Ref, process, _Pid, _Reason}, #state{monitors = Monitors} =
         error ->
             {noreply, State}
     end;
+handle_info({close_wait, SessionId}, State) ->
+    {noreply, finish_closing(SessionId, State)};
 handle_info(_Msg, State) ->
     {noreply, State}.
 
@@ -228,6 +287,29 @@ handle_quic_h3({quic_h3, _Conn, {data, StreamId, _Data, _Fin}} = Msg,
             Held = maps:get(StreamId, Expected),
             {noreply, State#state{expected = Expected#{StreamId => [Msg | Held]}}}
     end;
+%% A CONNECT stream whose session has ended. After the peer's
+%% WT_CLOSE_SESSION, more data on it is an error (http3-17 §6). Its end
+%% lets a closing client close the connection.
+handle_quic_h3({quic_h3, Conn, {data, StreamId, Data, Fin}}, #state{gone = Gone} = State)
+  when is_map_key(StreamId, Gone) ->
+    case {maps:get(StreamId, Gone), Data} of
+        {peer_closed, D} when D =/= <<>> ->
+            _ = cancel_stream(Conn, StreamId, ?H3_MESSAGE_ERROR);
+        _ ->
+            ok
+    end,
+    case Fin of
+        true -> {noreply, finish_closing(StreamId, State)};
+        false -> {noreply, State}
+    end;
+handle_quic_h3({quic_h3, _Conn, {stream_reset, StreamId, _Code}}, #state{gone = Gone} = State)
+  when is_map_key(StreamId, Gone) ->
+    {noreply, finish_closing(StreamId, State)};
+%% http3-17 §4.7: GOAWAY asks every session to shut down.
+handle_quic_h3({quic_h3, _Conn, {goaway, Id}} = Msg, #state{sessions = Sessions} = State) ->
+    maps:foreach(fun(_Sid, Pid) -> webtransport_session:goaway(Pid, Id) end, Sessions),
+    notify_passthrough(Msg, State),
+    {noreply, State};
 handle_quic_h3({quic_h3, _Conn, {session_ticket, Ticket}}, State) ->
     %% Connection-scoped 0-RTT resumption ticket. Surface it to the connecting
     %% process (the passthrough on the client side); it can store the ticket
@@ -260,6 +342,88 @@ ensure_h3_monitor(Conn, #state{h3_conn = undefined} = State) ->
     Ref = erlang:monitor(process, Conn),
     State#state{h3_conn = Conn, h3_monitor = Ref};
 ensure_h3_monitor(_Conn, State) ->
+    State.
+
+do_open_local_uni(SessionId, #state{h3_conn = H3Conn} = State) when H3Conn =/= undefined ->
+    case maps:find(SessionId, State#state.sessions) of
+        {ok, SessionPid} ->
+            QuicConn = quic_h3:get_quic_conn(H3Conn),
+            case quic:open_unidirectional_stream(QuicConn) of
+                {ok, StreamId} ->
+                    Header = wt_h3_capsule:encode_uni_stream_header(SessionId),
+                    case quic:send_data(QuicConn, StreamId, Header, false) of
+                        ok ->
+                            Local = (State#state.local_streams)#{StreamId => SessionPid},
+                            {reply, {ok, StreamId}, State#state{local_streams = Local}};
+                        {error, _} = Err ->
+                            {reply, Err, State}
+                    end;
+                {error, _} = Err ->
+                    {reply, Err, State}
+            end;
+        error ->
+            {reply, {error, unknown_session}, State}
+    end;
+do_open_local_uni(_SessionId, State) ->
+    {reply, {error, no_h3_conn}, State}.
+
+%% Sessions and slots on this connection other than `SessionId'.
+others(SessionId, #state{sessions = Sessions, reserved = Reserved}) ->
+    map_size(maps:remove(SessionId, maps:merge(Sessions, Reserved))).
+
+%% A refused CONNECT: no session will come, so held streams are reset.
+refuse_session(SessionId, #state{parked = Parked} = State) ->
+    State1 = State#state{reserved = maps:remove(SessionId, State#state.reserved),
+                         gone = (State#state.gone)#{SessionId => ended}},
+    case maps:take(SessionId, Parked) of
+        {Events, Parked1} ->
+            [reset_unknown_session_stream(Id, State1) || {opened, Id, _, _, _} <- Events],
+            forget_parked(Events, State1#state{parked = Parked1});
+        error ->
+            State1
+    end.
+
+forget_parked(Events, State) ->
+    Datagrams = length([E || E <- Events, element(1, E) =:= datagram]),
+    State#state{parked_datagrams = State#state.parked_datagrams - Datagrams,
+                parked_bytes = max(0, State#state.parked_bytes - parked_size(Events))}.
+
+parked_size(Events) ->
+    lists:sum([byte_size(D) || E <- Events,
+                               D <- case E of
+                                        {opened, _, _, Bin, _} -> [Bin];
+                                        {data, _, Bin, _} -> [Bin];
+                                        _ -> []
+                                    end]).
+
+%% Client: once its last session ended, close the connection when the
+%% server has closed that session's CONNECT stream, or after a short wait.
+%% The server closed it already when it sent WT_CLOSE_SESSION.
+start_closing(_SessionId, _PeerClosed, #state{role = server} = State) ->
+    State;
+start_closing(SessionId, true, State) ->
+    maybe_close_connection(State#state{closing = maps:remove(SessionId, State#state.closing)});
+start_closing(SessionId, false, #state{closing = Closing} = State) ->
+    Ref = erlang:send_after(?CLOSE_WAIT_MS, self(), {close_wait, SessionId}),
+    State#state{closing = Closing#{SessionId => Ref}}.
+
+finish_closing(SessionId, #state{closing = Closing} = State) ->
+    case maps:take(SessionId, Closing) of
+        {Ref, Closing1} ->
+            _ = erlang:cancel_timer(Ref),
+            maybe_close_connection(State#state{closing = Closing1});
+        error ->
+            State
+    end.
+
+maybe_close_connection(#state{role = client, h3_conn = H3Conn, closing = Closing} = State)
+  when H3Conn =/= undefined, map_size(Closing) =:= 0 ->
+    case map_size(State#state.sessions) + map_size(State#state.reserved) of
+        0 -> try quic_h3:close(H3Conn) catch _:_ -> ok end;
+        _ -> ok
+    end,
+    State;
+maybe_close_connection(State) ->
     State.
 
 do_open_local_bidi(SessionId, State) ->
@@ -355,7 +519,23 @@ cancel_parked(StreamId, #state{h3_conn = H3Conn}) ->
     cancel_stream(H3Conn, StreamId, ?WT_BUFFERED_STREAM_REJECTED).
 
 park(SessionId, Event, #state{parked = Parked} = State) ->
-    State#state{parked = Parked#{SessionId => [Event | maps:get(SessionId, Parked, [])]}}.
+    Size = parked_size([Event]),
+    case State#state.parked_bytes + Size > ?MAX_PARKED_BYTES of
+        true ->
+            %% Too much held: give up on this stream.
+            drop_parked_stream(SessionId, element(2, Event), State);
+        false ->
+            State#state{parked = Parked#{SessionId => [Event | maps:get(SessionId, Parked, [])]},
+                        parked_bytes = State#state.parked_bytes + Size}
+    end.
+
+drop_parked_stream(SessionId, StreamId, #state{parked = Parked} = State) ->
+    _ = cancel_parked(StreamId, State),
+    Events = maps:get(SessionId, Parked, []),
+    {Mine, Rest} = lists:partition(fun(E) -> element(2, E) =:= StreamId end, Events),
+    State1 = forget_parked(Mine, State),
+    State1#state{parked = Parked#{SessionId => Rest},
+                 stream_sessions = maps:remove(StreamId, State#state.stream_sessions)}.
 
 parked_streams(Parked) ->
     maps:fold(fun(_, Events, Acc) ->
@@ -365,10 +545,8 @@ parked_streams(Parked) ->
 replay_parked(SessionId, Session, #state{parked = Parked} = State) ->
     case maps:take(SessionId, Parked) of
         {Events, Parked1} ->
-            Datagrams = length([E || E <- Events, element(1, E) =:= datagram]),
             lists:foreach(fun(E) -> replay(Session, E) end, lists:reverse(Events)),
-            State#state{parked = Parked1,
-                        parked_datagrams = State#state.parked_datagrams - Datagrams};
+            forget_parked(Events, State#state{parked = Parked1});
         error ->
             State
     end.
@@ -427,11 +605,18 @@ route_stream_closed(StreamId, Reason, State0) ->
         error ->
             State0
     end,
-    State#state{
-        stream_sessions = maps:remove(StreamId, State#state.stream_sessions),
-        pending = maps:remove(StreamId, State#state.pending),
-        local_streams = maps:remove(StreamId, State#state.local_streams)
-    }.
+    %% A reset or STOP_SENDING ends one direction; the stream stays mapped
+    %% until it is fully closed, so later events still find their session.
+    case Reason of
+        normal ->
+            State#state{
+                stream_sessions = maps:remove(StreamId, State#state.stream_sessions),
+                pending = maps:remove(StreamId, State#state.pending),
+                local_streams = maps:remove(StreamId, State#state.local_streams)
+            };
+        _ ->
+            State#state{pending = maps:remove(StreamId, State#state.pending)}
+    end.
 
 route_datagram(QuarterOrStreamId, Payload, State) ->
     %% quic_h3 already strips the quarter-stream-id varint and gives us the
@@ -474,24 +659,13 @@ find_session_for_stream(StreamId, #state{local_streams = Local} = State) ->
 
 find_session_for_peer_stream(_StreamId, #state{sessions = Sessions}) when map_size(Sessions) =:= 0 ->
     error;
-find_session_for_peer_stream(StreamId, #state{sessions = Sessions}) ->
-    %% A native WT stream id is always > the session-id of the CONNECT
-    %% stream that opened it, and below the next session's CONNECT id.
-    %% With one session per H3 connection (the common case) this is a
-    %% single map lookup.
-    case maps:size(Sessions) of
-        1 ->
-            [{_, Session}] = maps:to_list(Sessions),
-            {ok, Session};
-        _ ->
-            %% Pick the session whose id is the largest one <= StreamId.
-            Candidates = [{Sid, Pid} || {Sid, Pid} <- maps:to_list(Sessions), Sid =< StreamId],
-            case Candidates of
-                [] -> error;
-                _ ->
-                    {_, Pid} = lists:last(lists:keysort(1, Candidates)),
-                    {ok, Pid}
-            end
+find_session_for_peer_stream(_StreamId, #state{sessions = Sessions}) ->
+    %% Every stream is mapped when its header is read or when we open it.
+    %% An unmapped one can only belong to the single session, if there is
+    %% one; with several, guessing would deliver to the wrong session.
+    case maps:to_list(Sessions) of
+        [{_, Session}] -> {ok, Session};
+        _ -> error
     end.
 
 drop_session(SessionId, #state{sessions = Sessions, monitors = Monitors} = State) ->
@@ -499,9 +673,10 @@ drop_session(SessionId, #state{sessions = Sessions, monitors = Monitors} = State
     Monitors1 = maps:filter(fun(_Ref, Sid) -> Sid =/= SessionId end, Monitors),
     StreamSessions = maps:filter(fun(_S, Sid) -> Sid =/= SessionId end,
                                  State#state.stream_sessions),
+    Gone = State#state.gone,
     State#state{sessions = Sessions1, monitors = Monitors1,
                 stream_sessions = StreamSessions,
-                gone = (State#state.gone)#{SessionId => true}}.
+                gone = Gone#{SessionId => maps:get(SessionId, Gone, ended)}}.
 
 %% draft-15 §3.3: QUIC error codes inside the reserved WebTransport range
 %% map back to app-level codes. Anything outside stays opaque for the

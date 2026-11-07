@@ -15,8 +15,14 @@ handle_stream(_StreamId, _Type, _Data, State) ->
 
 handle_stream_fin(_StreamId, _Type, <<"close">>, State) ->
     {ok, State, [{close_session, 5, <<"bye">>}]};
+handle_stream_fin(StreamId, bidi, <<"drain">>, State) ->
+    %% Finish our side of this stream, then drain: the session stops once
+    %% every stream is done.
+    {ok, State, [{send, StreamId, <<>>, fin}, drain_session]};
 handle_stream_fin(_StreamId, _Type, <<"drain">>, State) ->
     {ok, State, [drain_session]};
+handle_stream_fin(_StreamId, _Type, <<"stop">>, State) ->
+    {stop, normal, State};
 handle_stream_fin(StreamId, bidi, Data, State) ->
     {ok, State, [{send, StreamId, Data, fin}]};
 handle_stream_fin(_StreamId, _Type, _Data, State) ->
