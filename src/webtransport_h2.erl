@@ -24,7 +24,7 @@
 -export([open_stream/3]).
 -export([send/4, send_datagram/2]).
 -export([close_session/3, drain_session/1]).
--export([send_capsule/2]).
+-export([send_capsule/2, session_error/4]).
 -export([reset_stream/3, reset_stream/4, stop_sending/3]).
 -export([decode_capsule/1, decode_capsules/1]).
 
@@ -310,6 +310,21 @@ close_session(#state{h2_conn = H2Conn, connect_stream_id = ConnectStreamId}, Err
         Capsule ->
             h2:send_data(H2Conn, ConnectStreamId, wt_h2_capsule:encode(Capsule), true)
     end.
+
+%% @doc End the session after a protocol violation (http2-16 §3.4):
+%% WT_CLOSE_SESSION with `Code' and `Reason', then RST_STREAM on the CONNECT
+%% stream with the HTTP/2 error `H2Code'.
+-spec session_error(state(), non_neg_integer(), binary(), h2_error:error_code()) ->
+    ok | {error, term()}.
+session_error(#state{h2_conn = H2Conn, connect_stream_id = ConnectStreamId},
+              Code, Reason, H2Code) ->
+    Reason1 = case wt_h3_capsule:valid_close_reason(Reason) of
+        true -> Reason;
+        false -> <<>>
+    end,
+    Capsule = wt_h2_capsule:close_session(Code, Reason1),
+    _ = h2:send_data(H2Conn, ConnectStreamId, wt_h2_capsule:encode(Capsule), false),
+    h2:cancel(H2Conn, ConnectStreamId, H2Code).
 
 %% @doc Send a DRAIN_WEBTRANSPORT_SESSION capsule to signal graceful shutdown.
 -spec drain_session(state()) -> ok | {error, term()}.

@@ -464,6 +464,10 @@ apply_capsule_list([Capsule | Rest], StateData) ->
     end.
 
 %% Apply one capsule from the peer and return the gen_statem result.
+apply_capsule({reset_stream, StreamId, Code, ReliableSize}, StateData) ->
+    transition_result(handle_peer_reset(StreamId, Code, ReliableSize, StateData));
+apply_capsule({stop_sending, StreamId, Code}, StateData) ->
+    transition_result(handle_peer_stop_sending(StreamId, Code, StateData));
 apply_capsule(Capsule, StateData) ->
     case handle_incoming_capsule(Capsule, StateData) of
         {session_error, Code, Reason} ->
@@ -475,12 +479,106 @@ apply_capsule(Capsule, StateData) ->
             end
     end.
 
+transition_result({StateData, Transition}) ->
+    open_apply_transition(Transition, StateData).
+
+%% WT_RESET_STREAM (h2): the peer ended its send side. http2-16 §6.2: the
+%% stream must have a send side on the peer's end that is still open, and
+%% the Reliable Size must equal what we received; otherwise
+%% WT_STREAM_STATE_ERROR. Error codes are 32 bits (WT_ERROR otherwise).
+handle_peer_reset(_StreamId, Code, _ReliableSize, StateData) when Code > 16#ffffffff ->
+    fail_session(?WT_ERROR_GENERIC, <<"reset error code above 32 bits">>, StateData);
+handle_peer_reset(StreamId, Code, ReliableSize, #data{streams = Streams} = StateData) ->
+    case maps:find(StreamId, Streams) of
+        {ok, Stream} ->
+            case {has_peer_send_side(StreamId, StateData),
+                  webtransport_stream:bytes_received(Stream) =:= ReliableSize,
+                  webtransport_stream:receive_reset(Stream, Code)} of
+                {true, true, {ok, Stream1}} ->
+                    StateData1 = release_stream_credit(
+                                   StreamId, StateData#data{streams = Streams#{StreamId => Stream1}}),
+                    notify_stream_closed(StreamId, {reset, Code}, StateData1);
+                {_, false, _} ->
+                    fail_session(?WT_STREAM_STATE_ERROR, <<"reset reliable size mismatch">>,
+                                 StateData);
+                _ ->
+                    fail_session(?WT_STREAM_STATE_ERROR, <<"reset on a finished stream">>,
+                                 StateData)
+            end;
+        error ->
+            fail_session(?WT_STREAM_STATE_ERROR, <<"reset on an unknown stream">>, StateData)
+    end.
+
+%% WT_STOP_SENDING (h2): the peer no longer reads. http2-16 §6.3: answer
+%% with WT_RESET_STREAM if our send side is still open (RFC 9000 §3.5); a
+%% second STOP_SENDING, or one for a stream we never send on, is a
+%% WT_STREAM_STATE_ERROR.
+handle_peer_stop_sending(_StreamId, Code, StateData) when Code > 16#ffffffff ->
+    fail_session(?WT_ERROR_GENERIC, <<"stop_sending error code above 32 bits">>, StateData);
+handle_peer_stop_sending(StreamId, Code, #data{streams = Streams} = StateData) ->
+    case maps:find(StreamId, Streams) of
+        {ok, Stream} ->
+            case {has_local_send_side(StreamId, StateData),
+                  webtransport_stream:peer_stop_sending(Stream, Code)} of
+                {true, {ok, Stream1}} ->
+                    Stream2 = case webtransport_stream:local_fin(Stream1) orelse
+                                   webtransport_stream:reset_code(Stream1) =/= undefined of
+                        true ->
+                            Stream1;
+                        false ->
+                            transport_reset_stream(StreamId, {app, Code}, Stream1, StateData),
+                            webtransport_stream:reset(Stream1, Code)
+                    end,
+                    StateData1 = release_stream_credit(
+                                   StreamId, StateData#data{streams = Streams#{StreamId => Stream2}}),
+                    notify_stream_closed(StreamId, {stop_sending, Code}, StateData1);
+                _ ->
+                    fail_session(?WT_STREAM_STATE_ERROR, <<"invalid stop_sending">>, StateData)
+            end;
+        error ->
+            fail_session(?WT_STREAM_STATE_ERROR, <<"stop_sending on an unknown stream">>,
+                         StateData)
+    end.
+
+%% The peer sends on bidi streams and on uni streams it opened.
+has_peer_send_side(StreamId, StateData) ->
+    webtransport_stream:stream_type(StreamId) =:= bidi orelse
+        not is_local_stream(StreamId, StateData).
+
+%% We send on bidi streams and on uni streams we opened.
+has_local_send_side(StreamId, StateData) ->
+    webtransport_stream:stream_type(StreamId) =:= bidi orelse
+        is_local_stream(StreamId, StateData).
+
+notify_stream_closed(StreamId, Reason, #data{handler = Handler, handler_state = HState} = StateData) ->
+    case Handler:handle_stream_closed(StreamId, Reason, HState) of
+        {ok, HState1} -> {StateData#data{handler_state = HState1}, continue};
+        {stop, StopReason, HState1} -> {StateData#data{handler_state = HState1}, {stop, StopReason}}
+    end.
+
 %% A session error (a flow-control or stream-state violation by the peer):
 %% send CLOSE_SESSION and stop.
 stop_with_session_error(Code, Reason, StateData) ->
     {StateData1, Stop} = fail_session(Code, Reason, StateData),
     {stop, element(2, Stop), StateData1}.
 
+%% On h3 the session closes with WT_CLOSE_SESSION carrying `Code'. On h2
+%% (http2-16 §3.4) WT_CLOSE_SESSION is followed by RST_STREAM on the CONNECT
+%% stream. The HTTP/2 WebTransport error codes are not assigned yet, so
+%% stream-state and generic errors carry code 0 in WT_CLOSE_SESSION and
+%% PROTOCOL_ERROR on RST_STREAM, and flow-control errors carry
+%% WT_FLOW_CONTROL_ERROR and FLOW_CONTROL_ERROR.
+fail_session(Code, Reason, #data{transport = h2, transport_state = H2State} = StateData) ->
+    logger:info("webtransport: h2 session error ~p: ~s", [Code, Reason]),
+    {WireCode, H2Code} = case Code of
+        ?WT_FLOW_CONTROL_ERROR -> {?WT_FLOW_CONTROL_ERROR, flow_control_error};
+        _ -> {0, protocol_error}
+    end,
+    _ = transport_call(fun() ->
+            webtransport_h2:session_error(H2State, WireCode, Reason, H2Code)
+        end),
+    {StateData#data{close_info = {WireCode, Reason}},
+     {stop, {shutdown, {session_error, Code}}}};
 fail_session(Code, Reason, StateData) ->
     logger:info("webtransport: session error ~.16#: ~s", [Code, Reason]),
     do_close(Code, Reason, StateData),
@@ -842,13 +940,22 @@ do_close_stream(StreamId, #data{streams = Streams} = StateData) ->
             {error, unknown_stream}
     end.
 
+%% http2-16 §6.2, §6.3: no reset once our send side has ended, and at most
+%% one STOP_SENDING per stream.
 do_reset_stream(StreamId, ErrorCode, #data{streams = Streams} = StateData) ->
     case maps:find(StreamId, Streams) of
         {ok, Stream} ->
-            Stream1 = webtransport_stream:reset(Stream, ErrorCode),
-            transport_reset_stream(StreamId, {app, ErrorCode}, Stream, StateData),
-            {ok, release_stream_credit(
-                   StreamId, StateData#data{streams = Streams#{StreamId => Stream1}})};
+            case webtransport_stream:local_fin(Stream) orelse
+                 webtransport_stream:reset_code(Stream) =/= undefined orelse
+                 not has_local_send_side(StreamId, StateData) of
+                true ->
+                    {error, stream_send_side_closed};
+                false ->
+                    Stream1 = webtransport_stream:reset(Stream, ErrorCode),
+                    transport_reset_stream(StreamId, {app, ErrorCode}, Stream, StateData),
+                    {ok, release_stream_credit(
+                           StreamId, StateData#data{streams = Streams#{StreamId => Stream1}})}
+            end;
         error ->
             {error, unknown_stream}
     end.
@@ -856,9 +963,15 @@ do_reset_stream(StreamId, ErrorCode, #data{streams = Streams} = StateData) ->
 do_stop_sending(StreamId, ErrorCode, #data{streams = Streams} = StateData) ->
     case maps:find(StreamId, Streams) of
         {ok, Stream} ->
-            Stream1 = webtransport_stream:stop_sending(Stream, ErrorCode),
-            transport_stop_sending(StreamId, {app, ErrorCode}, StateData),
-            {ok, StateData#data{streams = Streams#{StreamId => Stream1}}};
+            case webtransport_stream:is_readable(Stream) andalso
+                 has_peer_send_side(StreamId, StateData) of
+                false ->
+                    {error, stream_receive_side_closed};
+                true ->
+                    Stream1 = webtransport_stream:stop_sending(Stream, ErrorCode),
+                    transport_stop_sending(StreamId, {app, ErrorCode}, StateData),
+                    {ok, StateData#data{streams = Streams#{StreamId => Stream1}}}
+            end;
         error ->
             {error, unknown_stream}
     end.
@@ -934,7 +1047,14 @@ handle_incoming_capsule({max_stream_data, StreamId, Limit},
                         #data{streams = Streams} = StateData) ->
     case maps:find(StreamId, Streams) of
         {ok, Stream} ->
+            ValidState = has_local_send_side(StreamId, StateData) andalso
+                webtransport_stream:peer_stop_sending_code(Stream) =:= undefined,
             case Limit =< webtransport_stream:send_window(Stream) of
+                _ when not ValidState ->
+                    %% http2-16 §6.6: not after the peer's STOP_SENDING, and
+                    %% only for a stream we send on.
+                    {session_error, ?WT_STREAM_STATE_ERROR,
+                     <<"max_stream_data on a stream we do not send on">>};
                 true ->
                     {session_error, ?WT_FLOW_CONTROL_ERROR,
                      <<"max_stream_data did not increase">>};
@@ -943,7 +1063,7 @@ handle_incoming_capsule({max_stream_data, StreamId, Limit},
                     flush_streams(StateData#data{streams = Streams#{StreamId => Stream1}})
             end;
         error ->
-            StateData
+            {session_error, ?WT_STREAM_STATE_ERROR, <<"max_stream_data on an unknown stream">>}
     end;
 handle_incoming_capsule({max_streams_bidi, Limit}, _StateData) when Limit > ?MAX_STREAMS ->
     {session_error, ?WT_FLOW_CONTROL_ERROR, <<"max_streams above 2^60">>};
@@ -967,9 +1087,25 @@ handle_incoming_capsule({stream_data_blocked, _StreamId, _Limit},
     %% http3-17 §5.4: no per-stream flow-control capsules on h3.
     {session_error, ?WT_FLOW_CONTROL_ERROR,
      <<"h3 prohibits per-stream flow control capsules">>};
-handle_incoming_capsule({stream_data_blocked, StreamId, Limit}, StateData) ->
-    logger:debug("peer stream_data_blocked stream=~p limit=~p", [StreamId, Limit]),
-    StateData;
+handle_incoming_capsule({stream_data_blocked, StreamId, Limit},
+                        #data{streams = Streams} = StateData) ->
+    %% http2-16 §6.9: only for a stream the peer is still sending on.
+    case maps:find(StreamId, Streams) of
+        {ok, Stream} ->
+            case has_peer_send_side(StreamId, StateData) andalso
+                 not webtransport_stream:remote_fin(Stream) andalso
+                 webtransport_stream:remote_reset_code(Stream) =:= undefined of
+                true ->
+                    logger:debug("peer stream_data_blocked stream=~p limit=~p",
+                                 [StreamId, Limit]),
+                    StateData;
+                false ->
+                    {session_error, ?WT_STREAM_STATE_ERROR,
+                     <<"stream_data_blocked on a finished stream">>}
+            end;
+        error ->
+            {session_error, ?WT_STREAM_STATE_ERROR, <<"stream_data_blocked on an unknown stream">>}
+    end;
 handle_incoming_capsule({streams_blocked_bidi, Limit}, _StateData) when Limit > ?MAX_STREAMS ->
     {session_error, ?WT_FLOW_CONTROL_ERROR, <<"streams_blocked above 2^60">>};
 handle_incoming_capsule({streams_blocked_uni, Limit}, _StateData) when Limit > ?MAX_STREAMS ->
@@ -980,34 +1116,6 @@ handle_incoming_capsule({streams_blocked_bidi, Limit}, StateData) ->
 handle_incoming_capsule({streams_blocked_uni, Limit}, StateData) ->
     logger:debug("peer streams_blocked_uni at ~p", [Limit]),
     StateData;
-handle_incoming_capsule({stop_sending, StreamId, ErrorCode},
-                        #data{streams = Streams} = StateData) ->
-    %% Peer asked us to stop sending on this stream: block our write side.
-    case maps:find(StreamId, Streams) of
-        {ok, Stream} ->
-            case webtransport_stream:peer_stop_sending(Stream, ErrorCode) of
-                {ok, Stream1} ->
-                    StateData#data{streams = Streams#{StreamId => Stream1}};
-                {error, duplicate} ->
-                    %% draft-14 §6.3: duplicate STOP_SENDING is a stream
-                    %% state error. Log and continue (h2 could emit
-                    %% WEBTRANSPORT_STREAM_STATE_ERROR, but we don't have
-                    %% a separate stream-error return path yet).
-                    logger:warning("duplicate stop_sending on stream ~p", [StreamId]),
-                    StateData
-            end;
-        error ->
-            StateData
-    end;
-handle_incoming_capsule({reset_stream, StreamId, ErrorCode},
-                        #data{streams = Streams} = StateData) ->
-    case maps:find(StreamId, Streams) of
-        {ok, Stream} ->
-            Stream1 = webtransport_stream:reset(Stream, ErrorCode),
-            StateData#data{streams = Streams#{StreamId => Stream1}};
-        error ->
-            StateData
-    end;
 handle_incoming_capsule({padding, _}, StateData) ->
     StateData;
 handle_incoming_capsule({close_session, ErrorCode, Reason}, #data{} = StateData) ->
@@ -1052,6 +1160,13 @@ handle_incoming_stream_data(StreamId, Data, Fin,
                     %% granted closes the session.
                     fail_session(?WT_FLOW_CONTROL_ERROR, <<"flow control limit exceeded">>,
                                  StateData);
+                {error, Reason} when StateData#data.transport =:= h2 ->
+                    %% http2-16 §6.4: WT_STREAM on a stream whose peer side
+                    %% already ended is a WT_STREAM_STATE_ERROR.
+                    fail_session(?WT_STREAM_STATE_ERROR,
+                                 iolist_to_binary(io_lib:format("data on stream ~p: ~p",
+                                                                [StreamId, Reason])),
+                                 StateData);
                 {error, Reason} ->
                     logger:warning("webtransport: dropping ~p bytes on stream ~p: ~p",
                                    [byte_size(Data), StreamId, Reason]),
@@ -1067,6 +1182,12 @@ receive_into(_Stream, _Data, SessRecv, #data{flow_control = true, local_max_data
   when SessRecv > Max ->
     {error, flow_control};
 receive_into(Stream, Data, _SessRecv, #data{flow_control = FlowControl}) ->
+    case webtransport_stream:remote_reset_code(Stream) of
+        undefined -> receive_data(Stream, Data, FlowControl);
+        _ -> {error, stream_reset}
+    end.
+
+receive_data(Stream, Data, FlowControl) ->
     case webtransport_stream:receive_data(Stream, Data) of
         {error, flow_control_error} when FlowControl -> {error, flow_control};
         Other -> Other
@@ -1142,16 +1263,28 @@ handle_remote_stream_opened(StreamId, Type, #data{streams = Streams} = StateData
     case maps:is_key(StreamId, Streams) orelse is_retired(StreamId, StateData) of
         true ->
             {StateData, continue};
+        false when StateData#data.transport =:= h2 ->
+            case is_local_stream(StreamId, StateData) of
+                true ->
+                    %% http2-16 §6.4: data on a stream id of ours that we
+                    %% never opened.
+                    fail_session(?WT_STREAM_STATE_ERROR, <<"data on a stream we never opened">>,
+                                 StateData);
+                false ->
+                    open_peer_stream(StreamId, Type, StateData)
+            end;
         false ->
-            case peer_stream_allowed(StreamId, Type, StateData) of
-                {ok, Opened} ->
-                    Stream = new_stream(StreamId, peer, Type, StateData),
-                    StateData1 = set_peer_opened(Type, Opened, StateData),
-                    {StateData1#data{streams = Streams#{StreamId => Stream}}, continue};
-                exceeded ->
-                    fail_session(?WT_FLOW_CONTROL_ERROR, <<"stream limit exceeded">>,
-                                 StateData)
-            end
+            open_peer_stream(StreamId, Type, StateData)
+    end.
+
+open_peer_stream(StreamId, Type, #data{streams = Streams} = StateData) ->
+    case peer_stream_allowed(StreamId, Type, StateData) of
+        {ok, Opened} ->
+            Stream = new_stream(StreamId, peer, Type, StateData),
+            StateData1 = set_peer_opened(Type, Opened, StateData),
+            {StateData1#data{streams = Streams#{StreamId => Stream}}, continue};
+        exceeded ->
+            fail_session(?WT_FLOW_CONTROL_ERROR, <<"stream limit exceeded">>, StateData)
     end.
 
 %% How many peer streams of this kind exist once `StreamId' is open, or
@@ -1520,18 +1653,36 @@ receive_limit_test_() ->
                                             Data#data{flow_control = false}))
     ].
 
-handle_incoming_capsule_stop_sending_test() ->
-    Stream = webtransport_stream:new(4, bidi, 1024),
-    Data = #data{streams = #{4 => Stream}, transport = h2,
-                 remote_max_data = 0, remote_max_streams_bidi = 0,
-                 remote_max_streams_uni = 0, local_max_data = 0,
-                 local_max_streams_bidi = 0, local_max_streams_uni = 0,
-                 is_server = false, next_bidi_id = 0, next_uni_id = 2,
-                 request = #{}, handler = undefined, handler_state = undefined},
-    Data1 = handle_incoming_capsule({stop_sending, 4, 42}, Data),
-    #{4 := Stream1} = Data1#data.streams,
-    ?assertNot(webtransport_stream:is_writable(Stream1)),
-    ok.
+%% http2-16 §6.6, §6.9: flow-control capsules on a stream in the wrong
+%% state are WT_STREAM_STATE_ERROR.
+stream_state_capsule_test_() ->
+    Peer = webtransport_stream:new(0, bidi, 100, 100),
+    {ok, PeerFin} = webtransport_stream:receive_fin(Peer),
+    {ok, PeerStopped} = webtransport_stream:peer_stop_sending(Peer, 1),
+    Data = (test_data())#data{streams = #{0 => Peer, 4 => PeerFin, 8 => PeerStopped}},
+    [
+        ?_assertMatch({session_error, ?WT_STREAM_STATE_ERROR, _},
+                      handle_incoming_capsule({max_stream_data, 12, 500}, Data)),
+        ?_assertMatch({session_error, ?WT_STREAM_STATE_ERROR, _},
+                      handle_incoming_capsule({max_stream_data, 8, 500}, Data)),
+        ?_assertMatch(#data{}, handle_incoming_capsule({stream_data_blocked, 0, 100}, Data)),
+        ?_assertMatch({session_error, ?WT_STREAM_STATE_ERROR, _},
+                      handle_incoming_capsule({stream_data_blocked, 4, 100}, Data)),
+        ?_assertMatch({session_error, ?WT_STREAM_STATE_ERROR, _},
+                      handle_incoming_capsule({stream_data_blocked, 12, 100}, Data))
+    ].
+
+%% Which side of a stream sends: both on bidi, the opener on uni.
+send_sides_test_() ->
+    Server = test_data(),
+    [
+        ?_assert(has_peer_send_side(2, Server)),        %% client uni
+        ?_assertNot(has_local_send_side(2, Server)),
+        ?_assert(has_local_send_side(3, Server)),       %% server uni
+        ?_assertNot(has_peer_send_side(3, Server)),
+        ?_assert(has_peer_send_side(0, Server)),
+        ?_assert(has_local_send_side(0, Server))
+    ].
 
 augment_reason_test_() ->
     [

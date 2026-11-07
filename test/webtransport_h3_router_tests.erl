@@ -80,8 +80,17 @@ reset_event_reported_test() ->
     Router ! {quic_h3, self(), {stream_type_data, uni, 14, <<0>>, false}},
     ?assertEqual({stream_opened, 14, uni}, recv(200)),
 
-    Router ! {quic_h3, self(), {stream_type_reset, uni, 14, 42}},
+    %% An application code arrives mapped into the WT_APPLICATION_ERROR
+    %% range and is reported unmapped.
+    Router ! {quic_h3, self(), {stream_type_reset, uni, 14, wt_error:to_quic(42)}},
     ?assertEqual({stream_closed, 14, {reset, 42}}, recv(200)),
+
+    %% http3-17 §4.4: a code outside that range carries no application code.
+    Router ! {quic_h3, self(), {stream_type_open, uni, 18, 16#54}},
+    Router ! {quic_h3, self(), {stream_type_data, uni, 18, <<0>>, false}},
+    ?assertEqual({stream_opened, 18, uni}, recv(200)),
+    Router ! {quic_h3, self(), {stream_type_reset, uni, 18, 16#10c}},
+    ?assertEqual({stream_closed, 18, {reset, undefined}}, recv(200)),
 
     Session ! stop,
     gen_server:stop(Router).

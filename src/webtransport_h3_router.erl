@@ -383,8 +383,10 @@ drop_session(SessionId, #state{sessions = Sessions, monitors = Monitors} = State
 %% draft-15 §3.3: QUIC error codes inside the reserved WebTransport range
 %% map back to app-level codes. Anything outside stays opaque for the
 %% handler (e.g. native HTTP/3 or QUIC-level errors).
+%% http3-17 §4.4: a reset code outside the WT_APPLICATION_ERROR range
+%% carries no application code; report it as `undefined'.
 map_from_quic(ErrorCode) ->
     case wt_error:from_quic(ErrorCode) of
         {ok, App} -> App;
-        error -> ErrorCode
+        error -> undefined
     end.

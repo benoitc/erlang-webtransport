@@ -1242,10 +1242,6 @@ dispatch_h2_capsule(Session, {wt_stream_fin, WtStreamId, Data}) ->
     webtransport_session:handle_stream_data(Session, WtStreamId, Data, true);
 dispatch_h2_capsule(Session, {datagram, Data}) ->
     webtransport_session:handle_datagram_data(Session, Data);
-dispatch_h2_capsule(Session, {reset_stream, WtStreamId, ErrorCode, _ReliableSize}) ->
-    webtransport_session:handle_stream_closed(Session, WtStreamId, {reset, ErrorCode});
-dispatch_h2_capsule(Session, {stop_sending, WtStreamId, ErrorCode}) ->
-    webtransport_session:handle_stream_closed(Session, WtStreamId, {stop_sending, ErrorCode});
 dispatch_h2_capsule(Session, Capsule) ->
     webtransport_session:handle_capsule(Session, Capsule).
 

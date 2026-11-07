@@ -445,42 +445,66 @@ stream_limit_test(Config) ->
 %% Error Handling Tests
 %% ============================================================================
 
+%% After a reset the session stays up: on h2 the WT_RESET_STREAM carries a
+%% Reliable Size equal to what we sent (http2-16 §6.2), so the server
+%% accepts it. A second reset of the same send side is refused locally.
 reset_stream_test(Config) ->
     Port = proplists:get_value(port, Config),
-
     {ok, Session} = webtransport:connect("localhost", Port, <<"/test">>, #{
         transport => proplists:get_value(transport, Config),
         verify => verify_none
     }),
-
     {ok, StreamId} = webtransport:open_stream(Session, bidi),
-
-    %% Send some data
     ok = webtransport:send(Session, StreamId, <<"data">>, nofin),
-
-    %% Reset the stream
     ok = webtransport:reset_stream(Session, StreamId, 1),
-
-    timer:sleep(200),
-
+    ?assertEqual({error, stream_send_side_closed},
+                 webtransport:reset_stream(Session, StreamId, 1)),
+    assert_session_usable(Session),
     webtransport:close_session(Session).
 
+%% STOP_SENDING makes the peer reset its send side with our code
+%% (http2-16 §6.3, RFC 9000 §3.5). A second STOP_SENDING for the same
+%% stream is refused locally.
 stop_sending_test(Config) ->
     Port = proplists:get_value(port, Config),
-
     {ok, Session} = webtransport:connect("localhost", Port, <<"/test">>, #{
         transport => proplists:get_value(transport, Config),
         verify => verify_none
     }),
-
     {ok, StreamId} = webtransport:open_stream(Session, bidi),
-
-    %% Request peer to stop sending
-    ok = webtransport:stop_sending(Session, StreamId, 1),
-
-    timer:sleep(200),
-
+    ok = webtransport:send(Session, StreamId, <<"hello">>, nofin),
+    <<"hello">> = collect_until(Session, StreamId, 5),
+    ok = webtransport:stop_sending(Session, StreamId, 7),
+    receive
+        {webtransport, Session, {stream_closed, StreamId, {reset, Code}}} ->
+            ?assertEqual(7, Code)
+    after 5000 ->
+        error(no_reset_after_stop_sending)
+    end,
+    ?assertEqual({error, stream_receive_side_closed},
+                 webtransport:stop_sending(Session, StreamId, 7)),
+    assert_session_usable(Session),
     webtransport:close_session(Session).
+
+%% A fresh stream still echoes.
+assert_session_usable(Session) ->
+    {ok, S} = webtransport:open_stream(Session, bidi),
+    ok = webtransport:send(Session, S, <<"ping">>, fin),
+    Echoed = collect_stream_echo(Session, S, <<>>, 5000),
+    ?assertEqual(<<"ping">>, binary:part(Echoed, byte_size(Echoed) - 4, 4)).
+
+collect_until(Session, StreamId, Size) ->
+    collect_until(Session, StreamId, Size, <<>>).
+
+collect_until(_Session, _StreamId, Size, Acc) when byte_size(Acc) >= Size ->
+    Acc;
+collect_until(Session, StreamId, Size, Acc) ->
+    receive
+        {webtransport, Session, {stream, StreamId, _, Data}} ->
+            collect_until(Session, StreamId, Size, <<Acc/binary, Data/binary>>)
+    after 5000 ->
+        error({no_data, Acc})
+    end.
 
 %% ============================================================================
 %% Session Management Tests

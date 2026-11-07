@@ -81,6 +81,12 @@
 -define(H3_REQUEST_REJECTED,  16#10b).
 -define(H3_MESSAGE_ERROR,     16#10e).
 
+%% HTTP/2 session error kinds (http2-16 §3.4). Their HTTP/2 error codes are
+%% not assigned yet (0xTBD), so these are internal names only; on the wire a
+%% session error is WT_CLOSE_SESSION followed by RST_STREAM(PROTOCOL_ERROR).
+-define(WT_ERROR_GENERIC, wt_error).
+-define(WT_STREAM_STATE_ERROR, wt_stream_state_error).
+
 %% Application error code base
 -define(WT_APP_ERROR_FIRST, 16#52e4a40fa8db).
 
