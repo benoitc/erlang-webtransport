@@ -9,14 +9,46 @@ close_session_reason_length_test_() ->
     TooLong = <<Boundary/binary, "!">>,
     [
         ?_assertMatch({close_session, 1, _}, wt_h2_capsule:close_session(1, Boundary)),
-        ?_assertEqual({error, reason_too_long}, wt_h2_capsule:close_session(1, TooLong))
+        ?_assertEqual({error, bad_close_reason}, wt_h2_capsule:close_session(1, TooLong)),
+        ?_assertEqual({error, bad_close_reason}, wt_h2_capsule:close_session(1, <<255>>))
     ].
 
 close_session_reason_decode_too_long_test() ->
-    %% Manually craft a close_session capsule with 2048 bytes of reason.
-    Payload = <<(h2_varint:encode(1))/binary, (binary:copy(<<"y">>, 2048))/binary>>,
+    Payload = <<1:32, (binary:copy(<<"y">>, 2048))/binary>>,
     Encoded = h2_capsule:encode(?WT_CLOSE_SESSION, Payload),
-    ?assertEqual({error, reason_too_long}, wt_h2_capsule:decode(Encoded)).
+    ?assertEqual({error, bad_close_reason}, wt_h2_capsule:decode(Encoded)).
+
+%% http2-16 §6.4: 0x190B4D3C carries data, 0x190B4D3B ends the stream.
+wt_stream_fin_codepoints_test_() ->
+    Data = h2_capsule:encode(16#190B4D3C, <<4, "x">>),
+    Fin = h2_capsule:encode(16#190B4D3B, <<4, "x">>),
+    [
+        ?_assertEqual(Data, wt_h2_capsule:encode(wt_h2_capsule:wt_stream(4, <<"x">>))),
+        ?_assertEqual(Fin, wt_h2_capsule:encode(wt_h2_capsule:wt_stream_fin(4, <<"x">>))),
+        ?_assertEqual({ok, {wt_stream, 4, <<"x">>}, <<>>}, wt_h2_capsule:decode(Data)),
+        ?_assertEqual({ok, {wt_stream_fin, 4, <<"x">>}, <<>>}, wt_h2_capsule:decode(Fin))
+    ].
+
+%% http2-16 §6.12, §6.13: close and drain are the h3 capsules, with a
+%% 32-bit error code.
+close_and_drain_codepoints_test_() ->
+    Close = h2_capsule:encode(16#2843, <<0, 0, 0, 5, "bye">>),
+    [
+        ?_assertEqual(Close, wt_h2_capsule:encode(wt_h2_capsule:close_session(5, <<"bye">>))),
+        ?_assertEqual({ok, {close_session, 5, <<"bye">>}, <<>>}, wt_h2_capsule:decode(Close)),
+        ?_assertEqual({ok, {drain_session}, <<>>},
+                      wt_h2_capsule:decode(h2_capsule:encode(16#78ae, <<>>)))
+    ].
+
+%% http2-16 §6.2: WT_RESET_STREAM carries a Reliable Size.
+reset_stream_reliable_size_test_() ->
+    Wire = h2_capsule:encode(16#190B4D39, <<4, 7, 16#40, 200>>),
+    [
+        ?_assertEqual(Wire, wt_h2_capsule:encode(wt_h2_capsule:reset_stream(4, 7, 200))),
+        ?_assertEqual({ok, {reset_stream, 4, 7, 200}, <<>>}, wt_h2_capsule:decode(Wire)),
+        ?_assertEqual({error, extra_data},
+                      wt_h2_capsule:decode(h2_capsule:encode(16#190B4D39, <<4, 7, 0, 1>>)))
+    ].
 
 roundtrip_test_() ->
     Capsules = [
@@ -24,6 +56,7 @@ roundtrip_test_() ->
         wt_h2_capsule:wt_stream(1, <<"hello">>),
         wt_h2_capsule:wt_stream_fin(2, <<"world">>),
         wt_h2_capsule:reset_stream(3, 0),
+        wt_h2_capsule:reset_stream(3, 9, 4096),
         wt_h2_capsule:stop_sending(4, 1),
         wt_h2_capsule:max_data(1000000),
         wt_h2_capsule:max_stream_data(5, 500000),

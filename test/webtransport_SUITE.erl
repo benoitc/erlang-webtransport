@@ -765,8 +765,8 @@ wait_for_pushed_bidi(Session, ClientStreamId, Acc, Timeout) ->
         error({no_pushed_bidi, Acc})
     end.
 
-%% Reason strings over 1024 bytes must be refused at the public API,
-%% matching draft-14 §4.6 and draft-15 §5.
+%% Bad close arguments must be refused at the public API (http3-17 §6,
+%% http2-16 §6.12).
 close_session_reason_too_long_test(Config) ->
     Port = proplists:get_value(port, Config),
     {ok, Session} = webtransport:connect("localhost", Port, <<"/test">>, #{
@@ -776,6 +776,11 @@ close_session_reason_too_long_test(Config) ->
     Too = binary:copy(<<"x">>, 1025),
     ?assertEqual({error, reason_too_long},
                  webtransport:close_session(Session, 1, Too)),
+    %% http3-17 §6: the reason must be UTF-8 and the code 32 bits.
+    ?assertEqual({error, invalid_reason},
+                 webtransport:close_session(Session, 1, <<16#ff>>)),
+    ?assertEqual({error, invalid_error_code},
+                 webtransport:close_session(Session, 1 bsl 32, <<>>)),
     ?assert(is_process_alive(Session)),
     ok = webtransport:close_session(Session).
 

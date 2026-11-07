@@ -9,6 +9,7 @@
 -module(wt_h3).
 
 -export([default_settings/0, default_settings/1]).
+-export([server_settings/2, client_settings/2, peer_setting/2]).
 -export([request_headers/2, request_headers/3, request_headers/4]).
 -export([request_session/4, request_session/5]).
 -export([response_status/1, is_success_response/1]).
@@ -34,28 +35,103 @@
 default_settings() ->
     default_settings(latest).
 
-%% @doc Return default H3 settings for the given compatibility mode.
+%% @doc Return default server H3 settings for the given compatibility mode.
 -spec default_settings(compat_mode()) -> map().
-default_settings(latest) ->
-    %% draft-15 §3.1: servers advertise wt_enabled plus initial
-    %% flow-control windows. h3_datagram (0x33) is emitted by quic_h3
-    %% when `h3_datagram_enabled => true' -- don't duplicate it here
-    %% (duplicate setting ids are an H3_SETTINGS_ERROR per
-    %% RFC 9114 §7.2.4.1).
-    #{
+default_settings(Mode) ->
+    server_settings(Mode, #{}).
+
+%% @doc H3 SETTINGS a WebTransport server advertises.
+%%
+%% `latest' advertises SETTINGS_WT_ENABLED under both the http3-17 and the
+%% http3-15 codepoints: the two drafts share a wire format and the client's
+%% own SETTINGS select the version (http3-17 §7.1). Keys are the integer
+%% codepoints so the result does not depend on which value quic maps the
+%% `wt_enabled' atom to. h3_datagram (0x33) is emitted by quic_h3 when
+%% `h3_datagram_enabled => true'; it is not repeated here, since a duplicate
+%% id is an H3_SETTINGS_ERROR (RFC 9114 §7.2.4.1).
+%%
+%% `Opts' may carry `max_data', `max_streams_bidi' and `max_streams_uni',
+%% the initial limits we grant the peer.
+-spec server_settings(compat_mode(), map()) -> map().
+server_settings(latest, Opts) ->
+    (flow_control_settings(Opts))#{
         enable_connect_protocol      => 1,
-        wt_enabled                   => 1,
-        wt_initial_max_data          => ?DEFAULT_MAX_DATA,
-        wt_initial_max_streams_bidi  => ?DEFAULT_MAX_STREAMS_BIDI,
-        wt_initial_max_streams_uni   => ?DEFAULT_MAX_STREAMS_UNI
+        ?SETTINGS_WT_ENABLED_H3      => 1,
+        ?SETTINGS_WT_ENABLED_H3_D15  => 1
     };
-default_settings(legacy_browser_compat) ->
+server_settings(legacy_browser_compat, _Opts) ->
     %% draft-02 (Chrome / Firefox / quic-go v0.9). Never mix these
     %% with the latest-spec settings in one handshake.
     #{
         enable_connect_protocol              => 1,
         ?SETTINGS_ENABLE_WEBTRANSPORT_DRAFT02 => 1
     }.
+
+%% @doc H3 SETTINGS a WebTransport client sends.
+%%
+%% http3-17 §7.1: while the spec is a draft, a client sends
+%% SETTINGS_WT_ENABLED for the draft version it speaks, so the server can
+%% pick it. We speak http3-17 only. The initial flow-control limits declare
+%% that we use flow control (http3-17 §5.1).
+-spec client_settings(compat_mode(), map()) -> map().
+client_settings(latest, Opts) ->
+    %% quic validates an outgoing extended CONNECT against our own
+    %% enable_connect_protocol, so the client sends it too.
+    (flow_control_settings(Opts))#{
+        enable_connect_protocol => 1,
+        ?SETTINGS_WT_ENABLED_H3 => 1
+    };
+client_settings(legacy_browser_compat, _Opts) ->
+    server_settings(legacy_browser_compat, #{}).
+
+flow_control_settings(Opts) ->
+    #{
+        wt_initial_max_data         => maps:get(max_data, Opts, ?DEFAULT_MAX_DATA),
+        wt_initial_max_streams_bidi => maps:get(max_streams_bidi, Opts,
+                                                ?DEFAULT_MAX_STREAMS_BIDI),
+        wt_initial_max_streams_uni  => maps:get(max_streams_uni, Opts,
+                                                ?DEFAULT_MAX_STREAMS_UNI)
+    }.
+
+%% @doc Look up a setting in a peer SETTINGS map by its codepoint.
+%%
+%% quic surfaces settings it knows as atoms and the rest as integer ids, and
+%% which WebTransport codepoints it knows depends on its release. This finds
+%% the value either way.
+-spec peer_setting(map(), non_neg_integer()) -> non_neg_integer() | undefined.
+peer_setting(Settings, Id) ->
+    case maps:find(Id, Settings) of
+        {ok, V} -> V;
+        error -> peer_setting_by_atom(Settings, Id)
+    end.
+
+peer_setting_by_atom(Settings, Id) ->
+    Matches = [V || {K, V} <- maps:to_list(Settings),
+                    is_atom(K), setting_id(K) =:= Id],
+    case Matches of
+        [V | _] -> V;
+        [] -> undefined
+    end.
+
+%% Codepoint of a quic setting atom. Uses quic's own table when it exports
+%% one (from the release that maps `wt_enabled' to http3-17), else the
+%% values quic 2.2.1 uses. The call is dynamic because 2.2.1 does not
+%% export the function.
+setting_id(Key) ->
+    Mod = quic_h3_frame,
+    case erlang:function_exported(Mod, setting_to_id, 1) of
+        true -> Mod:setting_to_id(Key);
+        false -> local_setting_id(Key)
+    end.
+
+local_setting_id(wt_enabled)                  -> ?SETTINGS_WT_ENABLED_H3_D15;
+local_setting_id(wt_enabled_draft15)          -> ?SETTINGS_WT_ENABLED_H3_D15;
+local_setting_id(wt_initial_max_data)         -> 16#2b61;
+local_setting_id(wt_initial_max_streams_uni)  -> 16#2b64;
+local_setting_id(wt_initial_max_streams_bidi) -> 16#2b65;
+local_setting_id(h3_datagram)                 -> 16#33;
+local_setting_id(enable_connect_protocol)     -> 16#08;
+local_setting_id(_)                           -> undefined.
 
 %% ============================================================================
 %% Session Establishment
@@ -182,10 +258,13 @@ validate_required_settings(PeerSettings, CompatMode) ->
     end.
 
 check_wt_setting(PeerSettings, latest) ->
-    %% draft-15 §3.1: peer MUST advertise wt_enabled = 1.
-    case setting_enabled(PeerSettings, wt_enabled) of
-        true -> ok;
-        false -> {error, wt_not_enabled}
+    %% http3-17 §3.1: the server MUST advertise SETTINGS_WT_ENABLED = 1 under
+    %% the codepoint of the draft we speak; a value above 1 is an
+    %% H3_SETTINGS_ERROR.
+    case peer_setting(PeerSettings, ?SETTINGS_WT_ENABLED_H3) of
+        1 -> ok;
+        V when is_integer(V), V > 1 -> {error, {settings_error, wt_enabled}};
+        _ -> {error, wt_not_enabled}
     end;
 check_wt_setting(PeerSettings, legacy_browser_compat) ->
     case maps:find(?SETTINGS_ENABLE_WEBTRANSPORT_DRAFT02, PeerSettings) of
@@ -283,10 +362,32 @@ request_headers_legacy_test() ->
 default_settings_latest_disjoint_from_legacy_test() ->
     Latest = default_settings(latest),
     Legacy = default_settings(legacy_browser_compat),
-    ?assert(maps:is_key(wt_enabled, Latest)),
+    ?assertEqual(1, maps:get(?SETTINGS_WT_ENABLED_H3, Latest)),
+    ?assertNot(maps:is_key(wt_enabled, Latest)),
     ?assertNot(maps:is_key(?SETTINGS_ENABLE_WEBTRANSPORT_DRAFT02, Latest)),
     ?assert(maps:is_key(?SETTINGS_ENABLE_WEBTRANSPORT_DRAFT02, Legacy)),
-    ?assertNot(maps:is_key(wt_enabled, Legacy)).
+    ?assertNot(maps:is_key(?SETTINGS_WT_ENABLED_H3, Legacy)),
+    ?assertNot(maps:is_key(?SETTINGS_WT_ENABLED_H3_D15, Legacy)).
+
+%% http3-17 §7.1: the server advertises both draft codepoints, the client
+%% only the one it speaks.
+wt_enabled_codepoints_test_() ->
+    Server = server_settings(latest, #{}),
+    Client = client_settings(latest, #{max_data => 10}),
+    [
+        ?_assertEqual(1, maps:get(16#20b8933b, Server)),
+        ?_assertEqual(1, maps:get(16#2c7cf000, Server)),
+        ?_assertEqual(1, maps:get(16#20b8933b, Client)),
+        ?_assertNot(maps:is_key(16#2c7cf000, Client)),
+        ?_assertEqual(10, maps:get(wt_initial_max_data, Client))
+    ].
+
+peer_setting_test_() ->
+    [
+        ?_assertEqual(1, peer_setting(#{16#20b8933b => 1}, 16#20b8933b)),
+        ?_assertEqual(1, peer_setting(#{wt_initial_max_data => 1}, 16#2b61)),
+        ?_assertEqual(undefined, peer_setting(#{}, 16#20b8933b))
+    ].
 
 detect_compat_mode_latest_test() ->
     ?assertEqual({ok, latest},

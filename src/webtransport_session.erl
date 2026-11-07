@@ -290,6 +290,9 @@ open({call, From}, get_info, StateData) ->
 open({call, From}, early_data_accepted, StateData) ->
     {keep_state, StateData, [{reply, From, do_early_data_accepted(StateData)}]};
 
+open(cast, {capsule, {datagram, Data}}, StateData) ->
+    {StateData1, Transition} = handle_incoming_datagram(Data, StateData),
+    open_apply_transition(Transition, StateData1);
 open(cast, {capsule, Capsule}, StateData) ->
     case handle_incoming_capsule(Capsule, StateData) of
         {session_error, Code, Reason} ->
@@ -344,7 +347,7 @@ open(info, {quic_h3, _Conn, {data, StreamId, Data, Fin}},
                     %% treat as session close.
                     case {Fin, Result} of
                         {true, {keep_state, SD}} ->
-                            reset_all_streams(?WT_SESSION_GONE, SD),
+                            reset_all_streams(SD),
                             {stop, normal, SD#data{close_info = {0, <<"peer closed CONNECT">>}}};
                         _ ->
                             Result
@@ -379,6 +382,12 @@ open(info, Msg, #data{handler = Handler, handler_state = HState} = StateData) ->
 
 apply_capsule_list([], StateData) ->
     {keep_state, StateData};
+apply_capsule_list([{datagram, Data} | Rest], StateData) ->
+    %% RFC 9297 DATAGRAM capsule on the CONNECT stream.
+    case handle_incoming_datagram(Data, StateData) of
+        {StateData1, continue} -> apply_capsule_list(Rest, StateData1);
+        {StateData1, Transition} -> open_apply_transition(Transition, StateData1)
+    end;
 apply_capsule_list([Capsule | Rest], StateData) ->
     case handle_incoming_capsule(Capsule, StateData) of
         {session_error, Code, Reason} ->
@@ -408,7 +417,7 @@ open_apply_transition({stop, Reason}, StateData) ->
 %% draft-14 §4.7 / draft-15 §5.1: DRAIN_SESSION moves us to draining.
 apply_capsule_transition({close_session, _Code, _Reason}, StateData) ->
     %% Reset all live streams with WT_SESSION_GONE before stopping.
-    reset_all_streams(?WT_SESSION_GONE, StateData),
+    reset_all_streams(StateData),
     {stop, normal, StateData};
 apply_capsule_transition({drain_session}, StateData) ->
     {next_state, draining, StateData};
@@ -729,7 +738,7 @@ do_reset_stream(StreamId, ErrorCode, #data{streams = Streams} = StateData) ->
     case maps:find(StreamId, Streams) of
         {ok, Stream} ->
             Stream1 = webtransport_stream:reset(Stream, ErrorCode),
-            transport_reset_stream(StreamId, ErrorCode, StateData),
+            transport_reset_stream(StreamId, {app, ErrorCode}, Stream, StateData),
             {ok, StateData#data{streams = Streams#{StreamId => Stream1}}};
         error ->
             {error, unknown_stream}
@@ -739,7 +748,7 @@ do_stop_sending(StreamId, ErrorCode, #data{streams = Streams} = StateData) ->
     case maps:find(StreamId, Streams) of
         {ok, Stream} ->
             Stream1 = webtransport_stream:stop_sending(Stream, ErrorCode),
-            transport_stop_sending(StreamId, ErrorCode, StateData),
+            transport_stop_sending(StreamId, {app, ErrorCode}, StateData),
             {ok, StateData#data{streams = Streams#{StreamId => Stream1}}};
         error ->
             {error, unknown_stream}
@@ -754,7 +763,7 @@ do_close(ErrorCode, Reason, StateData) ->
     %% Reset all live streams with WT_SESSION_GONE, then send CLOSE_SESSION.
     %% The transport may already be gone (connection lost, peer closed
     %% first); closing is then a no-op, not a crash of the session.
-    reset_all_streams(?WT_SESSION_GONE, StateData),
+    reset_all_streams(StateData),
     transport_call(fun() ->
         case StateData of
             #data{transport = h2, transport_state = H2State} ->
@@ -764,12 +773,15 @@ do_close(ErrorCode, Reason, StateData) ->
         end
     end).
 
-reset_all_streams(ErrorCode, #data{streams = Streams} = StateData) ->
+%% http3-17 §6: on termination every stream of the session is reset with
+%% WT_SESSION_GONE, a protocol code sent as is.
+reset_all_streams(#data{streams = Streams} = StateData) ->
     maps:foreach(fun(StreamId, Stream) ->
         case webtransport_stream:is_open(Stream) of
             true ->
                 transport_call(fun() ->
-                    transport_reset_stream(StreamId, ErrorCode, StateData)
+                    transport_reset_stream(StreamId, {wt, ?WT_SESSION_GONE},
+                                           Stream, StateData)
                 end);
             false ->
                 ok
@@ -882,13 +894,10 @@ handle_incoming_capsule({close_session, ErrorCode, Reason}, #data{} = StateData)
     StateData#data{close_info = {ErrorCode, Reason}};
 handle_incoming_capsule({drain_session}, #data{} = StateData) ->
     StateData;
-handle_incoming_capsule(Unknown, _StateData) ->
-    %% Unknown capsule on the CONNECT stream. The drafts don't define a
-    %% "forward-compatible ignore" rule for WT capsules; treat it as a
-    %% session error so protocol mismatches surface immediately.
-    logger:warning("webtransport: unknown capsule ~p, closing session", [Unknown]),
-    {session_error, ?WT_REQUIREMENTS_NOT_MET,
-     iolist_to_binary(io_lib:format("unknown capsule: ~p", [Unknown]))}.
+handle_incoming_capsule({unknown, Type, _Payload}, StateData) ->
+    %% RFC 9297 §3.2: an unknown capsule type MUST be silently dropped.
+    logger:debug("webtransport: dropping unknown capsule type ~p", [Type]),
+    StateData.
 
 handle_incoming_stream_data(StreamId, Data, Fin,
                              #data{streams = Streams, handler = Handler,
@@ -1019,9 +1028,8 @@ count_peer_streams(Type, Streams, IsServer) ->
     end, 0, Streams).
 
 reject_excess_stream(StreamId, #data{transport = h3, transport_state = H3State}) ->
-    QuicConn = webtransport_h3:quic_conn(H3State),
-    QuicCode = wt_error:to_quic(?WT_BUFFERED_STREAM_REJECTED),
-    _ = quic:reset_stream(QuicConn, StreamId, QuicCode),
+    _ = webtransport_h3:reset_stream(H3State, StreamId,
+                                     {wt, ?WT_BUFFERED_STREAM_REJECTED}, 0),
     ok;
 reject_excess_stream(StreamId, #data{transport = h2, transport_state = H2State}) ->
     _ = webtransport_h2:send_capsule(H2State,
@@ -1149,15 +1157,34 @@ transport_open_stream(_StreamId, uni, #data{transport = h3, transport_state = H3
         {error, _} = Err -> Err
     end.
 
-transport_reset_stream(StreamId, ErrorCode, #data{transport = h2, transport_state = H2State}) ->
-    webtransport_h2:reset_stream(H2State, StreamId, ErrorCode);
-transport_reset_stream(StreamId, ErrorCode, #data{transport = h3, transport_state = H3State}) ->
-    webtransport_h3:reset_stream(H3State, StreamId, ErrorCode, 0).
+%% `Code' is `{app, C}' for an application code or `{wt, C}' for a protocol
+%% code. h2 carries both as the raw 32-bit value; h3 maps application codes
+%% into the WT_APPLICATION_ERROR range.
+transport_reset_stream(StreamId, {_, Code}, Stream,
+                       #data{transport = h2, transport_state = H2State}) ->
+    webtransport_h2:reset_stream(H2State, StreamId, Code,
+                                 webtransport_stream:bytes_sent(Stream));
+transport_reset_stream(StreamId, Code, Stream,
+                       #data{transport = h3, transport_state = H3State} = StateData) ->
+    webtransport_h3:reset_stream(H3State, StreamId, Code,
+                                 h3_reliable_size(StreamId, Stream, StateData)).
 
-transport_stop_sending(StreamId, ErrorCode, #data{transport = h2, transport_state = H2State}) ->
-    webtransport_h2:stop_sending(H2State, StreamId, ErrorCode);
-transport_stop_sending(StreamId, ErrorCode, #data{transport = h3, transport_state = H3State}) ->
-    webtransport_h3:stop_sending(H3State, StreamId, ErrorCode).
+%% http3-17 §4.4: the reliable size of a reset covers the stream header we
+%% wrote, so the peer can still map the stream to its session. We write no
+%% header on a peer-initiated stream.
+h3_reliable_size(StreamId, Stream, #data{transport_state = H3State} = StateData) ->
+    case is_local_stream(StreamId, StateData) of
+        true -> webtransport_h3:stream_header_size(H3State, webtransport_stream:type(Stream));
+        false -> 0
+    end.
+
+is_local_stream(StreamId, #data{is_server = IsServer}) ->
+    (webtransport_stream:initiator(StreamId) =:= server) =:= IsServer.
+
+transport_stop_sending(StreamId, {_, Code}, #data{transport = h2, transport_state = H2State}) ->
+    webtransport_h2:stop_sending(H2State, StreamId, Code);
+transport_stop_sending(StreamId, Code, #data{transport = h3, transport_state = H3State}) ->
+    webtransport_h3:stop_sending(H3State, StreamId, Code).
 
 count_streams(Type, Streams) ->
     maps:fold(fun(_Id, Stream, Acc) ->

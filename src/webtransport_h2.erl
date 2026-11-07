@@ -24,7 +24,7 @@
 -export([send/4, send_datagram/2]).
 -export([close_session/3, drain_session/1]).
 -export([send_capsule/2]).
--export([reset_stream/3, stop_sending/3]).
+-export([reset_stream/3, reset_stream/4, stop_sending/3]).
 -export([decode_capsule/1, decode_capsules/1]).
 
 %% Client connection helpers
@@ -247,8 +247,12 @@ send_datagram(#state{h2_conn = H2Conn, connect_stream_id = ConnectStreamId}, Dat
 %% @doc Send a CLOSE_WEBTRANSPORT_SESSION capsule and FIN the CONNECT stream.
 -spec close_session(state(), non_neg_integer(), binary()) -> ok | {error, term()}.
 close_session(#state{h2_conn = H2Conn, connect_stream_id = ConnectStreamId}, ErrorCode, Reason) ->
-    Capsule = wt_h2_capsule:close_session(ErrorCode, Reason),
-    h2:send_data(H2Conn, ConnectStreamId, wt_h2_capsule:encode(Capsule), true).
+    case wt_h2_capsule:close_session(ErrorCode, Reason) of
+        {error, _} = Err ->
+            Err;
+        Capsule ->
+            h2:send_data(H2Conn, ConnectStreamId, wt_h2_capsule:encode(Capsule), true)
+    end.
 
 %% @doc Send a DRAIN_WEBTRANSPORT_SESSION capsule to signal graceful shutdown.
 -spec drain_session(state()) -> ok | {error, term()}.
@@ -262,8 +266,16 @@ drain_session(#state{h2_conn = H2Conn, connect_stream_id = ConnectStreamId}) ->
 
 %% @doc Reset a multiplexed stream by sending a WT_RESET_STREAM capsule.
 -spec reset_stream(state(), non_neg_integer(), non_neg_integer()) -> ok | {error, term()}.
-reset_stream(#state{h2_conn = H2Conn, connect_stream_id = ConnectStreamId}, StreamId, ErrorCode) ->
-    Capsule = wt_h2_capsule:reset_stream(StreamId, ErrorCode),
+reset_stream(State, StreamId, ErrorCode) ->
+    reset_stream(State, StreamId, ErrorCode, 0).
+
+%% @doc Send WT_RESET_STREAM. `ReliableSize' is the number of bytes sent on
+%% the stream in WT_STREAM capsules (http2-16 §6.2).
+-spec reset_stream(state(), non_neg_integer(), non_neg_integer(), non_neg_integer()) ->
+    ok | {error, term()}.
+reset_stream(#state{h2_conn = H2Conn, connect_stream_id = ConnectStreamId},
+             StreamId, ErrorCode, ReliableSize) ->
+    Capsule = wt_h2_capsule:reset_stream(StreamId, ErrorCode, ReliableSize),
     h2:send_data(H2Conn, ConnectStreamId, wt_h2_capsule:encode(Capsule), false).
 
 %% @doc Request the peer stop sending on a stream via a WT_STOP_SENDING capsule.

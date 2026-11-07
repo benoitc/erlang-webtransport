@@ -197,14 +197,7 @@ h3_settings() ->
 
 -spec h3_settings(map()) -> map().
 h3_settings(Opts) ->
-    CompatMode = maps:get(compat_mode, Opts, auto),
-    Settings = case CompatMode of
-        auto ->
-            maps:merge(wt_h3:default_settings(latest),
-                       wt_h3:default_settings(legacy_browser_compat));
-        Mode ->
-            wt_h3:default_settings(Mode)
-    end,
+    Settings = h3_server_settings(Opts),
     Claim = wt_stream_type_handler(),
     ConnectionHandler = fun(QuicConnPid) ->
         {ok, Router} = webtransport_h3_router:start(undefined),
@@ -235,6 +228,20 @@ h3_settings(Opts) ->
         connection_handler => ConnectionHandler
     }.
 
+%% H3 SETTINGS for a listener. `auto' advertises both the latest-draft and
+%% the draft-02 keys: SETTINGS are connection-scoped and sent before any
+%% CONNECT, so the server cannot know the client's draft yet. Peers MUST
+%% ignore unknown settings (RFC 9114 §7.2.4.1), so the merged shape is
+%% wire-safe. Pinning a mode sends only that mode's settings.
+h3_server_settings(Opts) ->
+    case maps:get(compat_mode, Opts, auto) of
+        auto ->
+            maps:merge(wt_h3:server_settings(latest, Opts),
+                       wt_h3:server_settings(legacy_browser_compat, Opts));
+        Mode ->
+            wt_h3:server_settings(Mode, Opts)
+    end.
+
 %% @doc Return HTTP/2 settings to merge into an h2 server configuration.
 %%
 %% ```
@@ -253,15 +260,25 @@ h2_settings() ->
 h2_settings(Opts) ->
     #{
         enable_connect_protocol => true,
-        settings => #{
-            enable_connect_protocol => 1,
-            wt_initial_max_data =>
-                maps:get(max_data, Opts, ?DEFAULT_MAX_DATA),
-            wt_initial_max_streams_bidi =>
-                maps:get(max_streams_bidi, Opts, ?DEFAULT_MAX_STREAMS_BIDI),
-            wt_initial_max_streams_uni =>
-                maps:get(max_streams_uni, Opts, ?DEFAULT_MAX_STREAMS_UNI)
-        }
+        settings => h2_wt_settings(Opts)
+    }.
+
+%% SETTINGS an h2 endpoint sends for WebTransport (http2-16 §3.1, §4.3.1).
+%% SETTINGS_WT_ENABLED has no atom in h2, so it goes under its raw id.
+h2_wt_settings(Opts) ->
+    StreamData = maps:get(max_stream_data, Opts, ?DEFAULT_MAX_STREAM_DATA),
+    #{
+        enable_connect_protocol => 1,
+        ?SETTINGS_WT_ENABLED_H2 => 1,
+        wt_initial_max_data =>
+            maps:get(max_data, Opts, ?DEFAULT_MAX_DATA),
+        wt_initial_max_streams_bidi =>
+            maps:get(max_streams_bidi, Opts, ?DEFAULT_MAX_STREAMS_BIDI),
+        wt_initial_max_streams_uni =>
+            maps:get(max_streams_uni, Opts, ?DEFAULT_MAX_STREAMS_UNI),
+        wt_initial_max_stream_data_uni => StreamData,
+        wt_initial_max_stream_data_bidi_local => StreamData,
+        wt_initial_max_stream_data_bidi_remote => StreamData
     }.
 
 %% @doc Accept a WebTransport session on an incoming CONNECT request.
@@ -661,12 +678,19 @@ close_session(Session, ErrorCode) ->
     close_session(Session, ErrorCode, <<>>).
 
 %% @doc Close the session with an error code and reason.
-%% draft-14 §4.6 / draft-15 §5: Reason must be at most 1024 UTF-8 bytes.
--spec close_session(session(), non_neg_integer(), binary()) -> ok | {error, reason_too_long}.
+%% http3-17 §6, http2-16 §6.12: the code is 32 bits and the reason is valid
+%% UTF-8 of at most 1024 bytes.
+-spec close_session(session(), non_neg_integer(), binary()) ->
+    ok | {error, reason_too_long | invalid_reason | invalid_error_code}.
 close_session(_Session, _ErrorCode, Reason) when byte_size(Reason) > 1024 ->
     {error, reason_too_long};
+close_session(_Session, ErrorCode, _Reason) when ErrorCode > 16#ffffffff ->
+    {error, invalid_error_code};
 close_session(Session, ErrorCode, Reason) ->
-    webtransport_session:close(Session, ErrorCode, Reason).
+    case wt_h3_capsule:valid_close_reason(Reason) of
+        true -> webtransport_session:close(Session, ErrorCode, Reason);
+        false -> {error, invalid_reason}
+    end.
 
 %% @doc Get session information.
 -spec session_info(session()) -> {ok, map()} | {error, term()}.
@@ -802,15 +826,7 @@ start_h2_listener(Name, Opts) ->
     %% Create wrapper handler for H2
     H2Handler = make_h2_handler(Handler, HandlerOpts, Opts),
 
-    WtSettings = #{
-        enable_connect_protocol => 1,
-        wt_initial_max_data =>
-            maps:get(max_data, Opts, ?DEFAULT_MAX_DATA),
-        wt_initial_max_streams_bidi =>
-            maps:get(max_streams_bidi, Opts, ?DEFAULT_MAX_STREAMS_BIDI),
-        wt_initial_max_streams_uni =>
-            maps:get(max_streams_uni, Opts, ?DEFAULT_MAX_STREAMS_UNI)
-    },
+    WtSettings = h2_wt_settings(Opts),
     ServerOpts0 = #{
         cert => CertFile,
         key => KeyFile,
@@ -902,21 +918,7 @@ start_h3_listener(Name, Opts) ->
                 }
             end,
 
-            ServerCompatMode = maps:get(compat_mode, Opts, auto),
-            %% `auto' advertises both latest (draft-15) AND legacy
-            %% (draft-02) setting keys. H3 SETTINGS are connection-
-            %% scoped and sent before any CONNECT, so the server cannot
-            %% know the client's draft at SETTINGS time. Peers MUST
-            %% ignore unknown settings (RFC 9114 §7.2.4.1), so the
-            %% merged shape is wire-safe. Pinning to a specific mode
-            %% sends only that mode's settings.
-            AdvertisedSettings = case ServerCompatMode of
-                auto ->
-                    maps:merge(wt_h3:default_settings(latest),
-                               wt_h3:default_settings(legacy_browser_compat));
-                Other ->
-                    wt_h3:default_settings(Other)
-            end,
+            AdvertisedSettings = h3_server_settings(Opts),
             ServerOpts = #{
                 cert => CertDer,
                 key => PrivateKey,
@@ -1224,7 +1226,7 @@ dispatch_h2_capsule(Session, {wt_stream_fin, WtStreamId, Data}) ->
     webtransport_session:handle_stream_data(Session, WtStreamId, Data, true);
 dispatch_h2_capsule(Session, {datagram, Data}) ->
     webtransport_session:handle_datagram_data(Session, Data);
-dispatch_h2_capsule(Session, {reset_stream, WtStreamId, ErrorCode}) ->
+dispatch_h2_capsule(Session, {reset_stream, WtStreamId, ErrorCode, _ReliableSize}) ->
     webtransport_session:handle_stream_closed(Session, WtStreamId, {reset, ErrorCode});
 dispatch_h2_capsule(Session, {stop_sending, WtStreamId, ErrorCode}) ->
     webtransport_session:handle_stream_closed(Session, WtStreamId, {stop_sending, ErrorCode});
@@ -1320,14 +1322,14 @@ build_h2_ssl_opts(Opts) ->
     end.
 
 build_h3_connect_opts(Opts) ->
-    %% Client picks a compat_mode explicitly; default `latest' (draft-15).
+    %% Client picks a compat_mode explicitly; default `latest' (http3-17).
     %% Clients must not auto-probe the server, so the default is a single
     %% disjoint handshake shape.
     CompatMode = case maps:get(compat_mode, Opts, latest) of
         legacy_browser_compat -> legacy_browser_compat;
         _ -> latest
     end,
-    WTSettings = wt_h3:default_settings(CompatMode),
+    WTSettings = wt_h3:client_settings(CompatMode, Opts),
     BaseOpts = #{
         settings => WTSettings,
         sync => true,

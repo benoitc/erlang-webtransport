@@ -46,12 +46,13 @@ payload() ->
         {2, binary(1024)}
     ]).
 
-%% Generate a reason string for close_session
+%% Generate a reason string for close_session: valid UTF-8, at most
+%% 1024 bytes (http3-17 §6).
 reason() ->
     frequency([
         {5, <<>>},
-        {3, binary()},
-        {1, binary(256)}
+        {3, ?SUCHTHAT(R, utf8(), byte_size(R) =< 1024)},
+        {1, binary:copy(<<"r">>, 256)}
     ]).
 
 %% Generate any capsule type
@@ -60,7 +61,7 @@ capsule() ->
         {2, {padding, padding_data()}},
         {5, {wt_stream, small_stream_id(), payload()}},
         {3, {wt_stream_fin, small_stream_id(), payload()}},
-        {2, {reset_stream, small_stream_id(), error_code()}},
+        {2, {reset_stream, small_stream_id(), error_code(), flow_control_value()}},
         {2, {stop_sending, small_stream_id(), error_code()}},
         {2, {max_data, flow_control_value()}},
         {2, {max_stream_data, small_stream_id(), flow_control_value()}},
