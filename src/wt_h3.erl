@@ -117,25 +117,9 @@ peer_setting_by_atom(Settings, Id) ->
         [] -> undefined
     end.
 
-%% Codepoint of a quic setting atom. Uses quic's own table when it exports
-%% one (from the release that maps `wt_enabled' to http3-17), else the
-%% values quic 2.2.1 uses. The call is dynamic because 2.2.1 does not
-%% export the function.
+%% Codepoint of a quic setting atom.
 setting_id(Key) ->
-    Mod = quic_h3_frame,
-    case erlang:function_exported(Mod, setting_to_id, 1) of
-        true -> Mod:setting_to_id(Key);
-        false -> local_setting_id(Key)
-    end.
-
-local_setting_id(wt_enabled)                  -> ?SETTINGS_WT_ENABLED_H3_D15;
-local_setting_id(wt_enabled_draft15)          -> ?SETTINGS_WT_ENABLED_H3_D15;
-local_setting_id(wt_initial_max_data)         -> 16#2b61;
-local_setting_id(wt_initial_max_streams_uni)  -> 16#2b64;
-local_setting_id(wt_initial_max_streams_bidi) -> 16#2b65;
-local_setting_id(h3_datagram)                 -> 16#33;
-local_setting_id(enable_connect_protocol)     -> 16#08;
-local_setting_id(_)                           -> undefined.
+    quic_h3_frame:setting_to_id(Key).
 
 %% ============================================================================
 %% Session Establishment

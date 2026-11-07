@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-- quic bumped to 2.2.1. The version constraint is now `~> 2.2`.
+- quic bumped to 2.3.0. It fixes a header decoding issue that let an HTTP/3 peer burn minutes of CPU with one request (GHSA-224p-pchv-5r3r), and adds what WebTransport draft-17 needs: requests wait for the client's settings, and connections can be closed with an HTTP/3 error code. The version constraint is now `~> 2.3`.
 - h2 bumped to 0.12.7. It caps the stream resets a client can provoke on the server (MadeYouReset, CVE-2025-8671). The version constraint is now `~> 0.12.7`.
 
 ## 0.4.8 - 2026-10-03

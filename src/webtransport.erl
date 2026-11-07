@@ -221,6 +221,8 @@ h3_settings(Opts) ->
         settings => Settings,
         stream_type_handler => Claim,
         h3_datagram_enabled => true,
+        %% http3-17 §7.1: hold requests until the client's SETTINGS are in.
+        defer_requests_until_settings => true,
         quic_opts => #{
             max_datagram_frame_size => 65535,
             reset_stream_at => true
@@ -375,13 +377,15 @@ check_origin(Ctx, Handler, Headers, HandlerOpts) ->
 %% h3: http3-17 §3.1 requires the client's SETTINGS and transport
 %% parameters to enable HTTP/3 datagrams, QUIC datagrams and
 %% RESET_STREAM_AT; otherwise the session is malformed. The client's
-%% SETTINGS_WT_ENABLED codepoints pick the draft version (§7.1). The client
-%% SETTINGS can still be in flight when the request arrives; then the
-%% checks are skipped.
+%% SETTINGS_WT_ENABLED codepoints pick the draft version, so the server
+%% must not process the request before they arrive (§7.1). The listener
+%% sets quic's `defer_requests_until_settings' for that; an embedder that
+%% did not merge h3_settings/1 may still see a request ahead of them, and it
+%% is refused.
 check_peer(h3, Conn, _Headers, #{compat_mode := latest} = Ctx) ->
     case quic_h3:get_peer_settings(Conn) of
         undefined ->
-            {ok, Ctx#{wt_draft => h3_17}};
+            {reset, ?H3_REQUEST_REJECTED, peer_settings_not_received};
         Settings ->
             case wt_h3:validate_client(Conn, Settings) of
                 ok ->
@@ -1039,6 +1043,9 @@ start_h3_listener(Name, Opts) ->
                 key => PrivateKey,
                 handler => make_h3_handler(Handler, HandlerOpts, Opts, undefined),
                 settings => AdvertisedSettings,
+                %% http3-17 §7.1: hold requests until the client's SETTINGS
+                %% are in, since they select the draft version.
+                defer_requests_until_settings => true,
                 %% `sni_callback' rides inside `quic_opts' so it reaches
                 %% `quic:start_server'; `quic_h3' only lifts cert/key from
                 %% the top level. quic selects the cert per ClientHello SNI.
@@ -1444,21 +1451,14 @@ h3_validate_and_request(H3Conn, Authority, Path, Opts, Handler, Router) ->
         {error, {settings_error, _} = Reason} ->
             %% http3-17 §3.1: a SETTINGS_WT_ENABLED above 1 is a connection
             %% error of type H3_SETTINGS_ERROR.
-            h3_close(H3Conn, ?H3_SETTINGS_ERROR),
+            quic_h3:close(H3Conn, ?H3_SETTINGS_ERROR),
             {error, Reason};
         {error, Reason} ->
             quic_h3:close(H3Conn),
             {error, Reason}
     end.
 
-%% Close an h3 connection with an error code when quic supports it, else
-%% plainly.
-h3_close(H3Conn, Code) ->
-    Mod = quic_h3,
-    case erlang:function_exported(Mod, close, 2) of
-        true -> Mod:close(H3Conn, Code);
-        false -> quic_h3:close(H3Conn)
-    end.
+
 
 h3_send_connect(H3Conn, Authority, Path, Opts, Handler, Router, CompatMode) ->
     Headers = protocol_headers(Opts) ++ maps:get(headers, Opts, []),
