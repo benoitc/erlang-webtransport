@@ -45,13 +45,20 @@ Audited 2026-11-07 against quic 2.4.0 and h2 0.12.7.
   STOP_SENDING is answered with WT_RESET_STREAM.
 - **Termination.** WT_SESSION_GONE resets and STOP_SENDING on every stream,
   END_STREAM on h2 when the peer closes, H3_MESSAGE_ERROR for malformed
-  capsules or data after WT_CLOSE_SESSION, the session ends when its CONNECT
-  stream ends or is reset, the QUIC connection closes only with its last
-  session.
+  capsules or data after WT_CLOSE_SESSION (also when it arrives after the
+  session ended), the session ends when its CONNECT stream ends or is reset.
+  A client closes its QUIC connection once its last session ended and the
+  server closed the CONNECT stream (or after 1 s); a server leaves it open.
 - **Buffering.** Streams and datagrams that arrive before their session are
-  held and replayed; streams of an ended session are reset with
+  held and replayed, within caps (64 streams, 64 datagrams, 1 MiB of data per
+  connection); streams of an ended or refused session are reset with
   WT_SESSION_GONE. Session ids that are not client bidi stream ids close the
   connection with H3_ID_ERROR.
+- **Lifecycle.** A handler's `init/3` actions run once the session is
+  established. A session that ends for any reason sends WT_CLOSE_SESSION.
+  GOAWAY moves sessions to draining; a draining session still sends and
+  receives datagrams and stops once its streams are done. Finished streams
+  leave the session state.
 
 ## Known gaps
 
@@ -60,8 +67,10 @@ Audited 2026-11-07 against quic 2.4.0 and h2 0.12.7.
 | h2 | http2-16 §3.4 | WT_ERROR, WT_STREAM_STATE_ERROR and WT_FLOW_CONTROL_ERROR have no HTTP/2 codepoints yet (0xTBD). Session errors use RST_STREAM with PROTOCOL_ERROR or FLOW_CONTROL_ERROR, after a WT_CLOSE_SESSION that carries 0 or the h3 WT_FLOW_CONTROL_ERROR value. Switch when IANA assigns them. |
 | h2 | http2-16 §7 | The TLS requirement (TLS 1.3, or 1.2 with extended master secret) is not checked: the h2 library does not expose the negotiated version per connection. |
 | h2 | http2-16 §4.3.1 | Initial limits use the peer SETTINGS current when the session starts, not the ones acknowledged at the moment of the request. They differ only if the peer changes its WT SETTINGS mid-connection. |
-| h3 | http3-17 §4.7 | After WT_DRAIN_SESSION or GOAWAY we refuse to send new datagrams. The draft allows sending them. |
-| h3 | http3-17 §6 | STOP_SENDING(WT_SESSION_GONE) after receiving WT_CLOSE_SESSION, which the draft allows, is sent only through the general termination path. |
+| h2 | http2-16 §3.1 | A SETTINGS frame that later raises SETTINGS_WT_ENABLED above 1 is not seen: h2 does not report SETTINGS changes after the connection is up. The value is checked once, before the first session. |
+| h3 | http3-17 §5.4 | When the peer resets a stream, the bytes it sent but we never received are not counted against the session data limit, because quic does not report a reset's final size. After many resets with data in flight the two sides' views of the limit can drift. Upstream: `~/Projects/erlang_quic_wt_stream_events_prompt.md`. |
+| h3 | http3-17 §4.4 | When the peer sends STOP_SENDING, quic answers with RESET_STREAM rather than RESET_STREAM_AT. The peer has seen the stream to stop it, so in practice it already has the stream header. |
+| h3 | RFC 9000 §3.5 | STOP_SENDING on a unidirectional stream we opened is not reported to the handler: quic resets the stream and our next send on it fails. |
 
 ## Classes used by the audit
 

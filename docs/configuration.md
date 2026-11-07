@@ -294,7 +294,8 @@ When a session closes (locally or by the peer):
    `{error, invalid_error_code}` otherwise.
 3. The CONNECT stream is closed (FIN on HTTP/3, END_STREAM on HTTP/2).
 4. The handler's `terminate/2` receives `{closed, ErrorCode, Reason}`.
-5. On HTTP/3 the QUIC connection is closed once its last session has ended.
+5. On HTTP/3 a client closes its QUIC connection once its last session has
+   ended and the server closed the CONNECT stream; a server leaves it open.
 
 If the peer closes the CONNECT stream without sending `CLOSE_SESSION`, the
 session terminates with `{closed, 0, <<"peer closed CONNECT">>}`; if it

@@ -48,8 +48,12 @@ init(Session, Request, Opts) ->
 ```
 
 - `Session` -- the session pid, used for `webtransport:open_stream/2`, etc.
-- `Request` -- `#{path := binary(), authority := binary(), headers => [{binary(), binary()}]}`
+- `Request` -- `#{path := binary(), authority := binary(), headers => [{binary(), binary()}], wt_draft => atom(), protocol => binary()}`
 - `Opts` -- the `handler_opts` map from the listener or connect call
+
+`Actions` run once the session is established: on a server after the 200 is
+sent, on a client once the session is registered. Calls from `init/3` itself
+to the session API would deadlock; return actions instead.
 
 `init/2` is a back-compat shim. It is called only when `init/3` is not
 exported and loses the `Opts` argument.

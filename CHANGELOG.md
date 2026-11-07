@@ -47,7 +47,29 @@ the wire, so peers on older drafts may no longer connect.
 - Streams and datagrams that arrive just before their session is set up are
   held and delivered instead of being reset or dropped.
 - Error codes of a stream reset from an HTTP/3 peer that are not application
-  codes are now reported as `undefined` instead of a raw transport code.
+  codes are now reported as `undefined` instead of a raw transport code, and
+  a reset with code 0 is no longer mistaken for a clean end of stream.
+- A session always tells the peer when it ends, including when the handler
+  stops, crashes or a drain completes; before, the peer was left waiting.
+- Actions returned by a handler's `init/3` now run once the session is set
+  up, after the server's response. Before, they could go out ahead of it, and
+  opening a stream from `init/3` failed on HTTP/3.
+- Draining sessions now stop once their streams are done, can still close or
+  reset those streams, and keep exchanging datagrams. An HTTP/3 GOAWAY now
+  drains the sessions on the connection.
+- On HTTP/2, a reset or stop-sending request for a stream the peer has not
+  used yet now opens it as the draft requires, so two instances of this
+  library no longer end each other's sessions.
+- `close_stream/2` after a large send now waits for the queued data before
+  ending the stream, instead of cutting it short.
+- Finished streams are released, so long sessions no longer grow in memory.
+- `session_info/1` reports `max_datagram_size`, the largest datagram the
+  application can send.
+- A server no longer closes the HTTP/3 connection when its last WebTransport
+  session ends, so other requests on it are not cut off. A client closes its
+  connection once the server has closed the session.
+- `reset_stream` and `stop_sending` refuse error codes above 32 bits with
+  `{error, invalid_error_code}`.
 
 - quic bumped to 2.4.0. It fixes a header decoding issue that let an HTTP/3 peer burn minutes of CPU with one request (GHSA-224p-pchv-5r3r), and a bug that reset a WebTransport client's session stream at the first message the server sent on it after accepting. It also adds what WebTransport draft-17 needs: requests wait for the client's settings, and connections can be closed with an HTTP/3 error code. The version constraint is now `~> 2.4`.
 - Erlang/OTP 27 or later is now required, as quic 2.4.0 no longer supports OTP 26.

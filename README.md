@@ -463,7 +463,7 @@ ok = webtransport:close_session(Session, ErrorCode, Reason).
 %% Info :: #{transport, stream_count, local_max_data, remote_max_data,
 %%           local_max_streams_bidi, local_max_streams_uni,
 %%           remote_max_streams_bidi, remote_max_streams_uni,
-%%           bytes_sent, bytes_received, wt_draft,
+%%           bytes_sent, bytes_received, wt_draft, max_datagram_size,
 %%           protocol => binary(), close_info => {Code, Msg}}
 ```
 
@@ -576,7 +576,7 @@ When a session closes (locally or by the peer):
 2. A `CLOSE_SESSION` capsule is sent (or received) with a 32-bit error code and a reason of at most 1024 bytes of UTF-8.
 3. The CONNECT stream is closed (FIN on HTTP/3, END_STREAM on HTTP/2). The peer closing or resetting the CONNECT stream without `CLOSE_SESSION` also ends the session.
 4. The handler's `terminate/2` receives `{closed, ErrorCode, Reason}` as the reason.
-5. On HTTP/3 the QUIC connection is closed once its last session has ended.
+5. On HTTP/3 a client closes its QUIC connection once its last session has ended and the server closed the CONNECT stream; a server leaves the connection open.
 
 If the peer FINs the CONNECT stream without sending `CLOSE_SESSION`, the session terminates with `{closed, 0, <<"peer closed CONNECT">>}`.
 
