@@ -13,7 +13,7 @@
 -include("webtransport.hrl").
 
 -export([start_link/0, start_link/1, start/1]).
--export([register_session/3, unregister_session/2]).
+-export([register_session/3, unregister_session/2, expect_session/2]).
 -export([client_connect/4]).
 -export([set_passthrough/2]).
 -export([open_bidi_stream/2]).
@@ -32,6 +32,10 @@
     %% Data on these streams is delivered straight to the session, skipping
     %% the session-id varint decode that peer-initiated streams go through.
     local_streams = #{} :: #{non_neg_integer() => pid()},
+    %% Client side: CONNECT streams whose session is not registered yet.
+    %% Their data is held here, in arrival order, and replayed to the session
+    %% when it registers.
+    expected = #{} :: #{non_neg_integer() => [term()]},
     passthrough :: undefined | pid(),
     h3_conn :: undefined | pid(),
     h3_monitor :: undefined | reference()
@@ -67,6 +71,14 @@ register_session(Router, SessionId, SessionPid) ->
     gen_server:call(Router, {register, SessionId, SessionPid}).
 
 %% @doc Remove the session registration for the given session ID.
+%% @doc Client side: the CONNECT request for `SessionId' was sent. Hold the
+%% data the server sends on that stream until the session registers, so
+%% capsules that follow the 2xx response (flow control, close, drain) reach
+%% the session and not the connecting process.
+-spec expect_session(pid(), non_neg_integer()) -> ok.
+expect_session(Router, SessionId) ->
+    gen_server:call(Router, {expect, SessionId}).
+
 -spec unregister_session(pid(), non_neg_integer()) -> ok.
 unregister_session(Router, SessionId) ->
     gen_server:call(Router, {unregister, SessionId}).
@@ -102,7 +114,15 @@ handle_call({register, SessionId, SessionPid}, _From, State) ->
     Ref = erlang:monitor(process, SessionPid),
     Sessions = (State#state.sessions)#{SessionId => SessionPid},
     Monitors = (State#state.monitors)#{Ref => SessionId},
-    {reply, ok, State#state{sessions = Sessions, monitors = Monitors}};
+    {Held, Expected} = case maps:take(SessionId, State#state.expected) of
+        {Msgs, Rest} -> {lists:reverse(Msgs), Rest};
+        error -> {[], State#state.expected}
+    end,
+    [SessionPid ! Msg || Msg <- Held],
+    {reply, ok, State#state{sessions = Sessions, monitors = Monitors,
+                            expected = Expected}};
+handle_call({expect, SessionId}, _From, #state{expected = Expected} = State) ->
+    {reply, ok, State#state{expected = Expected#{SessionId => []}}};
 handle_call({unregister, SessionId}, _From, State) ->
     {reply, ok, drop_session(SessionId, State)};
 handle_call({client_connect, Host, Port, H3Opts}, _From, State) ->
@@ -165,6 +185,18 @@ handle_quic_h3({quic_h3, _Conn, {stream_type_stop_sending, _Direction, StreamId,
 handle_quic_h3({quic_h3, Conn, {datagram, StreamId, Payload}}, State0) ->
     State = ensure_h3_monitor(Conn, State0),
     {noreply, route_datagram(StreamId, Payload, State)};
+%% Client side: data on a CONNECT stream belongs to its session.
+handle_quic_h3({quic_h3, _Conn, {data, StreamId, _Data, _Fin}} = Msg,
+               #state{sessions = Sessions, expected = Expected} = State)
+  when is_map_key(StreamId, Sessions); is_map_key(StreamId, Expected) ->
+    case maps:find(StreamId, Sessions) of
+        {ok, Session} ->
+            Session ! Msg,
+            {noreply, State};
+        error ->
+            Held = maps:get(StreamId, Expected),
+            {noreply, State#state{expected = Expected#{StreamId => [Msg | Held]}}}
+    end;
 handle_quic_h3({quic_h3, _Conn, {session_ticket, Ticket}}, State) ->
     %% Connection-scoped 0-RTT resumption ticket. Surface it to the connecting
     %% process (the passthrough on the client side); it can store the ticket

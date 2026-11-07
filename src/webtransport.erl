@@ -1464,6 +1464,7 @@ h3_send_connect(H3Conn, Authority, Path, Opts, Handler, Router, CompatMode) ->
     Headers = protocol_headers(Opts) ++ maps:get(headers, Opts, []),
     case wt_h3:request_session(H3Conn, Authority, Path, Headers, CompatMode) of
         {ok, SessionId} ->
+            ok = webtransport_h3_router:expect_session(Router, SessionId),
             h3_await_response(H3Conn, SessionId, Authority, Path, Opts, Handler, Router);
         {error, Reason} ->
             quic_h3:close(H3Conn),

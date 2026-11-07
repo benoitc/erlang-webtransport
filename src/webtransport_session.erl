@@ -14,6 +14,12 @@
 
 -include("webtransport.hrl").
 
+%% A limit that is never reached: flow control off, or per-stream windows
+%% on h3, where QUIC does them.
+-define(UNLIMITED, 1 bsl 62).
+%% Largest Maximum Streams value (http3-17 §5.6.2, http2-16 §6.7).
+-define(MAX_STREAMS, 1 bsl 60).
+
 %% API
 -export([start_link/4, start_link/5]).
 -export([send/4, send_datagram/2]).
@@ -42,16 +48,37 @@
     next_bidi_id :: non_neg_integer(),
     next_uni_id :: non_neg_integer(),
     %% Flow control
-    local_max_data :: non_neg_integer(),
-    remote_max_data :: non_neg_integer(),
-    local_max_streams_bidi :: non_neg_integer(),
-    local_max_streams_uni :: non_neg_integer(),
-    remote_max_streams_bidi :: non_neg_integer(),
-    remote_max_streams_uni :: non_neg_integer(),
+    local_max_data = 0 :: non_neg_integer(),
+    remote_max_data = 0 :: non_neg_integer(),
+    local_max_streams_bidi = 0 :: non_neg_integer(),
+    local_max_streams_uni = 0 :: non_neg_integer(),
+    remote_max_streams_bidi = 0 :: non_neg_integer(),
+    remote_max_streams_uni = 0 :: non_neg_integer(),
     bytes_sent = 0 :: non_neg_integer(),
     bytes_received = 0 :: non_neg_integer(),
-    %% Size of the session receive window we advertise and replenish (h2).
-    session_window :: non_neg_integer(),
+    %% Size of the session receive window we advertise and replenish.
+    session_window = 0 :: non_neg_integer(),
+    %% WebTransport flow control in force (http3-17 §5.1). Always on for
+    %% h2; on h3 only when both endpoints sent a non-zero initial limit.
+    %% When off, limits are not enforced and flow-control capsules are
+    %% ignored.
+    flow_control = true :: boolean(),
+    %% Per-stream receive window we grant on h2 streams.
+    local_max_stream_data = 0 :: non_neg_integer(),
+    %% Per-stream send windows the peer granted on h2, as WebTransport-Init
+    %% keys: u (our uni), br (our bidi), bl (its bidi).
+    peer_stream_data = #{} :: #{u | bl | br => non_neg_integer()},
+    %% Streams opened over the session's life, by us and by the peer. Stream
+    %% limits are cumulative (http3-17 §5.6.2).
+    opened_bidi = 0 :: non_neg_integer(),
+    opened_uni = 0 :: non_neg_integer(),
+    peer_opened_bidi = 0 :: non_neg_integer(),
+    peer_opened_uni = 0 :: non_neg_integer(),
+    %% Peer streams whose stream credit was already returned.
+    credited = #{} :: #{non_neg_integer() => true},
+    %% Stream types we failed to open for lack of credit; the handler is told
+    %% when credit comes back (overview-14 §4.3).
+    blocked = #{} :: #{bidi | uni => true},
     %% Flags
     is_server :: boolean(),
     close_info :: undefined | {non_neg_integer(), binary()}
@@ -177,22 +204,15 @@ init({Transport, TransportState, Handler, Opts}) ->
         false -> {0, 2}   %% Client: even IDs
     end,
 
-    Data = #data{
+    Data = init_limits(Transport, TransportState, Opts, #data{
         transport = Transport,
         transport_state = TransportState,
         handler = Handler,
         request = Request,
         is_server = IsServer,
         next_bidi_id = NextBidi,
-        next_uni_id = NextUni,
-        local_max_data = maps:get(max_data, Opts, ?DEFAULT_MAX_DATA),
-        remote_max_data = maps:get(max_data, Opts, ?DEFAULT_MAX_DATA),
-        session_window = maps:get(max_data, Opts, ?DEFAULT_MAX_DATA),
-        local_max_streams_bidi = maps:get(max_streams_bidi, Opts, ?DEFAULT_MAX_STREAMS_BIDI),
-        local_max_streams_uni = maps:get(max_streams_uni, Opts, ?DEFAULT_MAX_STREAMS_UNI),
-        remote_max_streams_bidi = maps:get(max_streams_bidi, Opts, ?DEFAULT_MAX_STREAMS_BIDI),
-        remote_max_streams_uni = maps:get(max_streams_uni, Opts, ?DEFAULT_MAX_STREAMS_UNI)
-    },
+        next_uni_id = NextUni
+    }),
 
     %% Initialize handler. `code:ensure_loaded/1' is required because
     %% `erlang:function_exported/3' returns false for modules that haven't
@@ -227,6 +247,60 @@ init({Transport, TransportState, Handler, Opts}) ->
             {stop, Reason}
     end.
 
+%% Flow-control limits at session start.
+%%
+%% Local limits are what we grant the peer: our own options. Remote limits
+%% are what the peer granted us: its SETTINGS (http3-17 §5.5, http2-16
+%% §4.3.1), plus WebTransport-Init for h2 per-stream limits. A limit the
+%% peer did not send is 0.
+init_limits(Transport, TransportState, Opts, Data) ->
+    MaxData = maps:get(max_data, Opts, ?DEFAULT_MAX_DATA),
+    MaxBidi = maps:get(max_streams_bidi, Opts, ?DEFAULT_MAX_STREAMS_BIDI),
+    MaxUni = maps:get(max_streams_uni, Opts, ?DEFAULT_MAX_STREAMS_UNI),
+    Peer = peer_limits(Transport, TransportState, Opts),
+    FlowControl = case Transport of
+        h2 -> true;
+        h3 -> lists:any(fun(V) -> V > 0 end, maps:values(Peer)) andalso
+              lists:any(fun(V) -> V > 0 end, [MaxData, MaxBidi, MaxUni])
+    end,
+    Remote = fun(Key) ->
+        case FlowControl of
+            true -> maps:get(Key, Peer, 0);
+            false -> ?UNLIMITED
+        end
+    end,
+    Data#data{
+        flow_control = FlowControl,
+        local_max_data = MaxData,
+        session_window = MaxData,
+        local_max_streams_bidi = MaxBidi,
+        local_max_streams_uni = MaxUni,
+        local_max_stream_data = maps:get(max_stream_data, Opts, ?DEFAULT_MAX_STREAM_DATA),
+        remote_max_data = Remote(max_data),
+        remote_max_streams_bidi = Remote(max_streams_bidi),
+        remote_max_streams_uni = Remote(max_streams_uni),
+        peer_stream_data = maps:get(peer_stream_data, Opts, #{})
+    }.
+
+%% The peer's initial session-level limits, from its SETTINGS.
+peer_limits(h3, TransportState, Opts) ->
+    Settings = case maps:get(peer_settings, Opts, #{}) of
+        S when map_size(S) > 0 -> S;
+        _ -> webtransport_h3:peer_settings(TransportState)
+    end,
+    maps:filter(fun(_, V) -> is_integer(V) end, #{
+        max_data => wt_h3:peer_setting(Settings, 16#2b61),
+        max_streams_bidi => wt_h3:peer_setting(Settings, 16#2b65),
+        max_streams_uni => wt_h3:peer_setting(Settings, 16#2b64)
+    });
+peer_limits(h2, _TransportState, Opts) ->
+    Settings = maps:get(peer_settings, Opts, #{}),
+    #{
+        max_data => maps:get(wt_initial_max_data, Settings, 0),
+        max_streams_bidi => maps:get(wt_initial_max_streams_bidi, Settings, 0),
+        max_streams_uni => maps:get(wt_initial_max_streams_uni, Settings, 0)
+    }.
+
 init_apply_transition(continue, Data) ->
     {ok, open, Data};
 init_apply_transition(drain, Data) ->
@@ -255,6 +329,8 @@ open({call, From}, {open_stream, Type}, #data{} = StateData) ->
     case do_open_stream(Type, StateData) of
         {ok, StreamId, StateData1} ->
             {keep_state, StateData1, [{reply, From, {ok, StreamId}}]};
+        {error, stream_limit_reached = Reason} ->
+            {keep_state, mark_blocked(Type, StateData), [{reply, From, {error, Reason}}]};
         {error, Reason} ->
             {keep_state, StateData, [{reply, From, {error, Reason}}]}
     end;
@@ -294,14 +370,7 @@ open(cast, {capsule, {datagram, Data}}, StateData) ->
     {StateData1, Transition} = handle_incoming_datagram(Data, StateData),
     open_apply_transition(Transition, StateData1);
 open(cast, {capsule, Capsule}, StateData) ->
-    case handle_incoming_capsule(Capsule, StateData) of
-        {session_error, Code, Reason} ->
-            do_close(Code, Reason, StateData),
-            {stop, {shutdown, {session_error, Code}},
-             StateData#data{close_info = {Code, Reason}}};
-        StateData1 ->
-            apply_capsule_transition(Capsule, StateData1)
-    end;
+    apply_capsule(Capsule, StateData);
 
 open(cast, {stream_data, StreamId, Data, Fin}, StateData) ->
     {StateData1, Transition} = handle_incoming_stream_data(StreamId, Data, Fin, StateData),
@@ -312,8 +381,8 @@ open(cast, {datagram_data, Data}, StateData) ->
     open_apply_transition(Transition, StateData1);
 
 open(cast, {stream_opened, StreamId, Type}, StateData) ->
-    StateData1 = handle_remote_stream_opened(StreamId, Type, StateData),
-    {keep_state, StateData1};
+    {StateData1, Transition} = handle_remote_stream_opened(StreamId, Type, StateData),
+    open_apply_transition(Transition, StateData1);
 
 open(cast, {stream_closed, StreamId, Reason}, StateData) ->
     {StateData1, Transition} = handle_remote_stream_closed(StreamId, Reason, StateData),
@@ -389,19 +458,69 @@ apply_capsule_list([{datagram, Data} | Rest], StateData) ->
         {StateData1, Transition} -> open_apply_transition(Transition, StateData1)
     end;
 apply_capsule_list([Capsule | Rest], StateData) ->
+    case apply_capsule(Capsule, StateData) of
+        {keep_state, StateData1} -> apply_capsule_list(Rest, StateData1);
+        Other -> Other
+    end.
+
+%% Apply one capsule from the peer and return the gen_statem result.
+apply_capsule(Capsule, StateData) ->
     case handle_incoming_capsule(Capsule, StateData) of
         {session_error, Code, Reason} ->
-            do_close(Code, Reason, StateData),
-            {stop, {shutdown, {session_error, Code}},
-             StateData#data{close_info = {Code, Reason}}};
+            stop_with_session_error(Code, Reason, StateData);
         StateData1 ->
-            case apply_capsule_transition(Capsule, StateData1) of
-                {keep_state, StateData2} ->
-                    apply_capsule_list(Rest, StateData2);
-                Stop ->
-                    Stop
+            case notify_stream_credit(StateData1) of
+                {StateData2, continue} -> apply_capsule_transition(Capsule, StateData2);
+                {StateData2, Transition} -> open_apply_transition(Transition, StateData2)
             end
     end.
+
+%% A session error (a flow-control or stream-state violation by the peer):
+%% send CLOSE_SESSION and stop.
+stop_with_session_error(Code, Reason, StateData) ->
+    {StateData1, Stop} = fail_session(Code, Reason, StateData),
+    {stop, element(2, Stop), StateData1}.
+
+fail_session(Code, Reason, StateData) ->
+    logger:info("webtransport: session error ~.16#: ~s", [Code, Reason]),
+    do_close(Code, Reason, StateData),
+    {StateData#data{close_info = {Code, Reason}},
+     {stop, {shutdown, {session_error, Code}}}}.
+
+mark_blocked(Type, #data{blocked = Blocked} = StateData) ->
+    StateData#data{blocked = Blocked#{Type => true}}.
+
+%% overview-14 §4.3: tell the handler when stream credit comes back for a
+%% type it failed to open, through the optional handle_stream_credit/2.
+notify_stream_credit(#data{blocked = Blocked} = StateData) when map_size(Blocked) =:= 0 ->
+    {StateData, continue};
+notify_stream_credit(#data{blocked = Blocked} = StateData) ->
+    Ready = [T || T <- maps:keys(Blocked), streams_available(T, StateData) > 0],
+    notify_stream_credit(Ready, StateData#data{blocked = maps:without(Ready, Blocked)},
+                         continue).
+
+notify_stream_credit([], StateData, Transition) ->
+    {StateData, Transition};
+notify_stream_credit([Type | Rest], #data{handler = Handler, handler_state = HState} = StateData,
+                     Transition) ->
+    case erlang:function_exported(Handler, handle_stream_credit, 2) of
+        false ->
+            notify_stream_credit(Rest, StateData, Transition);
+        true ->
+            {StateData1, T1} =
+                case Handler:handle_stream_credit(Type, HState) of
+                    {ok, HState1} ->
+                        {StateData#data{handler_state = HState1}, continue};
+                    {ok, HState1, Actions} ->
+                        handle_actions(Actions, StateData#data{handler_state = HState1});
+                    {stop, Reason, HState1} ->
+                        {StateData#data{handler_state = HState1}, {stop, Reason}}
+                end,
+            notify_stream_credit(Rest, StateData1, strongest_transition(Transition, T1))
+    end.
+
+streams_available(bidi, #data{remote_max_streams_bidi = L, opened_bidi = O}) -> max(L - O, 0);
+streams_available(uni, #data{remote_max_streams_uni = L, opened_uni = O}) -> max(L - O, 0).
 
 %% Translate a `handle_actions' transition into a gen_statem return while
 %% in the `open' state.
@@ -509,52 +628,44 @@ augment_reason(Reason, {Code, Msg}) -> {Reason, {closed, Code, Msg}}.
 %% Internal functions
 %% ============================================================================
 
-%% Per-stream WebTransport windows only exist on h2 (draft-14 §6). On h3 the
-%% QUIC transport does flow control, so the WT-level window is unbounded
-%% there; applying the h2 default on h3 used to cut every payload at 256 KiB.
--define(H3_STREAM_WINDOW, 1 bsl 62).
+%% Per-stream WebTransport windows only exist on h2 (http2-16 §6). On h3
+%% the QUIC transport does per-stream flow control.
 
--spec initial_stream_window(#data{}) -> non_neg_integer().
-initial_stream_window(#data{transport = h3}) -> ?H3_STREAM_WINDOW;
-initial_stream_window(#data{transport = h2}) -> ?DEFAULT_MAX_STREAM_DATA.
+%% Send and receive windows of a new stream. h3 leaves per-stream flow
+%% control to QUIC. On h2 the send window is what the peer granted for this
+%% kind of stream (http2-16 §4.3) and the receive window is ours.
+-spec stream_windows(local | peer, bidi | uni, #data{}) ->
+    {non_neg_integer(), non_neg_integer()}.
+stream_windows(_Who, _Type, #data{transport = h3}) ->
+    {?UNLIMITED, ?UNLIMITED};
+stream_windows(local, uni, #data{peer_stream_data = P}) ->
+    {maps:get(u, P, 0), 0};
+stream_windows(local, bidi, #data{peer_stream_data = P, local_max_stream_data = L}) ->
+    {maps:get(br, P, 0), L};
+stream_windows(peer, uni, #data{local_max_stream_data = L}) ->
+    {0, L};
+stream_windows(peer, bidi, #data{peer_stream_data = P, local_max_stream_data = L}) ->
+    {maps:get(bl, P, 0), L}.
 
-do_send(StreamId, Data, Fin, #data{streams = Streams, transport = Transport} = StateData) ->
+new_stream(StreamId, Who, Type, StateData) ->
+    {Send, Recv} = stream_windows(Who, Type, StateData),
+    webtransport_stream:new(StreamId, Type, Send, Recv).
+
+do_send(StreamId, Data, Fin, #data{streams = Streams} = StateData) ->
     case maps:find(StreamId, Streams) of
-        {ok, Stream} ->
-            case Transport of
-                h3 -> send_h3(StreamId, Data, Fin, Stream, StateData);
-                h2 -> send_h2(StreamId, Data, Fin, Stream, StateData)
-            end;
-        error ->
-            {error, unknown_stream}
+        {ok, Stream} -> send_limited(StreamId, Data, Fin, Stream, StateData);
+        error -> {error, unknown_stream}
     end.
 
-%% h3: hand the whole payload to QUIC; it blocks or buffers as its own
-%% flow control dictates.
-send_h3(StreamId, Data, Fin, Stream,
-        #data{streams = Streams, bytes_sent = SessSent} = StateData) ->
-    case webtransport_stream:send(Stream, Data) of
-        {ok, ToSend, Stream1} ->
-            case transport_send(StreamId, ToSend, Fin, StateData) of
-                ok ->
-                    Stream2 = maybe_close_local(Fin, Stream1),
-                    {ok, StateData#data{streams = Streams#{StreamId => Stream2},
-                                        bytes_sent = SessSent + byte_size(ToSend)}};
-                {error, _} = Err ->
-                    Err
-            end;
-        {error, _} = Err ->
-            Err
-    end.
-
-%% h2: honour the session and per-stream windows. Bytes that do not fit are
-%% queued on the stream, in order, and go out from flush_h2_streams/1 when
-%% the peer raises a window. A FIN is held back until the queue drains, so
-%% the peer never sees FIN before the last byte.
-send_h2(StreamId, Data, Fin, Stream, #data{streams = Streams} = StateData) ->
+%% Honour the session window (both transports) and the per-stream window
+%% (h2; unbounded on h3, where QUIC does it). Bytes that do not fit are
+%% queued on the stream, in order, and go out from flush_streams/1 when the
+%% peer raises a limit. A FIN is held back until the queue drains, so the
+%% peer never sees FIN before the last byte.
+send_limited(StreamId, Data, Fin, Stream, #data{streams = Streams} = StateData) ->
     case webtransport_stream:send_buffer(Stream) of
         <<>> ->
-            push_h2(StreamId, Data, Fin, Stream, StateData);
+            push_limited(StreamId, Data, Fin, Stream, StateData);
         _ ->
             %% Earlier bytes are still waiting for credit: queue behind them.
             case webtransport_stream:is_writable(Stream) andalso
@@ -568,9 +679,9 @@ send_h2(StreamId, Data, Fin, Stream, #data{streams = Streams} = StateData) ->
             end
     end.
 
-push_h2(StreamId, Data, Fin, Stream,
-        #data{streams = Streams, bytes_sent = SessSent,
-              remote_max_data = SessMax} = StateData) ->
+push_limited(StreamId, Data, Fin, Stream,
+             #data{streams = Streams, bytes_sent = SessSent,
+                   remote_max_data = SessMax} = StateData) ->
     SessAvail = max(SessMax - SessSent, 0),
     {Now, Later} = split_binary_at(Data, SessAvail),
     case webtransport_stream:send(Stream, Now) of
@@ -607,14 +718,12 @@ push_h2(StreamId, Data, Fin, Stream,
             Err
     end.
 
-%% Retry queued bytes on every h2 stream after the peer raised a window.
--spec flush_h2_streams(#data{}) -> #data{}.
-flush_h2_streams(#data{transport = h2, streams = Streams} = StateData) ->
-    maps:fold(fun flush_h2_stream/3, StateData, Streams);
-flush_h2_streams(StateData) ->
-    StateData.
+%% Retry queued bytes on every stream after the peer raised a limit.
+-spec flush_streams(#data{}) -> #data{}.
+flush_streams(#data{streams = Streams} = StateData) ->
+    maps:fold(fun flush_stream/3, StateData, Streams).
 
-flush_h2_stream(StreamId, Stream, #data{streams = Streams} = StateData) ->
+flush_stream(StreamId, Stream, #data{streams = Streams} = StateData) ->
     case webtransport_stream:send_buffer(Stream) of
         <<>> ->
             StateData;
@@ -623,7 +732,7 @@ flush_h2_stream(StreamId, Stream, #data{streams = Streams} = StateData) ->
             Fin = webtransport_stream:fin_pending(Stream0),
             Stream1 = webtransport_stream:clear_fin_pending(Stream0),
             StateData1 = StateData#data{streams = Streams#{StreamId => Stream1}},
-            case push_h2(StreamId, Buf, Fin, Stream1, StateData1) of
+            case push_limited(StreamId, Buf, Fin, Stream1, StateData1) of
                 {ok, StateData2} ->
                     StateData2;
                 {error, Reason} ->
@@ -648,31 +757,34 @@ split_binary_at(Bin, At) ->
     <<Now:At/binary, Later/binary>> = Bin,
     {Now, Later}.
 
+%% Tell the peer we are blocked: WT_DATA_BLOCKED on both transports
+%% (http3-17 §5.6.5, http2-16 §6.8), WT_STREAM_DATA_BLOCKED on h2 only.
 emit_blocked(StreamId, Stream, SessAvail, StateData) ->
     case SessAvail =< 0 of
-        true -> _ = emit_data_blocked(StateData, StateData#data.remote_max_data);
+        true -> send_flow_capsule({data_blocked, StateData#data.remote_max_data}, StateData);
         false -> ok
     end,
-    maybe_emit_stream_data_blocked(h2, StreamId, Stream, StateData).
+    maybe_emit_stream_data_blocked(StreamId, Stream, StateData).
 
-%% h2 peers learn about local backpressure via DATA_BLOCKED / STREAM_DATA_BLOCKED
-%% capsules. h3 uses native QUIC flow control; the drafts don't define these
-%% capsules for h3, so we only emit on h2.
-emit_data_blocked(#data{transport = h2, transport_state = H2State}, Limit) ->
-    webtransport_h2:send_capsule(H2State, wt_h2_capsule:data_blocked(Limit));
-emit_data_blocked(_StateData, _Limit) ->
+maybe_emit_stream_data_blocked(StreamId, Stream, #data{transport = h2} = StateData) ->
+    Window = webtransport_stream:send_window(Stream),
+    case Window - webtransport_stream:bytes_sent(Stream) of
+        0 -> send_flow_capsule({stream_data_blocked, StreamId, Window}, StateData);
+        _ -> ok
+    end;
+maybe_emit_stream_data_blocked(_StreamId, _Stream, _StateData) ->
     ok.
 
-maybe_emit_stream_data_blocked(h2, StreamId, Stream, #data{transport_state = H2State}) ->
-    Window = webtransport_stream:send_window(Stream),
-    Sent = webtransport_stream:bytes_sent(Stream),
-    case Window - Sent of
-        0 ->
-            webtransport_h2:send_capsule(H2State,
-                                         wt_h2_capsule:stream_data_blocked(StreamId, Window));
-        _ ->
-            ok
-    end.
+%% Send a flow-control capsule on the CONNECT stream, unless flow control
+%% is off for this session.
+send_flow_capsule(_Capsule, #data{flow_control = false}) ->
+    ok;
+send_flow_capsule(Capsule, #data{transport = h2, transport_state = H2State}) ->
+    _ = webtransport_h2:send_capsule(H2State, Capsule),
+    ok;
+send_flow_capsule(Capsule, #data{transport = h3, transport_state = H3State}) ->
+    _ = transport_call(fun() -> webtransport_h3:send_capsule(H3State, Capsule) end),
+    ok.
 
 do_send_datagram(Data, StateData) ->
     case transport_send_datagram(Data, StateData) of
@@ -680,45 +792,40 @@ do_send_datagram(Data, StateData) ->
         {error, _} = Err -> Err
     end.
 
-do_open_stream(bidi, #data{streams = Streams, next_bidi_id = NextId,
-                           remote_max_streams_bidi = MaxStreams} = StateData) ->
-    CurrentCount = count_streams(bidi, Streams),
-    case CurrentCount < MaxStreams of
+%% Stream limits count every stream opened in the session, open or not
+%% (http3-17 §5.6.2, http2-16 §6.7). At the limit we send
+%% WT_STREAMS_BLOCKED and remember it, so the handler can be told when the
+%% peer grants more.
+do_open_stream(Type, #data{streams = Streams} = StateData) ->
+    {Opened, Limit, NextId} = open_counters(Type, StateData),
+    case Opened < Limit of
         true ->
-            case transport_open_stream(NextId, bidi, StateData) of
+            case transport_open_stream(NextId, Type, StateData) of
                 {ok, StreamId} ->
-                    Stream = webtransport_stream:new(StreamId, bidi, initial_stream_window(StateData)),
-                    Streams1 = Streams#{StreamId => Stream},
-                    {ok, StreamId, StateData#data{
-                        streams = Streams1,
-                        next_bidi_id = NextId + 4
-                    }};
+                    Stream = new_stream(StreamId, local, Type, StateData),
+                    StateData1 = bump_opened(Type, StateData#data{
+                        streams = Streams#{StreamId => Stream}}),
+                    {ok, StreamId, StateData1};
                 {error, _} = Err ->
                     Err
             end;
         false ->
-            {error, stream_limit_reached}
-    end;
-
-do_open_stream(uni, #data{streams = Streams, next_uni_id = NextId,
-                          remote_max_streams_uni = MaxStreams} = StateData) ->
-    CurrentCount = count_streams(uni, Streams),
-    case CurrentCount < MaxStreams of
-        true ->
-            case transport_open_stream(NextId, uni, StateData) of
-                {ok, StreamId} ->
-                    Stream = webtransport_stream:new(StreamId, uni, initial_stream_window(StateData)),
-                    Streams1 = Streams#{StreamId => Stream},
-                    {ok, StreamId, StateData#data{
-                        streams = Streams1,
-                        next_uni_id = NextId + 4
-                    }};
-                {error, _} = Err ->
-                    Err
-            end;
-        false ->
+            send_flow_capsule(streams_blocked(Type, Limit), StateData),
             {error, stream_limit_reached}
     end.
+
+open_counters(bidi, #data{opened_bidi = O, remote_max_streams_bidi = L, next_bidi_id = N}) ->
+    {O, L, N};
+open_counters(uni, #data{opened_uni = O, remote_max_streams_uni = L, next_uni_id = N}) ->
+    {O, L, N}.
+
+bump_opened(bidi, #data{opened_bidi = O, next_bidi_id = N} = D) ->
+    D#data{opened_bidi = O + 1, next_bidi_id = N + 4};
+bump_opened(uni, #data{opened_uni = O, next_uni_id = N} = D) ->
+    D#data{opened_uni = O + 1, next_uni_id = N + 4}.
+
+streams_blocked(bidi, Limit) -> {streams_blocked_bidi, Limit};
+streams_blocked(uni, Limit) -> {streams_blocked_uni, Limit}.
 
 do_close_stream(StreamId, #data{streams = Streams} = StateData) ->
     case maps:find(StreamId, Streams) of
@@ -726,7 +833,8 @@ do_close_stream(StreamId, #data{streams = Streams} = StateData) ->
             case webtransport_stream:close_local(Stream) of
                 {ok, Stream1} ->
                     transport_send(StreamId, <<>>, true, StateData),
-                    {ok, StateData#data{streams = Streams#{StreamId => Stream1}}};
+                    {ok, release_stream_credit(
+                           StreamId, StateData#data{streams = Streams#{StreamId => Stream1}})};
                 {error, _} = Err ->
                     Err
             end;
@@ -739,7 +847,8 @@ do_reset_stream(StreamId, ErrorCode, #data{streams = Streams} = StateData) ->
         {ok, Stream} ->
             Stream1 = webtransport_stream:reset(Stream, ErrorCode),
             transport_reset_stream(StreamId, {app, ErrorCode}, Stream, StateData),
-            {ok, StateData#data{streams = Streams#{StreamId => Stream1}}};
+            {ok, release_stream_credit(
+                   StreamId, StateData#data{streams = Streams#{StreamId => Stream1}})};
         error ->
             {error, unknown_stream}
     end.
@@ -799,61 +908,72 @@ transport_call(Fun) ->
         exit:{{shutdown, _}, _} -> {error, closed}
     end.
 
+%% http3-17 §5.1: without flow control, flow-control capsules are ignored.
+handle_incoming_capsule(Capsule, #data{flow_control = false} = StateData)
+  when element(1, Capsule) =:= max_data; element(1, Capsule) =:= max_stream_data;
+       element(1, Capsule) =:= max_streams_bidi; element(1, Capsule) =:= max_streams_uni;
+       element(1, Capsule) =:= data_blocked; element(1, Capsule) =:= stream_data_blocked;
+       element(1, Capsule) =:= streams_blocked_bidi;
+       element(1, Capsule) =:= streams_blocked_uni ->
+    StateData;
+%% Every limit must strictly increase over the previous or initial value
+%% (http3-17 §5.6.2, §5.6.4; http2-16 §6.5-§6.7).
 handle_incoming_capsule({max_data, Limit}, #data{remote_max_data = Prev} = StateData) ->
-    %% Drafts: MUST close session with WT_FLOW_CONTROL_ERROR on decrease.
-    case Limit < Prev of
+    case Limit =< Prev of
         true ->
-            {session_error, ?WT_FLOW_CONTROL_ERROR, <<"max_data decreased">>};
+            {session_error, ?WT_FLOW_CONTROL_ERROR, <<"max_data did not increase">>};
         false ->
-            flush_h2_streams(StateData#data{remote_max_data = Limit})
+            flush_streams(StateData#data{remote_max_data = Limit})
     end;
 handle_incoming_capsule({max_stream_data, _StreamId, _Limit},
                         #data{transport = h3} = _StateData) ->
-    %% draft-15 §5.4: WT_MAX_STREAM_DATA is prohibited on h3.
+    %% http3-17 §5.4: no per-stream flow-control capsules on h3.
     {session_error, ?WT_FLOW_CONTROL_ERROR,
      <<"h3 prohibits per-stream flow control capsules">>};
 handle_incoming_capsule({max_stream_data, StreamId, Limit},
                         #data{streams = Streams} = StateData) ->
-    %% h2 only: peer raises the per-stream send window.
     case maps:find(StreamId, Streams) of
         {ok, Stream} ->
-            Current = webtransport_stream:send_window(Stream),
-            case Limit < Current of
+            case Limit =< webtransport_stream:send_window(Stream) of
                 true ->
                     {session_error, ?WT_FLOW_CONTROL_ERROR,
-                     <<"max_stream_data decreased">>};
+                     <<"max_stream_data did not increase">>};
                 false ->
                     Stream1 = webtransport_stream:update_send_window(Stream, Limit),
-                    flush_h2_streams(StateData#data{streams = Streams#{StreamId => Stream1}})
+                    flush_streams(StateData#data{streams = Streams#{StreamId => Stream1}})
             end;
         error ->
             StateData
     end;
+handle_incoming_capsule({max_streams_bidi, Limit}, _StateData) when Limit > ?MAX_STREAMS ->
+    {session_error, ?WT_FLOW_CONTROL_ERROR, <<"max_streams above 2^60">>};
+handle_incoming_capsule({max_streams_uni, Limit}, _StateData) when Limit > ?MAX_STREAMS ->
+    {session_error, ?WT_FLOW_CONTROL_ERROR, <<"max_streams above 2^60">>};
 handle_incoming_capsule({max_streams_bidi, Limit}, #data{remote_max_streams_bidi = Prev} = StateData) ->
-    case Limit < Prev of
-        true ->
-            {session_error, ?WT_FLOW_CONTROL_ERROR, <<"max_streams_bidi decreased">>};
-        false ->
-            StateData#data{remote_max_streams_bidi = Limit}
+    case Limit =< Prev of
+        true -> {session_error, ?WT_FLOW_CONTROL_ERROR, <<"max_streams_bidi did not increase">>};
+        false -> StateData#data{remote_max_streams_bidi = Limit}
     end;
 handle_incoming_capsule({max_streams_uni, Limit}, #data{remote_max_streams_uni = Prev} = StateData) ->
-    case Limit < Prev of
-        true ->
-            {session_error, ?WT_FLOW_CONTROL_ERROR, <<"max_streams_uni decreased">>};
-        false ->
-            StateData#data{remote_max_streams_uni = Limit}
+    case Limit =< Prev of
+        true -> {session_error, ?WT_FLOW_CONTROL_ERROR, <<"max_streams_uni did not increase">>};
+        false -> StateData#data{remote_max_streams_uni = Limit}
     end;
 handle_incoming_capsule({data_blocked, Limit}, StateData) ->
     logger:debug("peer data_blocked at ~p", [Limit]),
     StateData;
 handle_incoming_capsule({stream_data_blocked, _StreamId, _Limit},
                         #data{transport = h3} = _StateData) ->
-    %% draft-15 §5.4: WT_STREAM_DATA_BLOCKED is prohibited on h3.
+    %% http3-17 §5.4: no per-stream flow-control capsules on h3.
     {session_error, ?WT_FLOW_CONTROL_ERROR,
      <<"h3 prohibits per-stream flow control capsules">>};
 handle_incoming_capsule({stream_data_blocked, StreamId, Limit}, StateData) ->
     logger:debug("peer stream_data_blocked stream=~p limit=~p", [StreamId, Limit]),
     StateData;
+handle_incoming_capsule({streams_blocked_bidi, Limit}, _StateData) when Limit > ?MAX_STREAMS ->
+    {session_error, ?WT_FLOW_CONTROL_ERROR, <<"streams_blocked above 2^60">>};
+handle_incoming_capsule({streams_blocked_uni, Limit}, _StateData) when Limit > ?MAX_STREAMS ->
+    {session_error, ?WT_FLOW_CONTROL_ERROR, <<"streams_blocked above 2^60">>};
 handle_incoming_capsule({streams_blocked_bidi, Limit}, StateData) ->
     logger:debug("peer streams_blocked_bidi at ~p", [Limit]),
     StateData;
@@ -906,7 +1026,8 @@ handle_incoming_stream_data(StreamId, Data, Fin,
     case maps:find(StreamId, Streams) of
         {ok, Stream} ->
             Type = webtransport_stream:type(Stream),
-            case webtransport_stream:receive_data(Stream, Data) of
+            SessRecv1 = SessRecv + byte_size(Data),
+            case receive_into(Stream, Data, SessRecv1, StateData) of
                 {ok, Stream1} ->
                     Stream2 = case Fin of
                         true ->
@@ -919,11 +1040,18 @@ handle_incoming_stream_data(StreamId, Data, Fin,
                         true -> fun() -> Handler:handle_stream_fin(StreamId, Type, Data, HState) end;
                         false -> fun() -> Handler:handle_stream(StreamId, Type, Data, HState) end
                     end,
-                    StateData1 = StateData#data{bytes_received = SessRecv + byte_size(Data)},
+                    StateData1 = StateData#data{bytes_received = SessRecv1},
                     %% The handler consumes the bytes synchronously, so credit
                     %% can be returned to the peer right away.
                     {Stream3, StateData2} = grant_credit(StreamId, Stream2, StateData1),
-                    apply_stream_callback(Callback(), StreamId, Stream3, Streams, StateData2);
+                    {StateData3, Transition} =
+                        apply_stream_callback(Callback(), StreamId, Stream3, Streams, StateData2),
+                    {release_stream_credit(StreamId, StateData3), Transition};
+                {error, flow_control} ->
+                    %% http3-17 §5.4, http2-16 §6.5/§6.6: data beyond what we
+                    %% granted closes the session.
+                    fail_session(?WT_FLOW_CONTROL_ERROR, <<"flow control limit exceeded">>,
+                                 StateData);
                 {error, Reason} ->
                     logger:warning("webtransport: dropping ~p bytes on stream ~p: ~p",
                                    [byte_size(Data), StreamId, Reason]),
@@ -933,40 +1061,54 @@ handle_incoming_stream_data(StreamId, Data, Fin,
             {StateData, continue}
     end.
 
-%% h2 receive-side flow control (draft-14 §6): once half of a window has
-%% been consumed, advertise a new limit so the peer can keep sending. h3
-%% leaves this to QUIC.
+%% Account received bytes against the session limit and, on h2, the
+%% stream window.
+receive_into(_Stream, _Data, SessRecv, #data{flow_control = true, local_max_data = Max})
+  when SessRecv > Max ->
+    {error, flow_control};
+receive_into(Stream, Data, _SessRecv, #data{flow_control = FlowControl}) ->
+    case webtransport_stream:receive_data(Stream, Data) of
+        {error, flow_control_error} when FlowControl -> {error, flow_control};
+        Other -> Other
+    end.
+
+%% Receive-side credit (http3-17 §5.6, http2-16 §4.4): once half of a window
+%% has been consumed, advertise a new limit so the peer can keep sending.
+%% WT_MAX_DATA on both transports; WT_MAX_STREAM_DATA on h2 only.
 -spec grant_credit(non_neg_integer(), webtransport_stream:stream(), #data{}) ->
     {webtransport_stream:stream(), #data{}}.
+grant_credit(_StreamId, Stream, #data{flow_control = false} = StateData) ->
+    {Stream, StateData};
 grant_credit(StreamId, Stream,
-             #data{transport = h2, transport_state = H2State,
-                   bytes_received = SessRecv, local_max_data = LocalMax,
+             #data{bytes_received = SessRecv, local_max_data = LocalMax,
                    session_window = SessWindow} = StateData) ->
-    Window = webtransport_stream:recv_window(Stream),
-    Received = webtransport_stream:bytes_received(Stream),
-    Stream1 =
-        case webtransport_stream:is_readable(Stream) andalso
-             Received >= Window - (?DEFAULT_MAX_STREAM_DATA div 2) of
-            true ->
-                NewWindow = Received + ?DEFAULT_MAX_STREAM_DATA,
-                _ = webtransport_h2:send_capsule(
-                      H2State, wt_h2_capsule:max_stream_data(StreamId, NewWindow)),
-                webtransport_stream:update_recv_window(Stream, NewWindow);
-            false ->
-                Stream
-        end,
+    Stream1 = grant_stream_credit(StreamId, Stream, StateData),
     StateData1 =
         case SessRecv >= LocalMax - (SessWindow div 2) of
             true ->
                 NewMax = SessRecv + SessWindow,
-                _ = webtransport_h2:send_capsule(H2State, wt_h2_capsule:max_data(NewMax)),
+                send_flow_capsule({max_data, NewMax}, StateData),
                 StateData#data{local_max_data = NewMax};
             false ->
                 StateData
         end,
-    {Stream1, StateData1};
-grant_credit(_StreamId, Stream, StateData) ->
-    {Stream, StateData}.
+    {Stream1, StateData1}.
+
+grant_stream_credit(StreamId, Stream, #data{transport = h2,
+                                            local_max_stream_data = StreamWindow} = StateData) ->
+    Window = webtransport_stream:recv_window(Stream),
+    Received = webtransport_stream:bytes_received(Stream),
+    case webtransport_stream:is_readable(Stream) andalso
+         Received >= Window - (StreamWindow div 2) of
+        true ->
+            NewWindow = Received + StreamWindow,
+            send_flow_capsule({max_stream_data, StreamId, NewWindow}, StateData),
+            webtransport_stream:update_recv_window(Stream, NewWindow);
+        false ->
+            Stream
+    end;
+grant_stream_credit(_StreamId, Stream, _StateData) ->
+    Stream.
 
 apply_stream_callback({ok, HState1}, StreamId, Stream2, Streams, StateData) ->
     {StateData#data{streams = Streams#{StreamId => Stream2},
@@ -991,50 +1133,88 @@ handle_incoming_datagram(Data, #data{handler = Handler, handler_state = HState} 
             {StateData#data{handler_state = HState1}, {stop, Reason}}
     end.
 
+%% A stream opened by the peer. The peer may open as many streams as our
+%% cumulative limit; one more is a WT_FLOW_CONTROL_ERROR (http3-17 §5.6.2,
+%% http2-16 §6.7). On h2 a stream id implicitly opens every lower id of the
+%% same kind, so the count is the id's ordinal; on h3 QUIC stream ids are
+%% shared with other uses and each new stream counts one.
 handle_remote_stream_opened(StreamId, Type, #data{streams = Streams} = StateData) ->
-    case maps:is_key(StreamId, Streams) of
+    case maps:is_key(StreamId, Streams) orelse is_retired(StreamId, StateData) of
         true ->
-            StateData;
+            {StateData, continue};
         false ->
-            Limit = case Type of
-                bidi -> StateData#data.local_max_streams_bidi;
-                uni  -> StateData#data.local_max_streams_uni
-            end,
-            Count = count_peer_streams(Type, Streams, StateData#data.is_server),
-            case Count < Limit of
-                true ->
-                    Stream = webtransport_stream:new(StreamId, Type, initial_stream_window(StateData)),
-                    StateData#data{streams = Streams#{StreamId => Stream}};
-                false ->
-                    %% Peer exceeded our advertised stream limit.
-                    %% Reset the stream with WT_BUFFERED_STREAM_REJECTED.
-                    reject_excess_stream(StreamId, StateData),
-                    StateData
+            case peer_stream_allowed(StreamId, Type, StateData) of
+                {ok, Opened} ->
+                    Stream = new_stream(StreamId, peer, Type, StateData),
+                    StateData1 = set_peer_opened(Type, Opened, StateData),
+                    {StateData1#data{streams = Streams#{StreamId => Stream}}, continue};
+                exceeded ->
+                    fail_session(?WT_FLOW_CONTROL_ERROR, <<"stream limit exceeded">>,
+                                 StateData)
             end
     end.
 
-count_peer_streams(Type, Streams, IsServer) ->
-    maps:fold(fun(Sid, S, Acc) ->
-        StreamType = webtransport_stream:type(S),
-        Initiator = webtransport_stream:initiator(Sid),
-        IsPeer = case IsServer of
-            true  -> Initiator =:= client;
-            false -> Initiator =:= server
-        end,
-        case IsPeer andalso StreamType =:= Type of
-            true -> Acc + 1;
-            false -> Acc
-        end
-    end, 0, Streams).
+%% How many peer streams of this kind exist once `StreamId' is open, or
+%% `exceeded' when that is more than we allow.
+peer_stream_allowed(StreamId, Type, StateData) ->
+    Opened = peer_opened_after(StreamId, Type, StateData),
+    Limit = case Type of
+        bidi -> StateData#data.local_max_streams_bidi;
+        uni  -> StateData#data.local_max_streams_uni
+    end,
+    case StateData#data.flow_control andalso Opened > Limit of
+        true -> exceeded;
+        false -> {ok, Opened}
+    end.
 
-reject_excess_stream(StreamId, #data{transport = h3, transport_state = H3State}) ->
-    _ = webtransport_h3:reset_stream(H3State, StreamId,
-                                     {wt, ?WT_BUFFERED_STREAM_REJECTED}, 0),
-    ok;
-reject_excess_stream(StreamId, #data{transport = h2, transport_state = H2State}) ->
-    _ = webtransport_h2:send_capsule(H2State,
-            wt_h2_capsule:reset_stream(StreamId, ?WT_BUFFERED_STREAM_REJECTED)),
-    ok.
+peer_opened_after(StreamId, Type, #data{transport = h2} = StateData) ->
+    max(StreamId div 4 + 1, peer_opened(Type, StateData));
+peer_opened_after(_StreamId, Type, StateData) ->
+    peer_opened(Type, StateData) + 1.
+
+peer_opened(bidi, #data{peer_opened_bidi = N}) -> N;
+peer_opened(uni, #data{peer_opened_uni = N}) -> N.
+
+set_peer_opened(bidi, N, StateData) -> StateData#data{peer_opened_bidi = N};
+set_peer_opened(uni, N, StateData) -> StateData#data{peer_opened_uni = N}.
+
+%% A peer stream we already finished with and returned credit for.
+is_retired(StreamId, #data{credited = Credited}) ->
+    maps:is_key(StreamId, Credited).
+
+%% When a peer-initiated stream is finished, give its credit back: raise
+%% our limit for that kind by one and send WT_MAX_STREAMS, so the peer can
+%% always have as many streams open as we allow (http3-17 §5.6, http2-16
+%% §4.4 SHOULD). A peer uni stream is finished once it ended or was reset;
+%% a peer bidi stream once both directions are closed.
+release_stream_credit(StreamId, #data{streams = Streams, credited = Credited} = StateData) ->
+    case maps:find(StreamId, Streams) of
+        {ok, Stream} ->
+            case not is_local_stream(StreamId, StateData) andalso
+                 not maps:is_key(StreamId, Credited) andalso
+                 stream_finished(Stream) of
+                true ->
+                    StateData1 = StateData#data{credited = Credited#{StreamId => true}},
+                    raise_peer_limit(webtransport_stream:type(Stream), StateData1);
+                false ->
+                    StateData
+            end;
+        error ->
+            StateData
+    end.
+
+stream_finished(Stream) ->
+    case webtransport_stream:type(Stream) of
+        uni -> not webtransport_stream:is_readable(Stream);
+        bidi -> webtransport_stream:state(Stream) =:= closed
+    end.
+
+raise_peer_limit(bidi, #data{local_max_streams_bidi = L} = StateData) ->
+    send_flow_capsule({max_streams_bidi, L + 1}, StateData),
+    StateData#data{local_max_streams_bidi = L + 1};
+raise_peer_limit(uni, #data{local_max_streams_uni = L} = StateData) ->
+    send_flow_capsule({max_streams_uni, L + 1}, StateData),
+    StateData#data{local_max_streams_uni = L + 1}.
 
 handle_remote_stream_closed(StreamId, Reason,
                              #data{streams = Streams, handler = Handler,
@@ -1042,15 +1222,13 @@ handle_remote_stream_closed(StreamId, Reason,
     case maps:find(StreamId, Streams) of
         {ok, Stream} ->
             Stream1 = webtransport_stream:close(Stream),
+            StateData1 = release_stream_credit(
+                           StreamId, StateData#data{streams = Streams#{StreamId => Stream1}}),
             case Handler:handle_stream_closed(StreamId, Reason, HState) of
                 {ok, HState1} ->
-                    {StateData#data{streams = Streams#{StreamId => Stream1},
-                                    handler_state = HState1},
-                     continue};
+                    {StateData1#data{handler_state = HState1}, continue};
                 {stop, StopReason, HState1} ->
-                    {StateData#data{streams = Streams#{StreamId => Stream1},
-                                    handler_state = HState1},
-                     {stop, StopReason}}
+                    {StateData1#data{handler_state = HState1}, {stop, StopReason}}
             end;
         error ->
             {StateData, continue}
@@ -1093,6 +1271,8 @@ dispatch_action({open_stream, Type} = Action, StateData) ->
     case do_open_stream(Type, StateData) of
         {ok, _StreamId, StateData1} ->
             {StateData1, continue};
+        {error, stream_limit_reached = Reason} ->
+            handle_action_failure(Action, Reason, mark_blocked(Type, StateData));
         {error, Reason} ->
             handle_action_failure(Action, Reason, StateData)
     end;
@@ -1185,14 +1365,6 @@ transport_stop_sending(StreamId, {_, Code}, #data{transport = h2, transport_stat
     webtransport_h2:stop_sending(H2State, StreamId, Code);
 transport_stop_sending(StreamId, Code, #data{transport = h3, transport_state = H3State}) ->
     webtransport_h3:stop_sending(H3State, StreamId, Code).
-
-count_streams(Type, Streams) ->
-    maps:fold(fun(_Id, Stream, Acc) ->
-        case webtransport_stream:type(Stream) of
-            Type -> Acc + 1;
-            _ -> Acc
-        end
-    end, 0, Streams).
 
 maybe_stop_if_drained(#data{streams = Streams} = StateData, Actions) ->
     OpenCount = maps:fold(fun(_Id, Stream, Acc) ->
@@ -1288,9 +1460,65 @@ handle_incoming_capsule_max_data_monotonic_test() ->
                  handle_incoming_capsule({max_data, 500}, Data)),
     %% Increase is accepted.
     ?assertEqual(2000, (handle_incoming_capsule({max_data, 2000}, Data))#data.remote_max_data),
-    %% Equal is accepted (not a decrease).
-    ?assertEqual(1000, (handle_incoming_capsule({max_data, 1000}, Data))#data.remote_max_data),
+    %% http3-17 §5.6.4, http2-16 §6.5: a value that does not increase the
+    %% limit is an error too.
+    ?assertMatch({session_error, ?WT_FLOW_CONTROL_ERROR, _},
+                 handle_incoming_capsule({max_data, 1000}, Data)),
     ok.
+
+test_data() ->
+    #data{streams = #{}, transport = h2,
+          remote_max_data = 0, remote_max_streams_bidi = 10,
+          remote_max_streams_uni = 10, local_max_data = 100,
+          local_max_streams_bidi = 3, local_max_streams_uni = 3,
+          is_server = true, next_bidi_id = 1, next_uni_id = 3,
+          request = #{}, handler = undefined, handler_state = undefined}.
+
+max_streams_rules_test_() ->
+    Data = test_data(),
+    [
+        ?_assertMatch({session_error, ?WT_FLOW_CONTROL_ERROR, _},
+                      handle_incoming_capsule({max_streams_bidi, 10}, Data)),
+        ?_assertMatch({session_error, ?WT_FLOW_CONTROL_ERROR, _},
+                      handle_incoming_capsule({max_streams_uni, (1 bsl 60) + 1}, Data)),
+        ?_assertMatch({session_error, ?WT_FLOW_CONTROL_ERROR, _},
+                      handle_incoming_capsule({streams_blocked_bidi, (1 bsl 60) + 1}, Data)),
+        ?_assertEqual(11, (handle_incoming_capsule({max_streams_bidi, 11}, Data))
+                          #data.remote_max_streams_bidi)
+    ].
+
+%% http3-17 §5.1: without flow control, flow-control capsules are ignored.
+flow_control_off_test_() ->
+    Data = (test_data())#data{flow_control = false},
+    [
+        ?_assertEqual(Data, handle_incoming_capsule({max_data, 0}, Data)),
+        ?_assertEqual(Data, handle_incoming_capsule({max_streams_bidi, 1 bsl 61}, Data))
+    ].
+
+%% http2-16 §6.7: a stream id opens every lower id of its kind, so the
+%% peer's count is the id's ordinal; above our limit is an error.
+peer_stream_limit_test_() ->
+    Data = test_data(),
+    [
+        ?_assertEqual({ok, 1}, peer_stream_allowed(0, bidi, Data)),
+        ?_assertEqual({ok, 3}, peer_stream_allowed(8, bidi, Data)),
+        ?_assertEqual(exceeded, peer_stream_allowed(12, bidi, Data)),
+        ?_assertEqual({ok, 1},
+                      peer_stream_allowed(12, bidi, Data#data{transport = h3})),
+        ?_assertEqual({ok, 4},
+                      peer_stream_allowed(12, bidi, Data#data{flow_control = false}))
+    ].
+
+%% Data beyond the session limit is a flow-control error.
+receive_limit_test_() ->
+    Stream = webtransport_stream:new(0, bidi, 1000, 1000),
+    Data = test_data(),
+    [
+        ?_assertMatch({ok, _}, receive_into(Stream, <<"x">>, 100, Data)),
+        ?_assertEqual({error, flow_control}, receive_into(Stream, <<"x">>, 101, Data)),
+        ?_assertMatch({ok, _}, receive_into(Stream, <<"x">>, 101,
+                                            Data#data{flow_control = false}))
+    ].
 
 handle_incoming_capsule_stop_sending_test() ->
     Stream = webtransport_stream:new(4, bidi, 1024),

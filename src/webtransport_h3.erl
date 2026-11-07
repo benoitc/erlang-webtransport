@@ -14,7 +14,7 @@
 -export([session_id/1, h3_conn/1, quic_conn/1, peer_settings/1, router/1]).
 -export([open_bidi_stream/1, open_uni_stream/1]).
 -export([send/4, send_datagram/2]).
--export([close_session/3, drain_session/1]).
+-export([close_session/3, drain_session/1, send_capsule/2]).
 -export([reset_stream/4, stop_sending/3, stream_header_size/2]).
 -export([decode_stream_header/1, decode_datagram/1]).
 
@@ -182,6 +182,11 @@ close_session(#state{h3_conn = H3Conn, session_id = SessionId}, ErrorCode, Reaso
         Capsule ->
             quic_h3:send_data(H3Conn, SessionId, wt_h3_capsule:encode(Capsule), true)
     end.
+
+%% @doc Send a session-level capsule (flow control) on the CONNECT stream.
+-spec send_capsule(state(), wt_h3_capsule:capsule()) -> ok | {error, term()}.
+send_capsule(#state{h3_conn = H3Conn, session_id = SessionId}, Capsule) ->
+    quic_h3:send_data(H3Conn, SessionId, wt_h3_capsule:encode(Capsule), false).
 
 %% @doc Send a DRAIN_WEBTRANSPORT_SESSION capsule to signal graceful shutdown.
 -spec drain_session(state()) -> ok | {error, term()}.

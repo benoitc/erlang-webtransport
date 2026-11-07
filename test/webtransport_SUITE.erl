@@ -59,6 +59,8 @@
     close_session_reason_too_long_test/1,
     origin_check_reject_test/1,
     protocol_negotiation_test/1,
+    flow_control_credit_test/1,
+    stream_credit_replenish_test/1,
     server_without_wt_enabled_test/1,
     invalid_webtransport_init_test/1,
 
@@ -91,6 +93,8 @@ groups() ->
         origin_check_reject_test,
         protocol_negotiation_test,
         server_without_wt_enabled_test,
+        flow_control_credit_test,
+        stream_credit_replenish_test,
         connect_disconnect_test,
         session_info_test,
         open_bidi_stream_test,
@@ -863,6 +867,84 @@ protocol_negotiation_test(Config) ->
         timer:sleep(100),
         flush_exits(),
         process_flag(trap_exit, false)
+    end.
+
+%% http3-17 §5.4, http2-16 §6.5/§6.6: with windows far smaller than the
+%% payload, the echo only completes if each side keeps granting credit as
+%% it consumes data (WT_MAX_DATA, and WT_MAX_STREAM_DATA on h2), and the
+%% sender queues what does not fit instead of dropping it.
+flow_control_credit_test(Config) ->
+    Port = proplists:get_value(port, Config),
+    {ok, Session} = webtransport:connect("localhost", Port, <<"/test">>, #{
+        transport => proplists:get_value(transport, Config),
+        verify => verify_none,
+        max_data => 256,
+        max_stream_data => 256
+    }),
+    {ok, StreamId} = webtransport:open_stream(Session, bidi),
+    Payload = test_helpers:random_data(16 * 1024),
+    ok = webtransport:send(Session, StreamId, Payload, fin),
+    Echoed = collect_stream_echo(Session, StreamId, <<>>, 10000),
+    Size = byte_size(Payload),
+    ?assert(byte_size(Echoed) >= Size),
+    ?assertEqual(Payload, binary:part(Echoed, byte_size(Echoed) - Size, Size)),
+    webtransport:close_session(Session).
+
+%% http3-17 §5.6.2, http2-16 §6.7: stream limits are cumulative. The server
+%% allows 2 bidi streams and returns credit (WT_MAX_STREAMS) as each one
+%% finishes, so the client can open many more over the session's life. A
+%% client that hits the limit is told when credit comes back
+%% (overview-14 §4.3).
+stream_credit_replenish_test(Config) ->
+    process_flag(trap_exit, true),
+    Transport = proplists:get_value(transport, Config),
+    Port = test_helpers:find_free_port(),
+    Name = list_to_atom("credit_listener_" ++ atom_to_list(Transport)),
+    {ok, _} = webtransport:start_listener(Name, #{
+        transport => Transport,
+        port => Port,
+        certfile => proplists:get_value(certfile, Config),
+        keyfile => proplists:get_value(keyfile, Config),
+        handler => wt_echo_handler,
+        max_streams_bidi => 2
+    }),
+    try
+        timer:sleep(100),
+        {ok, Session} = webtransport:connect("localhost", Port, <<"/test">>, #{
+            transport => Transport,
+            verify => verify_none
+        }),
+        {ok, Info} = webtransport:session_info(Session),
+        ?assertEqual(2, maps:get(remote_max_streams_bidi, Info)),
+        lists:foreach(fun(N) ->
+            StreamId = open_bidi_when_allowed(Session),
+            Payload = <<"msg ", (integer_to_binary(N))/binary>>,
+            ok = webtransport:send(Session, StreamId, Payload, fin),
+            Echoed = collect_stream_echo(Session, StreamId, <<>>, 5000),
+            ?assertEqual(Payload, binary:part(Echoed, byte_size(Echoed) - byte_size(Payload),
+                                              byte_size(Payload)))
+        end, lists:seq(1, 10)),
+        {ok, Info2} = webtransport:session_info(Session),
+        ?assert(maps:get(remote_max_streams_bidi, Info2) >= 10),
+        webtransport:close_session(Session)
+    after
+        webtransport:stop_listener(Name),
+        timer:sleep(100),
+        flush_exits(),
+        process_flag(trap_exit, false)
+    end.
+
+open_bidi_when_allowed(Session) ->
+    case webtransport:open_stream(Session, bidi) of
+        {ok, StreamId} ->
+            StreamId;
+        {error, stream_limit_reached} ->
+            receive
+                {webtransport, Session, {stream_credit, bidi}} ->
+                    open_bidi_when_allowed(Session)
+            after 5000 ->
+                error(no_stream_credit)
+            end
     end.
 
 %% http3-17 §3.1, http2-16 §3.1: a client MUST NOT open a session until the

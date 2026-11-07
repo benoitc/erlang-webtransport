@@ -123,11 +123,33 @@
     Opts :: map(),
     Result :: accept | {reject, Status :: 400..599, Reason :: binary()}.
 
+%% Optional subprotocol choice (http3-17 §3.3, http2-16 §3.3). `Offered'
+%% is the client's WT-Available-Protocols list, empty when it sent none.
+%% Return one of them to send it back in WT-Protocol, `none' to accept
+%% without a protocol, or `{reject, Status}' to refuse the session.
+%% Defaults to `none' when not exported.
+-callback select_protocol(Offered, Opts) -> Result when
+    Offered :: [binary()],
+    Opts :: map(),
+    Result :: {ok, binary()} | none | {reject, Status :: 400..599}.
+
+%% Optional notice that the peer raised its stream limit for `Type' after
+%% an open of that type failed with `stream_limit_reached' (overview-14
+%% §4.3). Opening the stream again will now succeed.
+-callback handle_stream_credit(Type, State) -> Result when
+    Type :: bidi | uni,
+    State :: term(),
+    Result :: {ok, NewState} | {ok, NewState, Actions} | {stop, Reason, NewState},
+    NewState :: term(),
+    Actions :: [action()],
+    Reason :: term().
+
 %% Optional callbacks. `init/3' is preferred; `init/2' is a back-compat
 %% shim that only gets called when the handler module does not export
 %% `init/3'.
 -optional_callbacks([init/2, init/3, handle_stream_fin/4, handle_info/2,
-                     handle_action_failed/3, origin_check/2]).
+                     handle_action_failed/3, origin_check/2,
+                     select_protocol/2, handle_stream_credit/2]).
 
 %% Types
 -type action() ::
