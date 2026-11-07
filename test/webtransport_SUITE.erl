@@ -58,6 +58,9 @@
     server_initiated_bidi_test/1,
     close_session_reason_too_long_test/1,
     origin_check_reject_test/1,
+    protocol_negotiation_test/1,
+    server_without_wt_enabled_test/1,
+    invalid_webtransport_init_test/1,
 
     %% Embedding (accept/4 from a non-connection process)
     embedded_accept_round_trip_test/1,
@@ -86,6 +89,8 @@ groups() ->
     Cases = [
         close_session_reason_too_long_test,
         origin_check_reject_test,
+        protocol_negotiation_test,
+        server_without_wt_enabled_test,
         connect_disconnect_test,
         session_info_test,
         open_bidi_stream_test,
@@ -122,9 +127,11 @@ groups() ->
     ],
     %% Embedding via h3_settings/0 + accept/4 is HTTP/3-only.
     H3Only = [embedded_accept_round_trip_test],
+    %% WebTransport-Init is an HTTP/2 header.
+    H2Only = [invalid_webtransport_init_test],
     [
         {h3_tests, [sequence], Cases ++ H3Only},
-        {h2_tests, [sequence], Cases}
+        {h2_tests, [sequence], Cases ++ H2Only}
     ].
 
 init_per_suite(Config) ->
@@ -815,6 +822,115 @@ origin_check_reject_test(Config) ->
         timer:sleep(100),
         flush_exits(),
         process_flag(trap_exit, false)
+    end.
+
+%% http3-17 §3.3, http2-16 §3.3: the client offers protocols, the server
+%% picks one of them, and the client refuses a missing pick when it
+%% requires one.
+protocol_negotiation_test(Config) ->
+    process_flag(trap_exit, true),
+    Transport = proplists:get_value(transport, Config),
+    Port = test_helpers:find_free_port(),
+    Name = list_to_atom("proto_listener_" ++ atom_to_list(Transport)),
+    {ok, _} = webtransport:start_listener(Name, #{
+        transport => Transport,
+        port => Port,
+        certfile => proplists:get_value(certfile, Config),
+        keyfile => proplists:get_value(keyfile, Config),
+        handler => wt_protocol_handler
+    }),
+    Connect = fun(Extra) ->
+        webtransport:connect("localhost", Port, <<"/test">>,
+                             maps:merge(#{transport => Transport,
+                                          verify => verify_none}, Extra))
+    end,
+    try
+        timer:sleep(100),
+        {ok, S1} = Connect(#{protocols => [<<"chat/1">>, <<"chat/2">>]}),
+        {ok, Info} = webtransport:session_info(S1),
+        ?assertEqual(<<"chat/2">>, maps:get(protocol, Info)),
+        ok = webtransport:close_session(S1),
+        {ok, S2} = Connect(#{protocols => [<<"other">>]}),
+        {ok, Info2} = webtransport:session_info(S2),
+        ?assertNot(maps:is_key(protocol, Info2)),
+        ok = webtransport:close_session(S2),
+        ?assertEqual({error, {alpn_error, no_protocol}},
+                     Connect(#{protocols => [<<"other">>], require_protocol => true})),
+        ?assertMatch({error, {http_error, 400}},
+                     Connect(#{protocols => [<<"reject-me">>]}))
+    after
+        webtransport:stop_listener(Name),
+        timer:sleep(100),
+        flush_exits(),
+        process_flag(trap_exit, false)
+    end.
+
+%% http3-17 §3.1, http2-16 §3.1: a client MUST NOT open a session until the
+%% server sent SETTINGS_WT_ENABLED. Run a bare server that only enables
+%% extended CONNECT.
+server_without_wt_enabled_test(Config) ->
+    process_flag(trap_exit, true),
+    Transport = proplists:get_value(transport, Config),
+    Port = test_helpers:find_free_port(),
+    Stop = start_bare_server(Transport, Port, Config),
+    try
+        timer:sleep(100),
+        ?assertEqual({error, wt_not_enabled},
+                     webtransport:connect("localhost", Port, <<"/test">>,
+                                          #{transport => Transport,
+                                            verify => verify_none}))
+    after
+        Stop(),
+        flush_exits(),
+        process_flag(trap_exit, false)
+    end.
+
+start_bare_server(h3, Port, Config) ->
+    {ok, CertPem} = file:read_file(proplists:get_value(certfile, Config)),
+    [{_, CertDer, _} | _] = public_key:pem_decode(CertPem),
+    {ok, KeyPem} = file:read_file(proplists:get_value(keyfile, Config)),
+    [KeyEntry] = public_key:pem_decode(KeyPem),
+    Name = bare_h3_server,
+    {ok, _} = quic_h3:start_server(Name, Port, #{
+        cert => CertDer,
+        key => public_key:pem_entry_decode(KeyEntry),
+        settings => #{enable_connect_protocol => 1},
+        h3_datagram_enabled => true,
+        quic_opts => #{max_datagram_frame_size => 65535, reset_stream_at => true},
+        handler => fun(C, S, _, _, _) -> quic_h3:send_response(C, S, 200, []) end
+    }),
+    fun() -> quic_h3:stop_server(Name) end;
+start_bare_server(h2, Port, Config) ->
+    {ok, Ref} = h2:start_server(Port, #{
+        cert => proplists:get_value(certfile, Config),
+        key => proplists:get_value(keyfile, Config),
+        enable_connect_protocol => true,
+        settings => #{enable_connect_protocol => 1},
+        handler => fun(C, S, _, _, _) -> h2:send_response(C, S, 200, []) end
+    }),
+    fun() -> h2:stop_server(Ref) end.
+
+%% http2-16 §4.3.2: a WebTransport-Init that does not hold valid values is
+%% rejected with a 4xx.
+invalid_webtransport_init_test(Config) ->
+    Port = proplists:get_value(port, Config),
+    {ok, Conn} = h2:connect("localhost", Port, #{
+        ssl_opts => [{verify, verify_none}, {alpn_advertised_protocols, [<<"h2">>]}]
+    }),
+    try
+        Headers = [{<<":protocol">>, <<"webtransport">>},
+                   {<<":scheme">>, <<"https">>},
+                   {<<":path">>, <<"/test">>},
+                   {<<"host">>, <<"localhost">>},
+                   {<<"webtransport-init">>, <<"u=abc">>}],
+        {ok, Sid} = h2:request(Conn, <<"CONNECT">>, <<"/test">>, Headers),
+        receive
+            {h2, Conn, {response, Sid, Status, _}} -> ?assertEqual(400, Status)
+        after 5000 ->
+            error(no_response)
+        end
+    after
+        h2:close(Conn)
     end.
 
 collect_stream_echo(Session, StreamId, Acc, Timeout) ->

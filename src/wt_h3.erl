@@ -14,10 +14,14 @@
 -export([request_session/4, request_session/5]).
 -export([response_status/1, is_success_response/1]).
 -export([validate_wt_support/2, validate_wt_support/3]).
+-export([validate_client/2, select_draft/1]).
 -export([detect_compat_mode/1]).
 -export([send_capsule/3, close_session/4, drain_session/2]).
 
 -include("webtransport.hrl").
+
+%% SETTINGS_H3_DATAGRAM (RFC 9297 §2.1.1).
+-define(H3_SETTING_DATAGRAM, 16#33).
 
 -type headers() :: [{binary(), binary()}].
 -type compat_mode() :: latest | legacy_browser_compat.
@@ -217,7 +221,11 @@ is_success_response(Headers) ->
 validate_wt_support(H3Conn, QuicConn) ->
     validate_wt_support(H3Conn, QuicConn, latest).
 
-%% @doc Check that the peer advertises WebTransport support for the given compat mode.
+%% @doc Check, on the client, that the server meets http3-17 §3.1: it
+%% advertises SETTINGS_WT_ENABLED = 1 for our draft, extended CONNECT and
+%% HTTP/3 datagrams, and its transport parameters enable QUIC datagrams and
+%% RESET_STREAM_AT. Draft-02 servers (legacy mode) predate RESET_STREAM_AT
+%% and are not held to it.
 -spec validate_wt_support(pid(), pid(), compat_mode()) -> ok | {error, term()}.
 validate_wt_support(H3Conn, QuicConn, CompatMode) ->
     case quic_h3:get_peer_settings(H3Conn) of
@@ -225,30 +233,45 @@ validate_wt_support(H3Conn, QuicConn, CompatMode) ->
             {error, settings_not_received};
         PeerSettings ->
             case validate_required_settings(PeerSettings, CompatMode) of
-                ok -> validate_transport_params(QuicConn);
+                ok -> validate_transport_params(QuicConn, CompatMode);
                 Err -> Err
             end
     end.
 
-validate_transport_params(QuicConn) ->
+%% @doc Check, on the server, the client's SETTINGS and transport
+%% parameters (http3-17 §3.1): HTTP/3 datagrams, QUIC datagrams and
+%% RESET_STREAM_AT must all be enabled.
+-spec validate_client(pid(), map()) -> ok | {error, term()}.
+validate_client(H3Conn, PeerSettings) ->
+    case peer_setting(PeerSettings, ?H3_SETTING_DATAGRAM) of
+        1 -> validate_transport_params(quic_h3:get_quic_conn(H3Conn), latest);
+        _ -> {error, h3_datagram_not_enabled}
+    end.
+
+%% @doc Pick the draft for a client from its SETTINGS_WT_ENABLED
+%% codepoints (http3-17 §7.1): -17 if it sent that one, else -15 if it sent
+%% that one, else -17.
+-spec select_draft(map()) -> h3_17 | h3_15.
+select_draft(PeerSettings) ->
+    case {peer_setting(PeerSettings, ?SETTINGS_WT_ENABLED_H3),
+          peer_setting(PeerSettings, ?SETTINGS_WT_ENABLED_H3_D15)} of
+        {1, _} -> h3_17;
+        {_, 1} -> h3_15;
+        _ -> h3_17
+    end.
+
+validate_transport_params(QuicConn, CompatMode) ->
     case quic:get_peer_transport_params(QuicConn) of
         {ok, TP} ->
-            case maps:get(max_datagram_frame_size, TP, 0) of
-                0 -> {error, datagrams_not_enabled};
-                _ ->
-                    %% reset_stream_at is required by draft-15 §3.1.
-                    %% If the peer does not advertise it, warn but allow
-                    %% (many implementations have not adopted it yet).
-                    case maps:get(reset_stream_at, TP, false) of
-                        true -> ok;
-                        false ->
-                            logger:debug("peer does not advertise reset_stream_at"),
-                            ok
-                    end
+            case {maps:get(max_datagram_frame_size, TP, 0),
+                  maps:get(reset_stream_at, TP, false), CompatMode} of
+                {0, _, _} -> {error, datagrams_not_enabled};
+                {_, true, _} -> ok;
+                {_, _, legacy_browser_compat} -> ok;
+                {_, _, latest} -> {error, reset_stream_at_not_enabled}
             end;
-        {error, _} ->
-            %% Transport params not yet available (rare race).
-            ok
+        {error, Reason} ->
+            {error, {transport_params_unavailable, Reason}}
     end.
 
 validate_required_settings(PeerSettings, CompatMode) ->
@@ -259,11 +282,13 @@ validate_required_settings(PeerSettings, CompatMode) ->
 
 check_wt_setting(PeerSettings, latest) ->
     %% http3-17 §3.1: the server MUST advertise SETTINGS_WT_ENABLED = 1 under
-    %% the codepoint of the draft we speak; a value above 1 is an
-    %% H3_SETTINGS_ERROR.
-    case peer_setting(PeerSettings, ?SETTINGS_WT_ENABLED_H3) of
-        1 -> ok;
-        V when is_integer(V), V > 1 -> {error, {settings_error, wt_enabled}};
+    %% the codepoint of the draft we speak (a value above 1 is an
+    %% H3_SETTINGS_ERROR), and HTTP/3 datagrams.
+    case {peer_setting(PeerSettings, ?SETTINGS_WT_ENABLED_H3),
+          peer_setting(PeerSettings, ?H3_SETTING_DATAGRAM)} of
+        {V, _} when is_integer(V), V > 1 -> {error, {settings_error, wt_enabled}};
+        {1, 1} -> ok;
+        {1, _} -> {error, h3_datagram_not_enabled};
         _ -> {error, wt_not_enabled}
     end;
 check_wt_setting(PeerSettings, legacy_browser_compat) ->
@@ -380,6 +405,26 @@ wt_enabled_codepoints_test_() ->
         ?_assertEqual(1, maps:get(16#20b8933b, Client)),
         ?_assertNot(maps:is_key(16#2c7cf000, Client)),
         ?_assertEqual(10, maps:get(wt_initial_max_data, Client))
+    ].
+
+select_draft_test_() ->
+    [
+        ?_assertEqual(h3_17, select_draft(#{16#20b8933b => 1, wt_enabled => 1})),
+        ?_assertEqual(h3_15, select_draft(#{16#2c7cf000 => 1})),
+        ?_assertEqual(h3_17, select_draft(#{}))
+    ].
+
+check_wt_setting_test_() ->
+    Ok = #{16#20b8933b => 1, h3_datagram => 1},
+    [
+        ?_assertEqual(ok, check_wt_setting(Ok, latest)),
+        ?_assertEqual({error, {settings_error, wt_enabled}},
+                      check_wt_setting(Ok#{16#20b8933b => 2}, latest)),
+        ?_assertEqual({error, h3_datagram_not_enabled},
+                      check_wt_setting(maps:remove(h3_datagram, Ok), latest)),
+        %% A server that only speaks http3-15.
+        ?_assertEqual({error, wt_not_enabled},
+                      check_wt_setting(#{16#2c7cf000 => 1, h3_datagram => 1}, latest))
     ].
 
 peer_setting_test_() ->

@@ -20,6 +20,7 @@
 
 -export([new/2, with_peer_settings/2]).
 -export([h2_conn/1, connect_stream_id/1, peer_settings/1]).
+-export([response_headers/1, peer_stream_data/1]).
 -export([open_stream/3]).
 -export([send/4, send_datagram/2]).
 -export([close_session/3, drain_session/1]).
@@ -36,7 +37,13 @@
 -record(state, {
     h2_conn :: pid(),
     connect_stream_id :: non_neg_integer(),
+    %% The peer's HTTP/2 SETTINGS when the session was set up.
     peer_settings = #{} :: map(),
+    %% Per-stream data limits the peer granted us, as WebTransport-Init
+    %% keys (u, bl, br): its SETTINGS and WebTransport-Init combined.
+    peer_stream_data = #{} :: wt_h2_init:init_params(),
+    %% Client only: headers of the 2xx response.
+    response_headers = [] :: [{binary(), binary()}],
     recv_buffer = <<>> :: binary()
 }).
 
@@ -76,6 +83,14 @@ connect_stream_id(#state{connect_stream_id = StreamId}) ->
 peer_settings(#state{peer_settings = PeerSettings}) ->
     PeerSettings.
 
+-spec peer_stream_data(state()) -> wt_h2_init:init_params().
+peer_stream_data(#state{peer_stream_data = Data}) ->
+    Data.
+
+-spec response_headers(state()) -> [{binary(), binary()}].
+response_headers(#state{response_headers = Headers}) ->
+    Headers.
+
 %% ============================================================================
 %% Client Connection
 %% ============================================================================
@@ -91,44 +106,88 @@ connect(Host, Port, Path, Opts) ->
     H2Host = h2_host(Host),
     SSLOpts = maps:get(ssl_opts, Opts, []),
     H2Opts = #{
-        ssl_opts => [{alpn_advertised_protocols, [<<"h2">>]} | SSLOpts]
+        ssl_opts => [{alpn_advertised_protocols, [<<"h2">>]} | SSLOpts],
+        settings => maps:get(settings, Opts, #{})
     },
     case h2:connect(H2Host, Port, H2Opts) of
         {ok, H2Conn} ->
-            Authority = authority(Host, Port),
-            Headers = request_headers(Authority, Path, maps:get(headers, Opts, [])),
-            case h2:request(H2Conn, <<"CONNECT">>, Path, Headers) of
-                {ok, StreamId} ->
-                    %% Wait for response
-                    receive
-                        {h2, H2Conn, {response, StreamId, Status, RespHeaders}} when Status >= 200, Status < 300 ->
-                            State = new(H2Conn, StreamId),
-                            {ok, extract_peer_settings(State, RespHeaders)};
-                        {h2, H2Conn, {response, StreamId, Status, _RespHeaders}} ->
-                            h2:close(H2Conn),
-                            {error, {http_error, Status}};
-                        {h2, H2Conn, {stream_reset, StreamId, ErrorCode}} ->
-                            h2:close(H2Conn),
-                            {error, {stream_reset, ErrorCode}};
-                        {h2, H2Conn, {closed, _Reason}} ->
-                            {error, connection_closed};
-                        {h2, H2Conn, closed} ->
-                            {error, connection_closed}
-                    after
-                        maps:get(timeout, Opts, 30000) ->
-                            h2:close(H2Conn),
-                            {error, timeout}
-                    end;
-                {error, Reason} ->
+            %% h2:connect returns once the SETTINGS exchange is done.
+            PeerSettings = h2:get_peer_settings(H2Conn),
+            case check_wt_enabled(PeerSettings) of
+                ok ->
+                    send_connect(H2Conn, Host, Port, Path, Opts, PeerSettings);
+                {error, {settings_error, _}} = Err ->
+                    %% http2-16 §3.1: a value above 1 is a connection error
+                    %% of type PROTOCOL_ERROR.
+                    _ = h2:goaway(H2Conn, protocol_error),
                     h2:close(H2Conn),
-                    {error, Reason}
+                    Err;
+                {error, _} = Err ->
+                    h2:close(H2Conn),
+                    Err
             end;
         {error, Reason} ->
             {error, Reason}
     end.
 
-%% Format an HTTP `:authority' from a host (string/binary/IP tuple) and port.
-%% IPv6 literals and 8-tuple addresses are bracketed per RFC 3986.
+%% http2-16 §3.1: a client MUST NOT open a session until the server sent
+%% SETTINGS_WT_ENABLED = 1.
+-spec check_wt_enabled(map()) -> ok | {error, term()}.
+check_wt_enabled(PeerSettings) ->
+    case maps:get(?SETTINGS_WT_ENABLED_H2, PeerSettings, 0) of
+        1 -> ok;
+        V when is_integer(V), V > 1 -> {error, {settings_error, wt_enabled}};
+        _ -> {error, wt_not_enabled}
+    end.
+
+send_connect(H2Conn, Host, Port, Path, Opts, PeerSettings) ->
+    Authority = authority(Host, Port),
+    Headers = request_headers(Authority, Path, maps:get(headers, Opts, []), Opts),
+    case h2:request(H2Conn, <<"CONNECT">>, Path, Headers) of
+        {ok, StreamId} ->
+            receive
+                {h2, H2Conn, {response, StreamId, Status, RespHeaders}}
+                  when Status >= 200, Status < 300 ->
+                    State = new(H2Conn, StreamId),
+                    {ok, State#state{
+                        peer_settings = PeerSettings,
+                        peer_stream_data = response_stream_data(PeerSettings, RespHeaders),
+                        response_headers = RespHeaders
+                    }};
+                {h2, H2Conn, {response, StreamId, Status, _RespHeaders}} ->
+                    h2:close(H2Conn),
+                    {error, {http_error, Status}};
+                {h2, H2Conn, {stream_reset, StreamId, ErrorCode}} ->
+                    h2:close(H2Conn),
+                    {error, {stream_reset, ErrorCode}};
+                {h2, H2Conn, {closed, _Reason}} ->
+                    {error, connection_closed};
+                {h2, H2Conn, closed} ->
+                    {error, connection_closed}
+            after
+                maps:get(timeout, Opts, 30000) ->
+                    h2:close(H2Conn),
+                    {error, timeout}
+            end;
+        {error, Reason} ->
+            h2:close(H2Conn),
+            {error, Reason}
+    end.
+
+%% Per-stream limits the server granted: its SETTINGS, raised by a
+%% WebTransport-Init in the response if it sent one.
+response_stream_data(PeerSettings, RespHeaders) ->
+    FromSettings = wt_h2_init:from_settings(PeerSettings),
+    case lists:keyfind(<<"webtransport-init">>, 1, RespHeaders) of
+        {_, InitBin} ->
+            case wt_h2_init:parse(InitBin) of
+                {ok, Init} -> wt_h2_init:apply_greater_of(Init, FromSettings);
+                {error, _} -> FromSettings
+            end;
+        false ->
+            FromSettings
+    end.
+
 authority(Host, Port) when is_tuple(Host) ->
     authority(inet:ntoa(Host), Port);
 authority(Host, Port) when is_list(Host) ->
@@ -183,16 +242,14 @@ request_headers(Authority, Path, ExtraHeaders, ConnectOpts) ->
         {<<":path">>, Path},
         {<<"host">>, Authority}
     ],
-    %% Emit WebTransport-Init if the caller provided initial windows.
-    InitParams = maps:fold(fun
-        (max_streams_uni, V, Acc) -> Acc#{u => V};
-        (max_streams_bidi, V, Acc) -> Acc#{bl => V};
-        (max_data, V, Acc) -> Acc#{br => V};
-        (_, _, Acc) -> Acc
-    end, #{}, ConnectOpts),
-    InitHeader = case map_size(InitParams) of
-        0 -> [];
-        _ -> [{<<"webtransport-init">>, wt_h2_init:encode(InitParams)}]
+    %% WebTransport-Init carries per-stream data limits only (http2-16
+    %% §4.3.2). Send it when the caller set `max_stream_data'.
+    InitHeader = case maps:find(max_stream_data, ConnectOpts) of
+        {ok, V} ->
+            [{<<"webtransport-init">>,
+              wt_h2_init:encode(#{u => V, bl => V, br => V})}];
+        error ->
+            []
     end,
     BaseHeaders ++ InitHeader ++ strip_reserved_headers(ExtraHeaders).
 
@@ -319,19 +376,6 @@ strip_reserved_headers(Headers) ->
     },
     [{Name, Value} || {Name, Value} <- Headers, not maps:is_key(Name, Reserved)].
 
-extract_peer_settings(State, Headers) ->
-    %% Parse WebTransport-Init structured-field header (draft-14 §4.3.2).
-    Settings = case lists:keyfind(<<"webtransport-init">>, 1, Headers) of
-        {_, InitBin} ->
-            case wt_h2_init:parse(InitBin) of
-                {ok, Init} -> Init;
-                {error, _} -> #{}
-            end;
-        false ->
-            #{}
-    end,
-    State#state{peer_settings = Settings}.
-
 -ifdef(TEST).
 -include_lib("eunit/include/eunit.hrl").
 
@@ -343,12 +387,20 @@ request_headers_test() ->
 
 request_headers_with_init_test() ->
     Headers = request_headers(<<"example.com:443">>, <<"/wt">>, [],
-                              #{max_streams_uni => 50, max_streams_bidi => 100}),
-    ?assert(lists:keymember(<<"webtransport-init">>, 1, Headers)),
+                              #{max_stream_data => 4096, max_streams_uni => 50}),
     {_, InitBin} = lists:keyfind(<<"webtransport-init">>, 1, Headers),
-    {ok, Parsed} = wt_h2_init:parse(InitBin),
-    ?assertEqual(50, maps:get(u, Parsed)),
-    ?assertEqual(100, maps:get(bl, Parsed)).
+    ?assertEqual({ok, #{u => 4096, bl => 4096, br => 4096}}, wt_h2_init:parse(InitBin)),
+    ?assertNot(lists:keymember(<<"webtransport-init">>, 1,
+                               request_headers(<<"h">>, <<"/">>, [],
+                                               #{max_streams_uni => 50}))).
+
+check_wt_enabled_test_() ->
+    [
+        ?_assertEqual(ok, check_wt_enabled(#{16#2b67 => 1})),
+        ?_assertEqual({error, wt_not_enabled}, check_wt_enabled(#{})),
+        ?_assertEqual({error, {settings_error, wt_enabled}},
+                      check_wt_enabled(#{16#2b67 => 2}))
+    ].
 
 strip_reserved_headers_test() ->
     Input = [

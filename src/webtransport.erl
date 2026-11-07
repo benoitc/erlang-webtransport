@@ -307,104 +307,219 @@ accept(Conn, StreamId, Headers, Opts) ->
     Handler = maps:get(handler, Opts, undefined),
     HandlerOpts = maps:get(handler_opts, Opts, #{}),
     Method = proplists:get_value(<<":method">>, Headers, <<>>),
-    Path = proplists:get_value(<<":path">>, Headers, <<"/">>),
     case {Handler, Method} of
         {undefined, _} ->
             {error, missing_handler};
         {_, <<"CONNECT">>} ->
-            case run_origin_check(Handler, Headers, HandlerOpts) of
-                accept ->
-                    do_accept(Transport, Conn, StreamId, Path,
-                              Headers, Handler, HandlerOpts, Opts);
-                {reject, Status, Reason} ->
-                    send_reject(Transport, Conn, StreamId, Status, Reason),
-                    {error, {rejected, Status}}
-            end;
+            Router = case Transport of
+                h3 -> get_or_create_router(Conn);
+                h2 -> undefined
+            end,
+            accept_connect(Transport, Conn, StreamId, Headers,
+                           Handler, HandlerOpts, Opts, Router);
         {_, _} ->
             {error, not_connect_method}
     end.
 
-do_accept(h3, H3Conn, StreamId, Path, Headers, Handler, HandlerOpts, Opts) ->
-    CompatMode = maps:get(compat_mode, Opts, auto),
-    case classify_h3_connect(Headers, CompatMode) of
+%% Turn an extended CONNECT into a session. Shared by accept/4 and the
+%% listeners. Steps, in spec order (http3-17 §3.2, http2-16 §3.2):
+%% check the request, verify the Origin, check the client's SETTINGS (h3)
+%% or WebTransport-Init (h2), negotiate the subprotocol, start the session,
+%% then send the 2xx. On h3 the CONNECT stream's buffered capsules are only
+%% handed to the session after the 2xx is sent.
+accept_connect(Transport, Conn, StreamId, Headers, Handler, HandlerOpts, Opts, Router) ->
+    Steps = [
+        fun() -> check_connect_request(Transport, Conn, Headers, Opts) end,
+        fun(Ctx) -> check_origin(Ctx, Handler, Headers, HandlerOpts) end,
+        fun(Ctx) -> check_peer(Transport, Conn, Headers, Ctx) end,
+        fun(Ctx) -> select_protocol(Ctx, Handler, Headers, HandlerOpts) end
+    ],
+    case run_steps(Steps) of
+        {ok, Ctx} ->
+            start_accepted(Transport, Conn, StreamId, Headers,
+                           Handler, HandlerOpts, Opts, Router, Ctx);
+        {reject, Status, Body, Reason} ->
+            send_reject(Transport, Conn, StreamId, Status, Body),
+            {error, Reason};
+        {reset, Code, Reason} ->
+            %% A malformed request (RFC 9114 §4.1.2): reset the stream.
+            _ = quic_h3:cancel(Conn, StreamId, Code),
+            {error, Reason}
+    end.
+
+run_steps([First | Rest]) ->
+    lists:foldl(fun(Step, {ok, Ctx}) -> Step(Ctx);
+                   (_Step, Stop) -> Stop
+                end, First(), Rest).
+
+check_connect_request(h3, _Conn, Headers, Opts) ->
+    case classify_h3_connect(Headers, maps:get(compat_mode, Opts, auto)) of
         {ok, ClientMode} ->
-            Router = get_or_create_router(H3Conn),
-            Opts1 = Opts#{compat_mode => ClientMode},
-            do_accept_h3(H3Conn, StreamId, Path, Headers,
-                         Handler, HandlerOpts, Opts1, Router);
+            {ok, #{compat_mode => ClientMode}};
         {error, Reason} ->
-            send_reject(h3, H3Conn, StreamId, 400,
-                        iolist_to_binary(io_lib:format("~p", [Reason]))),
-            {error, Reason}
+            {reject, 400, iolist_to_binary(io_lib:format("Bad Request: ~p", [Reason])),
+             Reason}
     end;
-do_accept(h2, Conn, StreamId, Path, Headers, Handler, HandlerOpts, Opts) ->
+check_connect_request(h2, _Conn, Headers, _Opts) ->
     case is_webtransport_request(Headers) of
-        true ->
-            do_accept_h2(Conn, StreamId, Path, Headers,
-                         Handler, HandlerOpts, Opts);
-        false ->
-            send_reject(h2, Conn, StreamId, 400, <<"Bad Request">>),
-            {error, not_webtransport}
+        true -> {ok, #{}};
+        false -> {reject, 400, <<"Bad Request">>, not_webtransport}
     end.
 
-do_accept_h3(H3Conn, StreamId, Path, Headers, Handler, HandlerOpts, Opts, Router) ->
-    TransportState = webtransport_h3:new(H3Conn, StreamId, Router),
-    Authority = proplists:get_value(<<":authority">>, Headers, <<>>),
-    Request = #{path => Path, authority => Authority, headers => Headers},
-    SessionOpts = maps:merge(HandlerOpts, #{
-        request => Request,
-        is_server => true,
-        handler_opts => HandlerOpts,
-        max_data => maps:get(max_data, Opts, ?DEFAULT_MAX_DATA),
-        max_streams_bidi => maps:get(max_streams_bidi, Opts, ?DEFAULT_MAX_STREAMS_BIDI),
-        max_streams_uni => maps:get(max_streams_uni, Opts, ?DEFAULT_MAX_STREAMS_UNI)
-    }),
-    case webtransport_session:start_link(h3, TransportState, Handler, SessionOpts) of
-        {ok, Session} ->
-            quic_h3:set_stream_handler(H3Conn, StreamId, Session),
-            webtransport_h3_router:register_session(Router, StreamId, Session),
-            quic_h3:send_response(H3Conn, StreamId, 200, []),
-            {ok, Session};
-        {error, Reason} ->
-            send_reject(h3, H3Conn, StreamId, 500,
-                        iolist_to_binary(io_lib:format("~p", [Reason]))),
-            {error, Reason}
+check_origin(Ctx, Handler, Headers, HandlerOpts) ->
+    case run_origin_check(Handler, Headers, HandlerOpts) of
+        accept -> {ok, Ctx};
+        {reject, Status, Body} -> {reject, Status, Body, {rejected, Status}}
     end.
 
-do_accept_h2(Conn, StreamId, Path, Headers, Handler, HandlerOpts, Opts) ->
-    h2:send_response(Conn, StreamId, 200, []),
-    TransportState = webtransport_h2:new(Conn, StreamId),
-    Authority = proplists:get_value(<<":authority">>, Headers, <<>>),
-    Request = #{path => Path, authority => Authority, headers => Headers},
-    ServerDefaults = #{
-        u  => maps:get(max_streams_uni, Opts, ?DEFAULT_MAX_STREAMS_UNI),
-        bl => maps:get(max_streams_bidi, Opts, ?DEFAULT_MAX_STREAMS_BIDI),
-        br => maps:get(max_data, Opts, ?DEFAULT_MAX_DATA)
-    },
-    Negotiated = case proplists:get_value(<<"webtransport-init">>, Headers) of
-        undefined -> ServerDefaults;
+%% h3: http3-17 §3.1 requires the client's SETTINGS and transport
+%% parameters to enable HTTP/3 datagrams, QUIC datagrams and
+%% RESET_STREAM_AT; otherwise the session is malformed. The client's
+%% SETTINGS_WT_ENABLED codepoints pick the draft version (§7.1). The client
+%% SETTINGS can still be in flight when the request arrives; then the
+%% checks are skipped.
+check_peer(h3, Conn, _Headers, #{compat_mode := latest} = Ctx) ->
+    case quic_h3:get_peer_settings(Conn) of
+        undefined ->
+            {ok, Ctx#{wt_draft => h3_17}};
+        Settings ->
+            case wt_h3:validate_client(Conn, Settings) of
+                ok ->
+                    {ok, Ctx#{wt_draft => wt_h3:select_draft(Settings),
+                              peer_settings => Settings}};
+                {error, Reason} ->
+                    {reset, ?H3_MESSAGE_ERROR, Reason}
+            end
+    end;
+check_peer(h3, _Conn, _Headers, Ctx) ->
+    {ok, Ctx#{wt_draft => draft02}};
+%% h2: http2-16 §4.3.2: a WebTransport-Init field that does not parse, or
+%% that has an invalid value for a defined key, rejects the request.
+check_peer(h2, Conn, Headers, Ctx) ->
+    PeerSettings = h2:get_peer_settings(Conn),
+    FromSettings = wt_h2_init:from_settings(PeerSettings),
+    case proplists:get_value(<<"webtransport-init">>, Headers) of
+        undefined ->
+            {ok, Ctx#{wt_draft => h2_16, peer_settings => PeerSettings,
+                      peer_stream_data => FromSettings}};
         InitBin ->
             case wt_h2_init:parse(InitBin) of
-                {ok, Init} -> wt_h2_init:apply_greater_of(Init, ServerDefaults);
-                {error, _} -> ServerDefaults
+                {ok, Init} ->
+                    {ok, Ctx#{wt_draft => h2_16, peer_settings => PeerSettings,
+                              peer_stream_data =>
+                                  wt_h2_init:apply_greater_of(Init, FromSettings)}};
+                {error, Reason} ->
+                    {reject, 400, <<"Invalid WebTransport-Init">>, Reason}
             end
+    end.
+
+%% http3-17 §3.3, http2-16 §3.3: the client lists protocols in
+%% WT-Available-Protocols; the handler may pick one, returned in
+%% WT-Protocol. A malformed list is ignored.
+select_protocol(Ctx, Handler, Headers, HandlerOpts) ->
+    Offered = offered_protocols(Headers),
+    case code:ensure_loaded(Handler) =:= {module, Handler} andalso
+         erlang:function_exported(Handler, select_protocol, 2) of
+        false ->
+            {ok, Ctx#{protocol => undefined}};
+        true ->
+            case Handler:select_protocol(Offered, HandlerOpts) of
+                {ok, Protocol} when is_binary(Protocol) ->
+                    case lists:member(Protocol, Offered) of
+                        true -> {ok, Ctx#{protocol => Protocol}};
+                        false -> {reject, 500, <<"protocol not offered">>,
+                                  {protocol_not_offered, Protocol}}
+                    end;
+                none ->
+                    {ok, Ctx#{protocol => undefined}};
+                {reject, Status} when is_integer(Status), Status >= 400, Status < 600 ->
+                    {reject, Status, <<"no acceptable protocol">>, {rejected, Status}}
+            end
+    end.
+
+offered_protocols(Headers) ->
+    case proplists:get_value(<<"wt-available-protocols">>, Headers) of
+        undefined -> [];
+        Bin -> string_list(Bin)
+    end.
+
+%% Strings of an SF List. Any member that is not a String makes the whole
+%% field ignored (http3-17 §3.3).
+string_list(Bin) ->
+    case wt_sf:parse_list(Bin) of
+        {ok, Members} ->
+            case lists:all(fun({string, _}) -> true; (_) -> false end, Members) of
+                true -> [S || {string, S} <- Members];
+                false -> []
+            end;
+        {error, _} ->
+            []
+    end.
+
+start_accepted(Transport, Conn, StreamId, Headers, Handler, HandlerOpts, Opts, Router, Ctx) ->
+    Protocol = maps:get(protocol, Ctx),
+    Request0 = #{
+        path => proplists:get_value(<<":path">>, Headers, <<"/">>),
+        authority => proplists:get_value(<<":authority">>, Headers, <<>>),
+        headers => Headers,
+        wt_draft => maps:get(wt_draft, Ctx)
+    },
+    Request = case Protocol of
+        undefined -> Request0;
+        _ -> Request0#{protocol => Protocol}
+    end,
+    RespHeaders = case Protocol of
+        undefined -> [];
+        _ -> [{<<"wt-protocol">>, wt_sf:serialize_string(Protocol)}]
     end,
     SessionOpts = maps:merge(HandlerOpts, #{
         request => Request,
         is_server => true,
         handler_opts => HandlerOpts,
-        max_data => maps:get(br, Negotiated, ?DEFAULT_MAX_DATA),
-        max_streams_bidi => maps:get(bl, Negotiated, ?DEFAULT_MAX_STREAMS_BIDI),
-        max_streams_uni => maps:get(u, Negotiated, ?DEFAULT_MAX_STREAMS_UNI)
+        max_data => maps:get(max_data, Opts, ?DEFAULT_MAX_DATA),
+        max_stream_data => maps:get(max_stream_data, Opts, ?DEFAULT_MAX_STREAM_DATA),
+        max_streams_bidi => maps:get(max_streams_bidi, Opts, ?DEFAULT_MAX_STREAMS_BIDI),
+        max_streams_uni => maps:get(max_streams_uni, Opts, ?DEFAULT_MAX_STREAMS_UNI),
+        peer_settings => maps:get(peer_settings, Ctx, #{}),
+        peer_stream_data => maps:get(peer_stream_data, Ctx, #{})
     }),
+    start_accepted(Transport, Conn, StreamId, Handler, SessionOpts, RespHeaders, Router).
+
+start_accepted(h3, H3Conn, StreamId, Handler, SessionOpts, RespHeaders, Router) ->
+    TransportState = webtransport_h3:new(H3Conn, StreamId, Router),
+    case webtransport_session:start_link(h3, TransportState, Handler, SessionOpts) of
+        {ok, Session} ->
+            %% Register with the router before the 2xx: the client may open
+            %% streams as soon as it sees it.
+            case Router of
+                undefined -> ok;
+                _ -> webtransport_h3_router:register_session(Router, StreamId, Session)
+            end,
+            quic_h3:send_response(H3Conn, StreamId, 200, RespHeaders),
+            %% http3-17 §3.2: capsules the client sent with the request are
+            %% not processed until the 2xx is out. quic buffers them until a
+            %% handler registers; with drain_buffer => false it replays them
+            %% to the session, in order, ahead of later data.
+            _ = quic_h3:set_stream_handler(H3Conn, StreamId, Session,
+                                           #{drain_buffer => false}),
+            {ok, Session};
+        {error, Reason} ->
+            send_reject(h3, H3Conn, StreamId, 500,
+                        iolist_to_binary(io_lib:format("~p", [Reason]))),
+            {error, Reason}
+    end;
+start_accepted(h2, Conn, StreamId, Handler, SessionOpts, RespHeaders, _Router) ->
+    TransportState = webtransport_h2:new(Conn, StreamId),
     case webtransport_session:start_link(h2, TransportState, Handler, SessionOpts) of
         {ok, Session} ->
+            h2:send_response(Conn, StreamId, 200, RespHeaders),
+            %% h2 buffers server stream events until a handler registers.
             LoopPid = spawn(fun() -> h2_data_loop(Conn, StreamId, Session) end),
             _ = h2:set_stream_handler(Conn, StreamId, LoopPid),
             {ok, Session};
         {error, Reason} ->
-            h2:send_data(Conn, StreamId,
-                         iolist_to_binary(io_lib:format("~p", [Reason])), true),
+            send_reject(h2, Conn, StreamId, 500,
+                        iolist_to_binary(io_lib:format("~p", [Reason]))),
             {error, Reason}
     end.
 
@@ -968,127 +1083,21 @@ listener_loop(Name) ->
 %% Internal Functions - Request Handling
 %% ============================================================================
 
-handle_h2_request(Conn, StreamId, <<"CONNECT">>, Path, Headers, Handler, HandlerOpts, Opts) ->
-    case is_webtransport_request(Headers) of
-        true ->
-            case run_origin_check(Handler, Headers, HandlerOpts) of
-                accept ->
-                    accept_h2_session(Conn, StreamId, Path, Headers,
-                                      Handler, HandlerOpts, Opts);
-                {reject, Status, Reason} ->
-                    h2:send_response(Conn, StreamId, Status, []),
-                    h2:send_data(Conn, StreamId, Reason, true)
-            end;
-        false ->
-            h2:send_response(Conn, StreamId, 400, []),
-            h2:send_data(Conn, StreamId, <<"Bad Request">>, true)
-    end;
-
+handle_h2_request(Conn, StreamId, <<"CONNECT">>, _Path, Headers, Handler, HandlerOpts, Opts) ->
+    _ = accept_connect(h2, Conn, StreamId, Headers, Handler, HandlerOpts, Opts, undefined),
+    ok;
 handle_h2_request(Conn, StreamId, _Method, _Path, _Headers, _Handler, _HandlerOpts, _Opts) ->
     h2:send_response(Conn, StreamId, 405, []),
     h2:send_data(Conn, StreamId, <<"Method Not Allowed">>, true).
 
-handle_h3_request(H3Conn, StreamId, <<"CONNECT">>, Path, Headers,
+handle_h3_request(H3Conn, StreamId, <<"CONNECT">>, _Path, Headers,
                   Handler, HandlerOpts, Opts, Router) ->
-    ListenerMode = maps:get(compat_mode, Opts, auto),
-    case classify_h3_connect(Headers, ListenerMode) of
-        {ok, ClientMode} ->
-            case run_origin_check(Handler, Headers, HandlerOpts) of
-                accept ->
-                    Opts1 = Opts#{compat_mode => ClientMode},
-                    accept_h3_session(H3Conn, StreamId, Path, Headers,
-                                      Handler, HandlerOpts, Opts1, Router);
-                {reject, Status, Reason} ->
-                    quic_h3:send_response(H3Conn, StreamId, Status, []),
-                    quic_h3:send_data(H3Conn, StreamId, Reason, true)
-            end;
-        {error, Reason} ->
-            Body = iolist_to_binary(io_lib:format("Bad Request: ~p", [Reason])),
-            quic_h3:send_response(H3Conn, StreamId, 400, []),
-            quic_h3:send_data(H3Conn, StreamId, Body, true)
-    end;
-
+    _ = accept_connect(h3, H3Conn, StreamId, Headers, Handler, HandlerOpts, Opts, Router),
+    ok;
 handle_h3_request(H3Conn, StreamId, _Method, _Path, _Headers,
                   _Handler, _HandlerOpts, _Opts, _Router) ->
     quic_h3:send_response(H3Conn, StreamId, 405, []),
     quic_h3:send_data(H3Conn, StreamId, <<"Method Not Allowed">>, true).
-
-accept_h2_session(Conn, StreamId, Path, Headers, Handler, HandlerOpts, Opts) ->
-    h2:send_response(Conn, StreamId, 200, []),
-    TransportState = webtransport_h2:new(Conn, StreamId),
-    Authority = proplists:get_value(<<":authority">>, Headers, <<>>),
-    Request = #{
-        path => Path,
-        authority => Authority,
-        headers => Headers
-    },
-    %% Parse WebTransport-Init from the client's CONNECT request and
-    %% apply the greater-of rule (draft-14 §4.3.2) against our defaults.
-    ServerDefaults = #{
-        u  => maps:get(max_streams_uni, Opts, ?DEFAULT_MAX_STREAMS_UNI),
-        bl => maps:get(max_streams_bidi, Opts, ?DEFAULT_MAX_STREAMS_BIDI),
-        br => maps:get(max_data, Opts, ?DEFAULT_MAX_DATA)
-    },
-    Negotiated = case proplists:get_value(<<"webtransport-init">>, Headers) of
-        undefined -> ServerDefaults;
-        InitBin ->
-            case wt_h2_init:parse(InitBin) of
-                {ok, Init} -> wt_h2_init:apply_greater_of(Init, ServerDefaults);
-                {error, _} -> ServerDefaults
-            end
-    end,
-    SessionOpts = maps:merge(HandlerOpts, #{
-        request => Request,
-        is_server => true,
-        handler_opts => HandlerOpts,
-        max_data => maps:get(br, Negotiated, ?DEFAULT_MAX_DATA),
-        max_streams_bidi => maps:get(bl, Negotiated, ?DEFAULT_MAX_STREAMS_BIDI),
-        max_streams_uni => maps:get(u, Negotiated, ?DEFAULT_MAX_STREAMS_UNI)
-    }),
-    case webtransport_session:start_link(h2, TransportState, Handler, SessionOpts) of
-        {ok, Session} ->
-            LoopPid = spawn(fun() -> h2_data_loop(Conn, StreamId, Session) end),
-            _ = h2:set_stream_handler(Conn, StreamId, LoopPid);
-        {error, Reason} ->
-            h2:send_response(Conn, StreamId, 500, []),
-            h2:send_data(Conn, StreamId,
-                         iolist_to_binary(io_lib:format("~p", [Reason])), true)
-    end.
-
-accept_h3_session(H3Conn, StreamId, Path, Headers, Handler, HandlerOpts, Opts, Router) ->
-    TransportState = webtransport_h3:new(H3Conn, StreamId, Router),
-    Authority = proplists:get_value(<<":authority">>, Headers, <<>>),
-    Request = #{
-        path => Path,
-        authority => Authority,
-        headers => Headers
-    },
-    SessionOpts = maps:merge(HandlerOpts, #{
-        request => Request,
-        is_server => true,
-        handler_opts => HandlerOpts,
-        max_data => maps:get(max_data, Opts, ?DEFAULT_MAX_DATA),
-        max_streams_bidi => maps:get(max_streams_bidi, Opts, ?DEFAULT_MAX_STREAMS_BIDI),
-        max_streams_uni => maps:get(max_streams_uni, Opts, ?DEFAULT_MAX_STREAMS_UNI)
-    }),
-    %% Register the session with the router BEFORE the 200 goes out.
-    %% Otherwise the client sees 200, opens extension streams, and the
-    %% stream_type_data arrives at the router while sessions is still
-    %% empty. The router then silently drops the data.
-    case webtransport_session:start_link(h3, TransportState, Handler, SessionOpts) of
-        {ok, Session} ->
-            quic_h3:set_stream_handler(H3Conn, StreamId, Session),
-            case Router of
-                undefined -> ok;
-                _ -> webtransport_h3_router:register_session(Router, StreamId, Session)
-            end,
-            quic_h3:send_response(H3Conn, StreamId, 200, []),
-            ok;
-        {error, Reason} ->
-            quic_h3:send_response(H3Conn, StreamId, 500, []),
-            quic_h3:send_data(H3Conn, StreamId,
-                              iolist_to_binary(io_lib:format("~p", [Reason])), true)
-    end.
 
 %% Defaults to accept when the handler does not export origin_check/2.
 run_origin_check(Handler, Headers, Opts) ->
@@ -1241,36 +1250,48 @@ connect_h2(Host, Port, Path, Opts, Handler) ->
     Caller = self(),
     UserHandlerOpts = maps:get(handler_opts, Opts, #{}),
     HandlerOpts = maps:merge(#{owner => Caller}, UserHandlerOpts),
-    Opts1 = Opts#{ssl_opts => build_h2_ssl_opts(Opts)},
+    Opts1 = Opts#{
+        ssl_opts => build_h2_ssl_opts(Opts),
+        settings => h2_wt_settings(Opts),
+        headers => protocol_headers(Opts) ++ maps:get(headers, Opts, []),
+        handler_opts => HandlerOpts
+    },
     case webtransport_h2:connect(Host, Port, Path, Opts1) of
         {ok, TransportState} ->
-            %% Default handler for client
-            ActualHandler = case Handler of
-                undefined -> webtransport_client_handler;
-                _ -> Handler
-            end,
-            Request = #{
-                path => Path,
-                authority => authority(Host, Port),
-                headers => maps:get(headers, Opts, [])
-            },
-            SessionOpts = #{
-                request => Request,
-                is_server => false,
-                handler_opts => HandlerOpts
-            },
-            case webtransport_session:start_link(h2, TransportState, ActualHandler, SessionOpts) of
-                {ok, Session} ->
-                    H2Conn = webtransport_h2:h2_conn(TransportState),
-                    StreamId = webtransport_h2:connect_stream_id(TransportState),
-                    LoopPid = spawn(fun() -> h2_data_loop(H2Conn, StreamId, Session) end),
-                    _ = h2:set_stream_handler(H2Conn, StreamId, LoopPid),
-                    {ok, Session};
-                {error, _} = Err ->
-                    Err
+            RespHeaders = webtransport_h2:response_headers(TransportState),
+            case selected_protocol(Opts1, RespHeaders) of
+                {ok, Protocol} ->
+                    h2_start_session(TransportState, Path, authority(Host, Port),
+                                     RespHeaders, Protocol, Opts1, Handler);
+                {error, Reason} ->
+                    %% http2-16 §3.3: close the session with WT_ALPN_ERROR.
+                    _ = webtransport_h2:close_session(TransportState, ?WT_ALPN_ERROR, <<>>),
+                    h2:close(webtransport_h2:h2_conn(TransportState)),
+                    {error, Reason}
             end;
         {error, Reason} ->
             {error, Reason}
+    end.
+
+h2_start_session(TransportState, Path, Authority, RespHeaders, Protocol, Opts, Handler) ->
+    ActualHandler = case Handler of
+        undefined -> webtransport_client_handler;
+        _ -> Handler
+    end,
+    Request = client_request(Path, Authority, RespHeaders, Protocol, h2_16),
+    SessionOpts = (client_session_opts(Request, Opts))#{
+        peer_settings => webtransport_h2:peer_settings(TransportState),
+        peer_stream_data => webtransport_h2:peer_stream_data(TransportState)
+    },
+    case webtransport_session:start_link(h2, TransportState, ActualHandler, SessionOpts) of
+        {ok, Session} ->
+            H2Conn = webtransport_h2:h2_conn(TransportState),
+            StreamId = webtransport_h2:connect_stream_id(TransportState),
+            LoopPid = spawn(fun() -> h2_data_loop(H2Conn, StreamId, Session) end),
+            _ = h2:set_stream_handler(H2Conn, StreamId, LoopPid),
+            {ok, Session};
+        {error, _} = Err ->
+            Err
     end.
 
 connect_h3(Host, Port, Path, Opts0, Handler) ->
@@ -1420,13 +1441,27 @@ h3_validate_and_request(H3Conn, Authority, Path, Opts, Handler, Router) ->
     case wt_h3:validate_wt_support(H3Conn, QuicConn, CompatMode) of
         ok ->
             h3_send_connect(H3Conn, Authority, Path, Opts, Handler, Router, CompatMode);
+        {error, {settings_error, _} = Reason} ->
+            %% http3-17 §3.1: a SETTINGS_WT_ENABLED above 1 is a connection
+            %% error of type H3_SETTINGS_ERROR.
+            h3_close(H3Conn, ?H3_SETTINGS_ERROR),
+            {error, Reason};
         {error, Reason} ->
             quic_h3:close(H3Conn),
             {error, Reason}
     end.
 
+%% Close an h3 connection with an error code when quic supports it, else
+%% plainly.
+h3_close(H3Conn, Code) ->
+    Mod = quic_h3,
+    case erlang:function_exported(Mod, close, 2) of
+        true -> Mod:close(H3Conn, Code);
+        false -> quic_h3:close(H3Conn)
+    end.
+
 h3_send_connect(H3Conn, Authority, Path, Opts, Handler, Router, CompatMode) ->
-    Headers = maps:get(headers, Opts, []),
+    Headers = protocol_headers(Opts) ++ maps:get(headers, Opts, []),
     case wt_h3:request_session(H3Conn, Authority, Path, Headers, CompatMode) of
         {ok, SessionId} ->
             h3_await_response(H3Conn, SessionId, Authority, Path, Opts, Handler, Router);
@@ -1455,22 +1490,26 @@ h3_await_response(H3Conn, SessionId, Authority, Path, Opts, Handler, Router) ->
     end.
 
 h3_start_session(H3Conn, SessionId, Authority, Path, Headers, Opts, Handler, Router) ->
+    case selected_protocol(Opts, Headers) of
+        {ok, Protocol} ->
+            h3_start_session(H3Conn, SessionId, Authority, Path, Headers, Opts,
+                             Handler, Router, Protocol);
+        {error, Reason} ->
+            %% http3-17 §3.3: close the session with WT_ALPN_ERROR.
+            _ = wt_h3:close_session(H3Conn, SessionId, ?WT_ALPN_ERROR, <<>>),
+            quic_h3:close(H3Conn),
+            {error, Reason}
+    end.
+
+h3_start_session(H3Conn, SessionId, Authority, Path, Headers, Opts, Handler, Router,
+                 Protocol) ->
     TransportState = webtransport_h3:new(H3Conn, SessionId, Router),
     ActualHandler = case Handler of
         undefined -> webtransport_client_handler;
         _ -> Handler
     end,
-    Request = #{
-        path => Path,
-        authority => Authority,
-        headers => Headers
-    },
-    HandlerOpts = maps:get(handler_opts, Opts, #{}),
-    SessionOpts = #{
-        request => Request,
-        is_server => false,
-        handler_opts => HandlerOpts
-    },
+    Request = client_request(Path, Authority, Headers, Protocol, h3_17),
+    SessionOpts = client_session_opts(Request, Opts),
     case webtransport_session:start_link(h3, TransportState, ActualHandler, SessionOpts) of
         {ok, Session} ->
             webtransport_h3_router:register_session(Router, SessionId, Session),
@@ -1482,6 +1521,56 @@ h3_start_session(H3Conn, SessionId, Authority, Path, Headers, Opts, Handler, Rou
             quic_h3:close(H3Conn),
             Err
     end.
+
+%% WT-Available-Protocols for a client that set `protocols'.
+protocol_headers(Opts) ->
+    case maps:get(protocols, Opts, []) of
+        [] -> [];
+        Protocols -> [{<<"wt-available-protocols">>,
+                       wt_sf:serialize_string_list(Protocols)}]
+    end.
+
+%% http3-17 §3.3, http2-16 §3.3: the server's WT-Protocol must be one we
+%% offered; with `require_protocol => true' it must also be present. A
+%% WT-Protocol that is not a String is ignored.
+selected_protocol(Opts, RespHeaders) ->
+    Offered = maps:get(protocols, Opts, []),
+    Selected = case proplists:get_value(<<"wt-protocol">>, RespHeaders) of
+        undefined -> undefined;
+        Bin ->
+            case wt_sf:parse_item(Bin) of
+                {ok, {string, P}} -> P;
+                _ -> undefined
+            end
+    end,
+    case {Selected, maps:get(require_protocol, Opts, false)} of
+        {undefined, true} -> {error, {alpn_error, no_protocol}};
+        {undefined, false} -> {ok, undefined};
+        {P1, _} ->
+            case lists:member(P1, Offered) of
+                true -> {ok, P1};
+                false -> {error, {alpn_error, {not_offered, P1}}}
+            end
+    end.
+
+client_request(Path, Authority, Headers, Protocol, Draft) ->
+    Request = #{path => Path, authority => Authority, headers => Headers,
+                wt_draft => Draft},
+    case Protocol of
+        undefined -> Request;
+        _ -> Request#{protocol => Protocol}
+    end.
+
+client_session_opts(Request, Opts) ->
+    #{
+        request => Request,
+        is_server => false,
+        handler_opts => maps:get(handler_opts, Opts, #{}),
+        max_data => maps:get(max_data, Opts, ?DEFAULT_MAX_DATA),
+        max_stream_data => maps:get(max_stream_data, Opts, ?DEFAULT_MAX_STREAM_DATA),
+        max_streams_bidi => maps:get(max_streams_bidi, Opts, ?DEFAULT_MAX_STREAMS_BIDI),
+        max_streams_uni => maps:get(max_streams_uni, Opts, ?DEFAULT_MAX_STREAMS_UNI)
+    }.
 
 %% ============================================================================
 %% Handler Factories

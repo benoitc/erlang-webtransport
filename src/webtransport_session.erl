@@ -1211,7 +1211,11 @@ do_early_data_accepted(#data{transport = h3, transport_state = H3State}) ->
 do_early_data_accepted(#data{transport = h2}) ->
     not_supported.
 
-build_info(#data{transport = Transport, streams = Streams,
+build_info(#data{request = Request} = StateData) ->
+    Info = build_info_base(StateData),
+    maps:merge(Info, maps:with([protocol, wt_draft], Request)).
+
+build_info_base(#data{transport = Transport, streams = Streams,
                   local_max_data = LocalMaxData, remote_max_data = RemoteMaxData,
                   local_max_streams_bidi = LocalMaxBidi, local_max_streams_uni = LocalMaxUni,
                   remote_max_streams_bidi = RemoteMaxBidi, remote_max_streams_uni = RemoteMaxUni,
