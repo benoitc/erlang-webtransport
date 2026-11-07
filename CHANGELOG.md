@@ -2,7 +2,8 @@
 
 ## Unreleased
 
-- quic bumped to 2.3.0. It fixes a header decoding issue that let an HTTP/3 peer burn minutes of CPU with one request (GHSA-224p-pchv-5r3r), and adds what WebTransport draft-17 needs: requests wait for the client's settings, and connections can be closed with an HTTP/3 error code. The version constraint is now `~> 2.3`.
+- quic bumped to 2.4.0. It fixes a header decoding issue that let an HTTP/3 peer burn minutes of CPU with one request (GHSA-224p-pchv-5r3r), and a bug that reset a WebTransport client's session stream at the first message the server sent on it after accepting. It also adds what WebTransport draft-17 needs: requests wait for the client's settings, and connections can be closed with an HTTP/3 error code. The version constraint is now `~> 2.4`.
+- Erlang/OTP 27 or later is now required, as quic 2.4.0 no longer supports OTP 26.
 - h2 bumped to 0.12.7. It caps the stream resets a client can provoke on the server (MadeYouReset, CVE-2025-8671). The version constraint is now `~> 0.12.7`.
 
 ## 0.4.8 - 2026-10-03

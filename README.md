@@ -15,7 +15,7 @@ covers session-ticket capture and connection-level acceptance reporting
 
 ## Requirements
 
-- Erlang/OTP 26.0 or later
+- Erlang/OTP 27.0 or later
 - [rebar3](https://rebar3.org/)
 - OpenSSL (for certificate generation)
 
