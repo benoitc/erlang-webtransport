@@ -1,89 +1,72 @@
 # Spec compliance
 
-This page lists the WebTransport spec revisions the library is checked
-against and the gaps that are known. Read it when you need to know whether a
-peer on a given draft will interoperate, or before you pick up compliance
-work. To re-run the audit, use the `spec-compliance` Claude Code skill in
+This page lists the WebTransport spec revisions the library implements and
+the gaps that are known. Read it when you need to know whether a peer on a
+given draft will interoperate, or before you pick up compliance work. To
+re-run the audit, use the `spec-compliance` Claude Code skill in
 `.claude/skills/spec-compliance/`.
 
 ## Revisions
 
-| Spec | Implemented | Latest (audited 2026-11-07) |
+| Spec | Implemented | Notes |
 |---|---|---|
-| draft-ietf-webtrans-http3 | 15 | 17 |
-| draft-ietf-webtrans-http2 | 14 | 16 |
-| draft-ietf-webtrans-overview | 12 | 14 |
+| draft-ietf-webtrans-http3 | 17 | Draft-15 clients are accepted: the server advertises both SETTINGS_WT_ENABLED codepoints and picks the version per §7.1. The client speaks draft-17 only. |
+| draft-ietf-webtrans-http2 | 16 | Draft-14 peers do not interoperate (the WT_STREAM FIN bit and the close capsule changed). |
+| draft-ietf-webtrans-overview | 14 | |
+| RFC 9297 | | Capsules, HTTP datagrams. |
+| RFC 9220 / RFC 8441 | | Extended CONNECT over h3 / h2. |
 
-Draft-02 (`compat_mode => legacy_browser_compat`) is not covered here. The
-audit confirmed that it does not leak into latest-mode handshakes.
+Draft-02 (`compat_mode => legacy_browser_compat`) is kept on a separate path
+for Chrome, Firefox and webtransport-go. It never mixes with the latest
+drafts in one handshake.
 
-## Classes
+Audited 2026-11-07 against quic 2.4.0 and h2 0.12.7.
+
+## What is covered
+
+- **Handshake.** SETTINGS_WT_ENABLED on both transports (h3 0x20b8933b and
+  0x2c7cf000, h2 0x2b67), with values above 1 refused as settings errors.
+  The client requires HTTP/3 datagrams, QUIC datagrams and RESET_STREAM_AT
+  from the server; the server checks the same on the client and waits for
+  its SETTINGS before handling a request. Origin check, 403 on rejection.
+- **Subprotocols.** WT-Available-Protocols and WT-Protocol as structured
+  fields, `WT_ALPN_ERROR` when the server's pick was not offered or is
+  missing and required.
+- **Wire format.** h3 stream headers, 32-bit close codes, UTF-8 close reasons
+  of at most 1024 bytes, h2 capsule codepoints of http2-16, Reliable Size on
+  WT_RESET_STREAM, RESET_STREAM_AT on h3, unknown capsules dropped.
+- **Flow control.** Initial limits from SETTINGS (and WebTransport-Init on
+  h2), flow control on or off per http3-17 §5.1, one session per h3
+  connection without it, strictly increasing limits, the 2^60 stream cap,
+  overruns as WT_FLOW_CONTROL_ERROR, credit returned with WT_MAX_DATA,
+  WT_MAX_STREAM_DATA and WT_MAX_STREAMS, blocked capsules sent.
+- **Stream state (h2).** Resets, STOP_SENDING, data and flow-control capsules
+  on a stream in the wrong state are WT_STREAM_STATE_ERROR session errors;
+  STOP_SENDING is answered with WT_RESET_STREAM.
+- **Termination.** WT_SESSION_GONE resets and STOP_SENDING on every stream,
+  END_STREAM on h2 when the peer closes, H3_MESSAGE_ERROR for malformed
+  capsules or data after WT_CLOSE_SESSION, the session ends when its CONNECT
+  stream ends or is reset, the QUIC connection closes only with its last
+  session.
+- **Buffering.** Streams and datagrams that arrive before their session are
+  held and replayed; streams of an ended session are reset with
+  WT_SESSION_GONE. Session ids that are not client bidi stream ids close the
+  connection with H3_ID_ERROR.
+
+## Known gaps
+
+| Path | Spec | Gap |
+|---|---|---|
+| h2 | http2-16 §3.4 | WT_ERROR, WT_STREAM_STATE_ERROR and WT_FLOW_CONTROL_ERROR have no HTTP/2 codepoints yet (0xTBD). Session errors use RST_STREAM with PROTOCOL_ERROR or FLOW_CONTROL_ERROR, after a WT_CLOSE_SESSION that carries 0 or the h3 WT_FLOW_CONTROL_ERROR value. Switch when IANA assigns them. |
+| h2 | http2-16 §7 | The TLS requirement (TLS 1.3, or 1.2 with extended master secret) is not checked: the h2 library does not expose the negotiated version per connection. |
+| h2 | http2-16 §4.3.1 | Initial limits use the peer SETTINGS current when the session starts, not the ones acknowledged at the moment of the request. They differ only if the peer changes its WT SETTINGS mid-connection. |
+| h3 | http3-17 §4.7 | After WT_DRAIN_SESSION or GOAWAY we refuse to send new datagrams. The draft allows sending them. |
+| h3 | http3-17 §6 | STOP_SENDING(WT_SESSION_GONE) after receiving WT_CLOSE_SESSION, which the draft allows, is sent only through the general termination path. |
+
+## Classes used by the audit
 
 - **wire**: we send or accept bytes the latest draft does not. Breaks
   interop with up-to-date peers.
 - **must**: a MUST we don't enforce. Well-behaved peers still work.
 - **should**: a SHOULD we skip.
 - **upstream**: needs a change in `quic` or `h2`.
-
-## Wire gaps
-
-| Path | Spec | Code | Gap |
-|---|---|---|---|
-| h3 | http3-17 §9.2 | `quic_h3.hrl:54` (quic) | SETTINGS_WT_ENABLED moved from 0x2c7cf000 to 0x20b8933b. Peers on -17 don't see our setting. quic passes integer keys through, so a local fix is possible. |
-| h3 | http3-17 §6 | `wt_h3_capsule.erl:117,152` | WT_CLOSE_SESSION error code is encoded as a varint; the spec says 32 bits. |
-| h3 | http3-17 §6 | `webtransport_session.erl:767,1023,1155` | WT_SESSION_GONE and WT_BUFFERED_STREAM_REJECTED are mapped into the application error range before the reset, so the peer sees the wrong code. |
-| h3 | http3-17 §5.4, §5.5 | `webtransport_session.erl:188,525` | Peer `wt_initial_max_*` SETTINGS are never read; send-side data and stream limits use our own defaults. |
-| h2 | http2-16 §6.4 | `webtransport.hrl:21`, `wt_h2_capsule.erl:169,245` | WT_STREAM FIN bit is reversed: -16 uses 0x190B4D3C for data and 0x190B4D3B for the final capsule. |
-| h2 | http2-16 §6.12, §6.13 | `webtransport.hrl:29`, `wt_h2_capsule.erl:215,343` | Close and drain use 0x190B4D45/46; the spec uses the h3 capsules 0x2843/0x78ae with a 32-bit error code. |
-| h2 | http2-16 §6.2 | `wt_h2_capsule.erl:177,257` | WT_RESET_STREAM has no Reliable Size field; a compliant reset fails to decode and closes the session. |
-| h2 | http2-16 §3.1 | `webtransport.erl:805` | Server never sends SETTINGS_WT_ENABLED (0x2b67); -16 clients won't open a session. |
-| h2 | http2-16 §4.3.2 | `wt_h2_init.erl:8`, `webtransport.erl:362,1025` | WebTransport-Init `u`/`bl`/`br` are read as stream counts and session data; the spec defines them as per-stream data limits. |
-| h2 | http2-16 §4.3.1 | `webtransport_session.erl:188` | Peer WT SETTINGS are never read and the client sends none; a compliant peer stalls. |
-| both | RFC 9297 §3.2 | `webtransport_session.erl:885` | Unknown capsule types close the session instead of being dropped. |
-
-## MUST gaps
-
-| Path | Spec | Code | Gap |
-|---|---|---|---|
-| h3 | http3-17 §3.1 | `wt_h3.erl:186` | Client does not close with H3_SETTINGS_ERROR when WT_ENABLED > 1. |
-| h3 | http3-17 §3.1 | `wt_h3.erl:166-182` | Client accepts a server missing h3_datagram or reset_stream_at. |
-| h3 | http3-17 §3.1 | `webtransport.erl:1131,310` | Server never checks the client's SETTINGS or transport parameters. |
-| h3 | http3-17 §3.2 | `webtransport.erl:1078,347` | Buffered capsules are released before the 2xx is sent. |
-| h3 | http3-17 §4 | `webtransport_h3_router.erl:239` | Session IDs that are not client-initiated bidi IDs are not rejected with H3_ID_ERROR. |
-| h3 | http3-17 §4.4 | `webtransport_h3.erl:195` | Resets use RESET_STREAM instead of RESET_STREAM_AT with the header size as Reliable Size. `quic:reset_stream_at/4` exists. |
-| h3 | http3-17 §5.1 | `webtransport_session.erl:790` | No "flow control disabled" state: capsules are always applied and extra sessions are not refused. |
-| h3 | http3-17 §6 | `webtransport_session.erl:370,409` | Data after WT_CLOSE_SESSION on the CONNECT stream is dropped instead of resetting with H3_MESSAGE_ERROR. |
-| h3 | http3-17 §6 | `webtransport_session.erl:767` | On termination only send sides are reset; no STOP_SENDING on receive sides. |
-| h3 | http3-17 §6 | `webtransport.erl:1455` | The client session never receives CONNECT-stream data, so server CLOSE, DRAIN and FIN are ignored. A server `stream_reset` on the CONNECT stream goes to the handler; `draining` has no `info` clause. |
-| h3 | RFC 9297 §3.2 | `webtransport_session.erl:338` | A capsule split across two DATA frames is dropped (h2 buffers it). |
-| h2 | http2-16 §3.1 | `webtransport_h2.erl:96` | Client sends CONNECT without waiting for WT_ENABLED and does not reject values > 1. |
-| h2 | http2-16 §4.3.2 | `wt_h2_init.erl:55`, `webtransport.erl:372` | Unparseable WebTransport-Init is accepted with defaults instead of a 4xx; unknown keys and parameters fail to parse instead of being ignored. |
-| h2 | http2-16 §6.2-§6.9 | `webtransport.erl:1227`, `webtransport_session.erl:803,851,919` | Stream-state violations (reset or data on a closed stream, duplicate STOP_SENDING, MAX_STREAM_DATA after STOP_SENDING) are ignored instead of WT_STREAM_STATE_ERROR. |
-| h2 | http2-16 §6.3 | `webtransport.erl:1229` | STOP_SENDING closes the whole stream; no WT_RESET_STREAM is sent back. |
-| h2 | http2-16 §6.2, §6.3 | `wt_h2_capsule.erl:257` | Error codes above 0xffffffff are accepted. |
-| h2 | http2-16 §6.12, §3.4 | `webtransport_session.erl:409,492`, `webtransport.erl:1166` | No END_STREAM after a peer's close; a peer FIN without a capsule does not end the session. |
-| both | http3-17 §5.6, http2-16 §6.5-§6.7 | `webtransport_session.erl:792,808,821,828` | WT_MAX_* equal to the previous value is accepted; the spec requires a strict increase. |
-| both | http3-17 §5.6.2, http2-16 §6.7 | `webtransport_session.erl:820,845` | Maximum Streams above 2^60 is not rejected. |
-| both | http3-17 §5.4, http2-16 §6.5 | `webtransport_session.erl:893-925` | Incoming data beyond our stream or session limit is dropped or ignored instead of WT_FLOW_CONTROL_ERROR. |
-| both | http3-17 §5.6.2, http2-16 §6.7 | `webtransport_session.erl:995` | A stream over our limit is reset instead of closing the session; on h2 the count ignores stream-ID ordering. |
-| both | http3-17 §6, http2-16 §6.12 | `wt_h3_capsule.erl:154`, `wt_h2_capsule.erl:343` | CLOSE_SESSION reason is not checked for UTF-8, and an over-long reason gets the wrong error. |
-| both | overview-14 §2, http2-16 §3.3 | `webtransport.erl:1015,358` | No subprotocol negotiation (WT-Available-Protocols / WT-Protocol). |
-| both | overview-14 §4.3 | `webtransport_session.erl:820` | Handlers are not told when new stream credit arrives. |
-
-## SHOULD gaps
-
-| Path | Spec | Code | Gap |
-|---|---|---|---|
-| both | http3-17 §5.6, http2-16 §4.4 | `webtransport_session.erl:932-959` | WT_MAX_STREAMS is never sent; on h3 WT_MAX_DATA is never sent either. Peers stall at the initial limits. |
-| both | http3-17 §5.6.3, http2-16 §6.10 | `webtransport_session.erl:651,691,711` | WT_STREAMS_BLOCKED is never sent; WT_DATA_BLOCKED only on h2. |
-| h3 | http3-17 §4.6 | `webtransport_h3_router.erl:260,310` | Streams and datagrams for a not-yet-known session are rejected instead of buffered; server streams that beat the 2xx are lost on the client. |
-| h3 | http3-17 §4.4 | `webtransport_h3_router.erl:354` | Reset codes outside the application range are delivered as if they were application codes. |
-| h3 | http3-17 §6 | `webtransport_session.erl:470` | CONNECTION_CLOSE is sent right after WT_CLOSE_SESSION and can overtake it. |
-
-## Upstream gaps
-
-| Dep | Spec | Gap |
-|---|---|---|
-| quic | http3-17 §9.2 | `H3_SETTINGS_WT_ENABLED` still 0x2c7cf000. |
-| quic | http3-17 §4.3 | WT_STREAM (0x41) in an unexpected place is skipped instead of H3_FRAME_UNEXPECTED (`quic_h3_connection.erl:1899,2828`). |
-| h2 | http2-16 §7 | No API exposes the negotiated TLS version or extended master secret, so the TLS requirement can't be checked. |

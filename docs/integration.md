@@ -22,9 +22,10 @@ H3Opts = maps:merge(webtransport:h3_settings(), #{
 
 | Key | Value |
 |-----|-------|
-| `settings` | H3 SETTINGS (wt_enabled, flow-control windows, draft-02 compat) |
+| `settings` | H3 SETTINGS (SETTINGS_WT_ENABLED for draft-17 and draft-15, flow-control limits, draft-02 compat) |
 | `stream_type_handler` | Claims WT extension streams (0x41 bidi, 0x54 uni) |
 | `h3_datagram_enabled` | `true` |
+| `defer_requests_until_settings` | `true`; requests wait for the client's SETTINGS, which select the draft. Without it a request that arrives ahead of them is refused |
 | `quic_opts` | `#{max_datagram_frame_size => 65535, reset_stream_at => true}` |
 | `connection_handler` | Creates a per-connection WT stream router |
 
@@ -88,7 +89,7 @@ H2Opts = maps:merge(webtransport:h2_settings(), #{
 | Key | Value |
 |-----|-------|
 | `enable_connect_protocol` | `true` |
-| `settings` | H2 SETTINGS (enable_connect_protocol, wt_initial_max_*) |
+| `settings` | H2 SETTINGS (enable_connect_protocol, SETTINGS_WT_ENABLED, wt_initial_max_*) |
 
 ### 2. Route requests
 
@@ -107,16 +108,20 @@ my_h2_handler(Conn, StreamId, <<"GET">>, Path, Headers) ->
 
 `accept(Conn, StreamId, Headers, Opts)` performs these steps:
 
-1. Runs `origin_check/2` on the handler (if exported)
-2. Validates the CONNECT request (`:protocol`, compat mode detection for h3)
-3. Starts a `webtransport_session` gen_statem
-4. Registers it as the stream handler via `quic_h3:set_stream_handler/3`
-   (h3) or `h2:set_stream_handler/3` (h2) -- same API the transport uses
-   for raw streams
-5. For h3: registers with the per-connection router so extension streams
+1. Validates the CONNECT request (`:protocol`, compat mode detection for h3)
+2. Runs `origin_check/2` on the handler (if exported)
+3. h3: checks the client's SETTINGS and transport parameters (HTTP/3
+   datagrams, QUIC datagrams, RESET_STREAM_AT) and picks draft-17 or
+   draft-15. h2: parses `WebTransport-Init`; an invalid value gets 400
+4. Calls `select_protocol/2` on the handler (if exported)
+5. Starts a `webtransport_session` gen_statem
+6. For h3: registers with the per-connection router so extension streams
    (bidirectional 0x41, unidirectional 0x54) are routed to the session
-6. Sends 200 OK to the client
-7. Returns `{ok, Session}` or `{error, Reason}`
+7. Sends 200 OK, with `WT-Protocol` when a subprotocol was picked
+8. Registers the session as the stream handler (`quic_h3:set_stream_handler/4`
+   or `h2:set_stream_handler/3`), so capsules the client sent with the request
+   are handled only after the 200
+9. Returns `{ok, Session}` or `{error, Reason}`
 
 ### Options
 
@@ -127,6 +132,7 @@ my_h2_handler(Conn, StreamId, <<"GET">>, Path, Headers) ->
 | `handler_opts` | `#{}` | Passed to `handler:init/3` |
 | `compat_mode` | `auto` | h3 draft selection |
 | `max_data` | 1048576 | Session flow-control window |
+| `max_stream_data` | 262144 | Per-stream window (h2) |
 | `max_streams_bidi` | 100 | Max bidi streams |
 | `max_streams_uni` | 100 | Max uni streams |
 

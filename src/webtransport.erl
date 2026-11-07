@@ -334,6 +334,7 @@ accept_connect(Transport, Conn, StreamId, Headers, Handler, HandlerOpts, Opts, R
         fun() -> check_connect_request(Transport, Conn, Headers, Opts) end,
         fun(Ctx) -> check_origin(Ctx, Handler, Headers, HandlerOpts) end,
         fun(Ctx) -> check_peer(Transport, Conn, Headers, Ctx) end,
+        fun(Ctx) -> check_session_limit(Transport, Router, StreamId, Opts, Ctx) end,
         fun(Ctx) -> select_protocol(Ctx, Handler, Headers, HandlerOpts) end
     ],
     case run_steps(Steps) of
@@ -416,6 +417,32 @@ check_peer(h2, Conn, Headers, Ctx) ->
                     {reject, 400, <<"Invalid WebTransport-Init">>, Reason}
             end
     end.
+
+%% http3-17 §5.1: without flow control a connection carries one session; a
+%% server resets further CONNECT streams with H3_REQUEST_REJECTED. Flow
+%% control is in force when both sides sent a non-zero initial limit.
+check_session_limit(h3, Router, StreamId, Opts, #{compat_mode := latest} = Ctx)
+  when is_pid(Router) ->
+    Peer = maps:get(peer_settings, Ctx, #{}),
+    PeerDeclares = lists:any(fun(Id) ->
+        case wt_h3:peer_setting(Peer, Id) of
+            V when is_integer(V), V > 0 -> true;
+            _ -> false
+        end
+    end, [16#2b61, 16#2b64, 16#2b65]),
+    WeDeclare = lists:any(fun(K) -> maps:get(K, Opts, 1) > 0 end,
+                          [max_data, max_streams_bidi, max_streams_uni]),
+    case PeerDeclares andalso WeDeclare of
+        true ->
+            {ok, Ctx};
+        false ->
+            case webtransport_h3_router:session_count(Router, StreamId) of
+                0 -> {ok, Ctx};
+                _ -> {reset, ?H3_REQUEST_REJECTED, second_session_without_flow_control}
+            end
+    end;
+check_session_limit(_Transport, _Router, _StreamId, _Opts, Ctx) ->
+    {ok, Ctx}.
 
 %% http3-17 §3.3, http2-16 §3.3: the client lists protocols in
 %% WT-Available-Protocols; the handler may pick one, returned in
@@ -1720,3 +1747,35 @@ read_cacerts_file(CAFile) ->
         {error, Reason} ->
             {error, {cacerts_read_failed, Reason}}
     end.
+
+%% ============================================================================
+%% Eunit
+%% ============================================================================
+
+-ifdef(TEST).
+-include_lib("eunit/include/eunit.hrl").
+
+%% http3-17 §5.1: a second session on a connection without flow control is
+%% refused; with flow control declared by both sides it is accepted.
+session_limit_test_() ->
+    {ok, Router} = webtransport_h3_router:start_link(),
+    Other = spawn(fun() -> receive stop -> ok end end),
+    ok = webtransport_h3_router:register_session(Router, 0, Other),
+    Ctx = #{compat_mode => latest},
+    WithFc = Ctx#{peer_settings => #{wt_initial_max_data => 1000}},
+    Results = [
+        check_session_limit(h3, Router, 4, #{}, Ctx),
+        check_session_limit(h3, Router, 4, #{}, WithFc),
+        check_session_limit(h3, Router, 0, #{}, Ctx),
+        check_session_limit(h3, Router, 4, #{}, Ctx#{compat_mode => legacy_browser_compat})
+    ],
+    Other ! stop,
+    gen_server:stop(Router),
+    [
+        ?_assertMatch({reset, ?H3_REQUEST_REJECTED, _}, lists:nth(1, Results)),
+        ?_assertMatch({ok, _}, lists:nth(2, Results)),
+        ?_assertMatch({ok, _}, lists:nth(3, Results)),
+        ?_assertMatch({ok, _}, lists:nth(4, Results))
+    ].
+
+-endif.
