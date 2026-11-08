@@ -215,7 +215,8 @@ drain_session(#state{h3_conn = H3Conn, session_id = SessionId}) ->
 %% covering the stream header we wrote plus any application offset
 %% (http3-17 §4.4), so the peer still learns which session the stream
 %% belonged to. With a `ReliableSize' of 0 (a peer-initiated stream, where we
-%% wrote no header) a plain RESET_STREAM is sent.
+%% wrote no header) a plain RESET_STREAM is sent, and so it is when the peer
+%% did not negotiate RESET_STREAM_AT (draft-02 and http3-07 peers).
 -spec reset_stream(state(), non_neg_integer(), code(), non_neg_integer()) ->
     ok | {error, term()}.
 reset_stream(#state{quic_conn = QuicConn, h3_conn = H3Conn, session_id = SessionId},
@@ -225,7 +226,10 @@ reset_stream(#state{quic_conn = QuicConn, h3_conn = H3Conn, session_id = Session
         true ->
             quic_h3:cancel(H3Conn, StreamId, QuicCode);
         false when ReliableSize > 0 ->
-            quic:reset_stream_at(QuicConn, StreamId, QuicCode, ReliableSize);
+            case quic:reset_stream_at(QuicConn, StreamId, QuicCode, ReliableSize) of
+                {error, not_supported} -> quic:reset_stream(QuicConn, StreamId, QuicCode);
+                Result -> Result
+            end;
         false ->
             quic:reset_stream(QuicConn, StreamId, QuicCode)
     end.
@@ -288,6 +292,33 @@ quic_code_test_() ->
 %% A state with no live connection, for unit tests elsewhere.
 new_for_test(SessionId) ->
     #state{h3_conn = self(), quic_conn = self(), session_id = SessionId}.
+
+%% A peer without the reset_stream_at transport parameter still gets a
+%% RESET_STREAM.
+reset_stream_fallback_test() ->
+    Self = self(),
+    Conn = spawn_link(fun() -> fake_quic_conn(Self) end),
+    State = #state{h3_conn = Conn, quic_conn = Conn, session_id = 0},
+    ?assertEqual(ok, reset_stream(State, 4, {wt, ?WT_SESSION_GONE}, 3)),
+    ?assertMatch([{reset_stream_at, 4, _, 3}, {close_stream, 4, _}], fake_calls([])),
+    unlink(Conn),
+    exit(Conn, kill).
+
+fake_quic_conn(Owner) ->
+    receive
+        {'$gen_call', From, {reset_stream_at, _, _, _} = Req} ->
+            Owner ! {fake_call, Req},
+            gen:reply(From, {error, not_supported});
+        {'$gen_call', From, Req} ->
+            Owner ! {fake_call, Req},
+            gen:reply(From, ok)
+    end,
+    fake_quic_conn(Owner).
+
+fake_calls(Acc) ->
+    receive {fake_call, Req} -> fake_calls([Req | Acc])
+    after 0 -> lists:reverse(Acc)
+    end.
 
 stream_header_size_test_() ->
     State = #state{h3_conn = self(), quic_conn = self(), session_id = 0},
