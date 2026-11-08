@@ -33,7 +33,7 @@
 
 %% Internal API (called by transport layers)
 -export([handle_capsule/2, handle_stream_data/4, handle_datagram_data/2]).
--export([established/1, goaway/2]).
+-export([established/1, established/2, goaway/2]).
 -export([handle_stream_opened/3, handle_stream_closed/3]).
 
 %% gen_statem callbacks
@@ -77,6 +77,9 @@
     opened_uni = 0 :: non_neg_integer(),
     peer_opened_bidi = 0 :: non_neg_integer(),
     peer_opened_uni = 0 :: non_neg_integer(),
+    %% h2: the client's WebTransport-Init, kept to combine with the SETTINGS
+    %% in effect when the session is accepted.
+    webtransport_init = #{} :: map(),
     %% The peer sent WT_CLOSE_SESSION.
     peer_closed = false :: boolean(),
     %% Actions returned by the handler's init, run once the session is
@@ -176,6 +179,12 @@ early_data_accepted(Session) ->
 -spec established(session()) -> ok.
 established(Session) ->
     gen_statem:cast(Session, established).
+
+%% @doc As established/1, with the peer SETTINGS in effect when the session
+%% was accepted (h2, http2-16 §4.3.1). They replace the ones read earlier.
+-spec established(session(), map()) -> ok.
+established(Session, Info) ->
+    gen_statem:cast(Session, {established, Info}).
 
 %% @doc The connection received GOAWAY: no new streams (http3-17 §4.7).
 -spec goaway(session(), non_neg_integer()) -> ok.
@@ -298,7 +307,20 @@ init_limits(Transport, TransportState, Opts, Data) ->
         remote_max_data = Remote(max_data),
         remote_max_streams_bidi = Remote(max_streams_bidi),
         remote_max_streams_uni = Remote(max_streams_uni),
-        peer_stream_data = maps:get(peer_stream_data, Opts, #{})
+        peer_stream_data = maps:get(peer_stream_data, Opts, #{}),
+        webtransport_init = maps:get(webtransport_init, Opts, #{})
+    }.
+
+%% h2: limits from the peer SETTINGS in effect when the session was
+%% accepted, replacing the ones read before (no stream exists yet).
+apply_peer_limits(PeerSettings, Init, StateData) ->
+    Peer = peer_limits(h2, undefined, #{peer_settings => PeerSettings}),
+    StateData#data{
+        remote_max_data = maps:get(max_data, Peer),
+        remote_max_streams_bidi = maps:get(max_streams_bidi, Peer),
+        remote_max_streams_uni = maps:get(max_streams_uni, Peer),
+        peer_stream_data = wt_h2_init:apply_greater_of(Init,
+                                                       wt_h2_init:from_settings(PeerSettings))
     }.
 
 %% The peer's initial session-level limits, from its SETTINGS.
@@ -379,6 +401,12 @@ open({call, From}, get_info, StateData) ->
 open({call, From}, early_data_accepted, StateData) ->
     {keep_state, StateData, [{reply, From, do_early_data_accepted(StateData)}]};
 
+open(cast, {established, #{peer_settings := PeerSettings}},
+     #data{transport = h2, webtransport_init = Init} = StateData) ->
+    StateData1 = apply_peer_limits(PeerSettings, Init, StateData),
+    open(cast, established, StateData1);
+open(cast, {established, _}, StateData) ->
+    open(cast, established, StateData);
 open(cast, established, #data{pending_actions = Actions} = StateData) ->
     {StateData1, Transition} = handle_actions(Actions, StateData#data{pending_actions = []}),
     open_apply_transition(Transition, StateData1);
@@ -523,6 +551,11 @@ apply_capsule(connect_fin, StateData) ->
 apply_capsule({malformed, Reason}, StateData) ->
     %% RFC 9297 §3.3: a malformed capsule stream is a session error.
     stop_with_session_error(?WT_ERROR_GENERIC, Reason, StateData);
+%% The connection failed under the session (h2 SETTINGS error): nothing can
+%% be sent any more.
+apply_capsule({connection_error, Reason}, StateData) ->
+    {stop, {shutdown, {connection_error, Reason}},
+     StateData#data{close_info = {0, Reason}}};
 apply_capsule(connect_reset, StateData) ->
     reset_all_streams(StateData),
     {stop, normal, StateData#data{close_info = {0, <<"CONNECT stream reset">>}}};
@@ -793,6 +826,11 @@ draining(cast, {stream_opened, StreamId, Type}, StateData) ->
 draining(cast, {datagram_data, Data}, StateData) ->
     {StateData1, Transition} = handle_incoming_datagram(Data, StateData),
     draining_apply_transition(Transition, StateData1);
+draining(cast, {established, #{peer_settings := PeerSettings}},
+         #data{transport = h2, webtransport_init = Init} = StateData) ->
+    draining(cast, established, apply_peer_limits(PeerSettings, Init, StateData));
+draining(cast, {established, _}, StateData) ->
+    draining(cast, established, StateData);
 draining(cast, established, #data{pending_actions = Actions} = StateData) ->
     {StateData1, Transition} = handle_actions(Actions, StateData#data{pending_actions = []}),
     draining_apply_transition(Transition, StateData1);
@@ -2117,6 +2155,18 @@ count_unreceived_test() ->
     Data1 = count_unreceived(2, Stream, {reset, 1, 53}, Data),
     ?assertEqual(140, Data1#data.bytes_received),
     ?assertEqual(Data, count_unreceived(2, Stream, {reset, 1}, Data)).
+
+%% http2-16 §4.3.1: the SETTINGS in effect when the session was accepted
+%% replace the ones read before, combined with WebTransport-Init.
+apply_peer_limits_test() ->
+    Data = test_data(),
+    Settings = #{wt_initial_max_data => 500, wt_initial_max_streams_bidi => 7,
+                 wt_initial_max_streams_uni => 3, wt_initial_max_stream_data_uni => 10},
+    D1 = apply_peer_limits(Settings, #{u => 20, br => 5}, Data),
+    ?assertEqual(500, D1#data.remote_max_data),
+    ?assertEqual(7, D1#data.remote_max_streams_bidi),
+    ?assertEqual(3, D1#data.remote_max_streams_uni),
+    ?assertEqual(#{u => 20, br => 5}, D1#data.peer_stream_data).
 
 %% Which side of a stream sends: both on bidi, the opener on uni.
 send_sides_test_() ->

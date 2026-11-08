@@ -71,6 +71,10 @@
     stream_credit_replenish_test/1,
     server_without_wt_enabled_test/1,
     invalid_webtransport_init_test/1,
+    client_refuses_tls12_server_test/1,
+    h2_embedded_accept_round_trip_test/1,
+    listener_refuses_tls12_client_test/1,
+    accept_refuses_tls12_test/1,
 
     %% Embedding (accept/4 from a non-connection process)
     embedded_accept_round_trip_test/1,
@@ -148,7 +152,9 @@ groups() ->
     %% Embedding via h3_settings/0 + accept/4 is HTTP/3-only.
     H3Only = [embedded_accept_round_trip_test],
     %% WebTransport-Init is an HTTP/2 header.
-    H2Only = [invalid_webtransport_init_test],
+    H2Only = [invalid_webtransport_init_test, client_refuses_tls12_server_test,
+              h2_embedded_accept_round_trip_test,
+              listener_refuses_tls12_client_test, accept_refuses_tls12_test],
     [
         {h3_tests, [sequence], Cases ++ H3Only},
         {h2_tests, [sequence], Cases ++ H2Only}
@@ -1225,6 +1231,104 @@ start_bare_server(h2, Port, Config) ->
         handler => fun(C, S, _, _, _) -> h2:send_response(C, S, 200, []) end
     }),
     fun() -> h2:stop_server(Ref) end.
+
+%% http2-16 §7: WebTransport over HTTP/2 needs TLS 1.3 here (OTP's ssl has
+%% no extended master secret for TLS 1.2). A client does not send a
+%% WebTransport request over TLS 1.2.
+client_refuses_tls12_server_test(Config) ->
+    process_flag(trap_exit, true),
+    Port = test_helpers:find_free_port(),
+    {ok, Ref} = h2:start_server(Port, #{
+        cert => proplists:get_value(certfile, Config),
+        key => proplists:get_value(keyfile, Config),
+        enable_connect_protocol => true,
+        ssl_opts => [{versions, ['tlsv1.2']}],
+        settings => #{enable_connect_protocol => 1, 16#2b67 => 1},
+        handler => fun(C, S, _, _, _) -> h2:send_response(C, S, 200, []) end
+    }),
+    try
+        timer:sleep(100),
+        ?assertEqual({error, {tls_version_not_allowed, 'tlsv1.2'}},
+                     webtransport:connect("localhost", Port, <<"/test">>,
+                                          #{transport => h2, verify => verify_none}))
+    after
+        h2:stop_server(Ref),
+        flush_exits(),
+        process_flag(trap_exit, false)
+    end.
+
+%% Our h2 listener only offers TLS 1.3.
+listener_refuses_tls12_client_test(Config) ->
+    Port = proplists:get_value(port, Config),
+    ?assertMatch({error, _},
+                 h2:connect("localhost", Port, #{
+                     ssl_opts => [{verify, verify_none}, {versions, ['tlsv1.2']},
+                                  {alpn_advertised_protocols, [<<"h2">>]}]
+                 })).
+
+%% accept/4 from an h2 server's request handler: h2 passes method and path
+%% as arguments, so the path is given as an option.
+h2_embedded_accept_round_trip_test(Config) ->
+    process_flag(trap_exit, true),
+    Port = test_helpers:find_free_port(),
+    Opts = maps:merge(webtransport:h2_settings(), #{
+        cert => proplists:get_value(certfile, Config),
+        key => proplists:get_value(keyfile, Config),
+        handler => fun(C, S, <<"CONNECT">>, Path, Headers) ->
+            {ok, _} = webtransport:accept(C, S, Headers, #{transport => h2,
+                                                           handler => wt_echo_handler,
+                                                           path => Path})
+        end
+    }),
+    {ok, Ref} = h2:start_server(Port, Opts),
+    try
+        timer:sleep(100),
+        {ok, Session} = webtransport:connect("localhost", Port, <<"/embedded">>,
+                                             #{transport => h2, verify => verify_none}),
+        assert_session_usable(Session),
+        webtransport:close_session(Session)
+    after
+        h2:stop_server(Ref),
+        flush_exits(),
+        process_flag(trap_exit, false)
+    end.
+
+%% A server embedding accept/4 on a TLS 1.2 connection treats the request
+%% as malformed: the CONNECT stream is reset with PROTOCOL_ERROR.
+accept_refuses_tls12_test(Config) ->
+    process_flag(trap_exit, true),
+    Port = test_helpers:find_free_port(),
+    Opts = maps:merge(webtransport:h2_settings(), #{
+        cert => proplists:get_value(certfile, Config),
+        key => proplists:get_value(keyfile, Config),
+        ssl_opts => [{versions, ['tlsv1.2']}],
+        handler => fun(C, S, _M, _P, Headers) ->
+            webtransport:accept(C, S, Headers, #{transport => h2, handler => wt_echo_handler})
+        end
+    }),
+    {ok, Ref} = h2:start_server(Port, Opts),
+    try
+        timer:sleep(100),
+        {ok, Conn} = h2:connect("localhost", Port, #{
+            ssl_opts => [{verify, verify_none}, {versions, ['tlsv1.2']},
+                         {alpn_advertised_protocols, [<<"h2">>]}]
+        }),
+        Headers = [{<<":protocol">>, <<"webtransport">>},
+                   {<<":scheme">>, <<"https">>},
+                   {<<":path">>, <<"/test">>},
+                   {<<"host">>, <<"localhost">>}],
+        {ok, Sid} = h2:request(Conn, <<"CONNECT">>, <<"/test">>, Headers),
+        receive
+            {h2, Conn, {stream_reset, Sid, Code}} -> ?assertEqual(protocol_error, Code)
+        after 5000 ->
+            error(no_reset)
+        end,
+        h2:close(Conn)
+    after
+        h2:stop_server(Ref),
+        flush_exits(),
+        process_flag(trap_exit, false)
+    end.
 
 %% http2-16 §4.3.2: a WebTransport-Init that does not hold valid values is
 %% rejected with a 4xx.

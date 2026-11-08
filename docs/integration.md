@@ -94,10 +94,12 @@ H2Opts = maps:merge(webtransport:h2_settings(), #{
 ### 2. Route requests
 
 ```erlang
-my_h2_handler(Conn, StreamId, <<"CONNECT">>, <<"/wt">>, Headers) ->
+my_h2_handler(Conn, StreamId, <<"CONNECT">>, <<"/wt">> = Path, Headers) ->
+    %% h2 passes the method and path as arguments, not as headers.
     {ok, _Session} = webtransport:accept(Conn, StreamId, Headers, #{
         transport => h2,
-        handler => my_wt_handler
+        handler => my_wt_handler,
+        path => Path
     });
 
 my_h2_handler(Conn, StreamId, <<"GET">>, Path, Headers) ->
@@ -135,6 +137,12 @@ my_h2_handler(Conn, StreamId, <<"GET">>, Path, Headers) ->
 | `max_stream_data` | 262144 | Per-stream window (h2) |
 | `max_streams_bidi` | 100 | Max bidi streams |
 | `max_streams_uni` | 100 | Max uni streams |
+| `path` | from `:path` | Request path. h2 passes it to your handler as an argument, not as a header; pass it here |
+
+On h2 the connection must use TLS 1.3 (http2-16 §7; OTP's `ssl` has no
+extended master secret for TLS 1.2). `accept/4` resets the CONNECT stream
+with `PROTOCOL_ERROR` otherwise, so offer TLS 1.3 on servers that carry
+WebTransport.
 
 ## Relationship to `start_listener/2`
 

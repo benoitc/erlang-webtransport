@@ -20,7 +20,7 @@ Draft-02 (`compat_mode => legacy_browser_compat`) is kept on a separate path
 for Chrome, Firefox and webtransport-go. It never mixes with the latest
 drafts in one handshake.
 
-Audited 2026-11-08 against quic 2.5.0 and h2 0.12.7.
+Audited 2026-11-08 against quic 2.5.0 and h2 0.13.0.
 
 ## What is covered
 
@@ -28,7 +28,11 @@ Audited 2026-11-08 against quic 2.5.0 and h2 0.12.7.
   0x2c7cf000, h2 0x2b67), with values above 1 refused as settings errors.
   The client requires HTTP/3 datagrams, QUIC datagrams and RESET_STREAM_AT
   from the server; the server checks the same on the client and waits for
-  its SETTINGS before handling a request. Origin check, 403 on rejection.
+  its SETTINGS before handling a request. Later changes to the server's h2
+  SETTINGS are watched, and limits use the SETTINGS in effect when the
+  request or response was sent. h2 runs over TLS 1.3 only (§7; OTP's `ssl`
+  has no extended master secret for TLS 1.2). Origin check, 403 on
+  rejection.
 - **Subprotocols.** WT-Available-Protocols and WT-Protocol as structured
   fields, `WT_ALPN_ERROR` when the server's pick was not offered or is
   missing and required.
@@ -67,13 +71,6 @@ Audited 2026-11-08 against quic 2.5.0 and h2 0.12.7.
 | Path | Spec | Gap |
 |---|---|---|
 | h2 | http2-16 §3.4 | WT_ERROR, WT_STREAM_STATE_ERROR and WT_FLOW_CONTROL_ERROR have no HTTP/2 codepoints yet (0xTBD). Session errors use RST_STREAM with PROTOCOL_ERROR or FLOW_CONTROL_ERROR, after a WT_CLOSE_SESSION that carries 0 or the h3 WT_FLOW_CONTROL_ERROR value. Switch when IANA assigns them. |
-| h2 | http2-16 §7 | The TLS requirement (TLS 1.3, or 1.2 with extended master secret) is not checked: the h2 library does not expose the negotiated version per connection. |
-| h2 | http2-16 §4.3.1 | Initial limits use the peer SETTINGS current when the session starts, not the ones acknowledged at the moment of the request. They differ only if the peer changes its WT SETTINGS mid-connection. |
-| h2 | http2-16 §3.1 | A SETTINGS frame that later raises SETTINGS_WT_ENABLED above 1 is not seen: h2 does not report SETTINGS changes after the connection is up. The value is checked once, before the first session. |
-
-The last three need h2 to report the connection's TLS version, SETTINGS
-changes, and the SETTINGS in effect when HEADERS are sent. OTP's `ssl` has no
-extended master secret support, so on OTP only TLS 1.3 meets §7.
 
 ## Classes used by the audit
 

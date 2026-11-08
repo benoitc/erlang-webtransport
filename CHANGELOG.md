@@ -23,6 +23,18 @@ the wire, so peers on older drafts may no longer connect.
   opens more streams than it was allowed, or lowers a limit, now has its
   session closed instead of having the excess dropped. HTTP/3 sends are now
   held back when the peer's session limit is reached.
+- WebTransport over HTTP/2 now requires TLS 1.3, as the draft asks for TLS
+  1.3 or a TLS 1.2 feature OTP does not provide. The HTTP/2 listener offers
+  only TLS 1.3, clients refuse to open a session over anything else, and
+  `accept/4` resets such a request. A server that later turns
+  WebTransport support into an invalid value now closes the client's
+  connection, and session limits use the settings in effect when the
+  session was set up.
+- `accept/4` now works from an HTTP/2 server's request handler. h2 passes
+  the method and path as arguments, which `accept/4` did not see, so it
+  always answered `{error, not_connect_method}`. Pass the path with the new
+  `path` option. Sessions on the HTTP/2 listener also report their real path
+  instead of `/`.
 - New `max_stream_data` option sets the per-stream window granted on
   HTTP/2. The HTTP/2 WebTransport-Init header now carries per-stream limits,
   as the draft defines it, and a malformed one is refused with 400.
@@ -77,7 +89,7 @@ the wire, so peers on older drafts may no longer connect.
 
 - quic bumped to 2.5.0. Since 2.2.1 it fixes a header decoding issue that let an HTTP/3 peer burn minutes of CPU with one request (GHSA-224p-pchv-5r3r), a listener option that claimed to require client certificates but accepted every client (GHSA-wc8g-r527-q23h; this library does not set it), and a bug that reset a WebTransport client's session stream at the first message the server sent on it. It also adds what WebTransport draft-17 needs: requests wait for the client's settings, connections can be closed with an HTTP/3 error code, a stream reset reports its final size, and our streams keep their header when quic resets them on its own. The version constraint is now `~> 2.5`.
 - Erlang/OTP 27 or later is now required, as quic 2.4 and later no longer support OTP 26.
-- h2 bumped to 0.12.7. It caps the stream resets a client can provoke on the server (MadeYouReset, CVE-2025-8671). The version constraint is now `~> 0.12.7`.
+- h2 bumped to 0.13.0. It fixes two denial-of-service issues, one where a client could run more requests at once than the server allows (MadeYouReset, CVE-2025-8671) and a SETTINGS flood (CVE-2019-9515), and adds what WebTransport over HTTP/2 needs: the TLS version of a connection, notice of SETTINGS changes, and the SETTINGS in effect when a request or response is sent. The version constraint is now `~> 0.13.0`.
 
 ## 0.4.8 - 2026-10-03
 

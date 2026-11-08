@@ -3,7 +3,7 @@
 An Erlang implementation of the [WebTransport](https://www.w3.org/TR/webtransport/) protocol over:
 
 - **HTTP/3** ([draft-ietf-webtrans-http3-17](https://datatracker.ietf.org/doc/html/draft-ietf-webtrans-http3-17)) using native QUIC streams; draft-15 clients are accepted too
-- **HTTP/2** ([draft-ietf-webtrans-http2-16](https://datatracker.ietf.org/doc/html/draft-ietf-webtrans-http2-16)) using [RFC 9297](https://www.rfc-editor.org/rfc/rfc9297) capsules
+- **HTTP/2** ([draft-ietf-webtrans-http2-16](https://datatracker.ietf.org/doc/html/draft-ietf-webtrans-http2-16)) using [RFC 9297](https://www.rfc-editor.org/rfc/rfc9297) capsules, over TLS 1.3 only
 
 [docs/compliance.md](docs/compliance.md) lists what is implemented and the known gaps.
 
@@ -360,10 +360,12 @@ H2Opts = maps:merge(webtransport:h2_settings(), #{
 }),
 {ok, _} = h2:start_server(443, H2Opts).
 
-my_h2_handler(Conn, StreamId, <<"CONNECT">>, <<"/wt">>, Headers) ->
+my_h2_handler(Conn, StreamId, <<"CONNECT">>, <<"/wt">> = Path, Headers) ->
+    %% h2 passes the method and path as arguments, not as headers.
     {ok, _Session} = webtransport:accept(Conn, StreamId, Headers, #{
         transport => h2,
-        handler => my_wt_handler
+        handler => my_wt_handler,
+        path => Path
     });
 my_h2_handler(Conn, StreamId, <<"GET">>, Path, Headers) ->
     serve_static(Conn, StreamId, Path, Headers).
@@ -381,6 +383,7 @@ my_h2_handler(Conn, StreamId, <<"GET">>, Path, Headers) ->
 | `max_stream_data` | 262144 | Per-stream window (HTTP/2) |
 | `max_streams_bidi` | 100 | Max bidi streams |
 | `max_streams_uni` | 100 | Max uni streams |
+| `path` | from `:path` | Request path, for h2 servers whose handler gets it as an argument |
 
 `accept/4` validates the CONNECT headers and the client's SETTINGS,
 negotiates the subprotocol, starts a session, sends 200, then registers the

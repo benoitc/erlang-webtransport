@@ -308,10 +308,11 @@ h2_wt_settings(Opts) ->
 %% '''
 -spec accept(pid(), non_neg_integer(), [{binary(), binary()}], map()) ->
     {ok, session()} | {error, term()}.
-accept(Conn, StreamId, Headers, Opts) ->
+accept(Conn, StreamId, Headers0, Opts) ->
     Transport = maps:get(transport, Opts, h3),
     Handler = maps:get(handler, Opts, undefined),
     HandlerOpts = maps:get(handler_opts, Opts, #{}),
+    Headers = with_request_pseudo(Headers0, undefined, maps:get(path, Opts, undefined)),
     Method = proplists:get_value(<<":method">>, Headers, <<>>),
     case {Handler, Method} of
         {undefined, _} ->
@@ -326,6 +327,19 @@ accept(Conn, StreamId, Headers, Opts) ->
         {_, _} ->
             {error, not_connect_method}
     end.
+
+%% h2 hands its request handler the method and path as arguments, not as
+%% `:method' and `:path' headers. Put them back so every path reads the
+%% same header list. Without a method, a request carrying `:protocol' is an
+%% extended CONNECT: RFC 8441 §4 allows `:protocol' only there.
+with_request_pseudo(Headers, Method0, Path) ->
+    Method = case {Method0, proplists:is_defined(<<":protocol">>, Headers)} of
+        {undefined, true} -> <<"CONNECT">>;
+        {M, _} -> M
+    end,
+    Add = [{K, V} || {K, V} <- [{<<":method">>, Method}, {<<":path">>, Path}],
+                     V =/= undefined, not proplists:is_defined(K, Headers)],
+    Add ++ Headers.
 
 %% Turn an extended CONNECT into a session. Shared by accept/4 and the
 %% listeners. Steps, in spec order (http3-17 §3.2, http2-16 §3.2):
@@ -349,8 +363,12 @@ accept_connect(Transport, Conn, StreamId, Headers, Handler, HandlerOpts, Opts, R
             send_reject(Transport, Conn, StreamId, Status, Body),
             {error, Reason};
         {reset, Code, Reason} ->
-            %% A malformed request (RFC 9114 §4.1.2): reset the stream.
-            _ = quic_h3:cancel(Conn, StreamId, Code),
+            %% A malformed request (RFC 9114 §4.1.2, RFC 9113 §8.1.1):
+            %% reset the stream.
+            _ = case Transport of
+                h3 -> quic_h3:cancel(Conn, StreamId, Code);
+                h2 -> h2:cancel(Conn, StreamId, Code)
+            end,
             {error, Reason}
     end,
     case {Result, Router} of
@@ -421,6 +439,16 @@ check_peer(h3, _Conn, _Headers, Ctx) ->
 %% h2: http2-16 §4.3.2: a WebTransport-Init field that does not parse, or
 %% that has an invalid value for a defined key, rejects the request.
 check_peer(h2, Conn, Headers, Ctx) ->
+    case webtransport_h2:check_tls(Conn) of
+        ok ->
+            check_h2_init(Conn, Headers, Ctx);
+        {error, Reason} ->
+            %% http2-16 §7: a request on a connection without TLS 1.3 is
+            %% malformed (RFC 9113 §8.1.1: stream error PROTOCOL_ERROR).
+            {reset, protocol_error, Reason}
+    end.
+
+check_h2_init(Conn, Headers, Ctx) ->
     PeerSettings = h2:get_peer_settings(Conn),
     FromSettings = wt_h2_init:from_settings(PeerSettings),
     case proplists:get_value(<<"webtransport-init">>, Headers) of
@@ -431,6 +459,7 @@ check_peer(h2, Conn, Headers, Ctx) ->
             case wt_h2_init:parse(InitBin) of
                 {ok, Init} ->
                     {ok, Ctx#{wt_draft => h2_16, peer_settings => PeerSettings,
+                              webtransport_init => Init,
                               peer_stream_data =>
                                   wt_h2_init:apply_greater_of(Init, FromSettings)}};
                 {error, Reason} ->
@@ -533,7 +562,8 @@ start_accepted(Transport, Conn, StreamId, Headers, Handler, HandlerOpts, Opts, R
         max_streams_bidi => maps:get(max_streams_bidi, Opts, ?DEFAULT_MAX_STREAMS_BIDI),
         max_streams_uni => maps:get(max_streams_uni, Opts, ?DEFAULT_MAX_STREAMS_UNI),
         peer_settings => maps:get(peer_settings, Ctx, #{}),
-        peer_stream_data => maps:get(peer_stream_data, Ctx, #{})
+        peer_stream_data => maps:get(peer_stream_data, Ctx, #{}),
+        webtransport_init => maps:get(webtransport_init, Ctx, #{})
     }),
     start_accepted(Transport, Conn, StreamId, Handler, SessionOpts, RespHeaders, Router).
 
@@ -565,11 +595,18 @@ start_accepted(h2, Conn, StreamId, Handler, SessionOpts, RespHeaders, _Router) -
     TransportState = webtransport_h2:new(Conn, StreamId),
     case webtransport_session:start_link(h2, TransportState, Handler, SessionOpts) of
         {ok, Session} ->
-            h2:send_response(Conn, StreamId, 200, RespHeaders),
+            %% http2-16 §4.3.1: the session uses the client SETTINGS in
+            %% effect when the response is sent; h2 returns them from the
+            %% same call.
+            PeerSettings = case h2:send_response(Conn, StreamId, 200, RespHeaders,
+                                                 #{report_peer_settings => true}) of
+                {ok, PS} -> PS;
+                _ -> h2:get_peer_settings(Conn)
+            end,
             %% h2 buffers server stream events until a handler registers.
             LoopPid = spawn(fun() -> h2_data_loop(Conn, StreamId, Session) end),
             _ = h2:set_stream_handler(Conn, StreamId, LoopPid),
-            ok = webtransport_session:established(Session),
+            ok = webtransport_session:established(Session, #{peer_settings => PeerSettings}),
             {ok, Session};
         {error, Reason} ->
             send_reject(h2, Conn, StreamId, 500,
@@ -1005,7 +1042,7 @@ start_h2_listener(Name, Opts) ->
     },
     %% h2:start_server reads `ip' / `inet6' from its server-opts map. Map our
     %% `ip' / `family' listener opts onto those keys.
-    ServerOpts1 = add_h2_bind_opts(ServerOpts0, Opts),
+    ServerOpts1 = add_h2_bind_opts(ServerOpts0#{ssl_opts => [{versions, ['tlsv1.3']}]}, Opts),
     %% Per-SNI cert selection: adapt the quic-style `sni_callback' to an `ssl'
     %% `sni_fun' and pass it through `ssl_opts' (h2 merges these on top of its
     %% defaults). When no callback is set the static certfile/keyfile is used.
@@ -1141,8 +1178,9 @@ listener_loop(Name) ->
 %% Internal Functions - Request Handling
 %% ============================================================================
 
-handle_h2_request(Conn, StreamId, <<"CONNECT">>, _Path, Headers, Handler, HandlerOpts, Opts) ->
-    _ = accept_connect(h2, Conn, StreamId, Headers, Handler, HandlerOpts, Opts, undefined),
+handle_h2_request(Conn, StreamId, <<"CONNECT">> = Method, Path, Headers, Handler, HandlerOpts, Opts) ->
+    _ = accept_connect(h2, Conn, StreamId, with_request_pseudo(Headers, Method, Path),
+                       Handler, HandlerOpts, Opts, undefined),
     ok;
 handle_h2_request(Conn, StreamId, _Method, _Path, _Headers, _Handler, _HandlerOpts, _Opts) ->
     h2:send_response(Conn, StreamId, 405, []),
@@ -1289,6 +1327,22 @@ h2_data_event({h2, Conn, {data, StreamId, Data, IsFin}},
             webtransport_session:handle_capsule(Session, {malformed, <<"malformed capsule">>}),
             stop
     end;
+%% Client: the server changed its SETTINGS (notify_peer_settings). http2-16
+%% §3.1: SETTINGS_WT_ENABLED above 1 is a connection error of type
+%% PROTOCOL_ERROR. Turning it off does not affect this session.
+h2_data_event({h2, Conn, {peer_settings, Settings}},
+              {Conn, _, Session, ConnRef, SessionRef}, Buf) ->
+    case maps:get(?SETTINGS_WT_ENABLED_H2, Settings, 0) of
+        V when is_integer(V), V > 1 ->
+            _ = h2:goaway(Conn, protocol_error),
+            cleanup_data_loop(ConnRef, SessionRef),
+            webtransport_session:handle_capsule(
+              Session, {connection_error, <<"SETTINGS_WT_ENABLED above 1">>}),
+            h2:close(Conn),
+            stop;
+        _ ->
+            {continue, Buf}
+    end;
 h2_data_event({h2, Conn, {stream_reset, StreamId, _ErrorCode}},
               {Conn, StreamId, Session, ConnRef, SessionRef}, _Buf) ->
     cleanup_data_loop(ConnRef, SessionRef),
@@ -1319,6 +1373,8 @@ take_h2_stream_events(Conn, StreamId, Acc) ->
         {h2, Conn, {Tag, StreamId, _, _}} = Msg when Tag =:= data ->
             take_h2_stream_events(Conn, StreamId, [Msg | Acc]);
         {h2, Conn, {stream_reset, StreamId, _}} = Msg ->
+            take_h2_stream_events(Conn, StreamId, [Msg | Acc]);
+        {h2, Conn, {peer_settings, _}} = Msg ->
             take_h2_stream_events(Conn, StreamId, [Msg | Acc])
     after 0 ->
         lists:reverse(Acc)
@@ -1398,6 +1454,9 @@ h2_start_session(TransportState, Path, Authority, RespHeaders, Protocol, Opts, H
                 end
             end),
             _ = h2:set_stream_handler(H2Conn, StreamId, LoopPid),
+            %% The loop owns the connection from here: it gets its close and
+            %% SETTINGS-change events instead of the connecting process.
+            _ = h2:controlling_process(H2Conn, LoopPid),
             LoopPid ! {prefix, take_h2_stream_events(H2Conn, StreamId, [])},
             ok = webtransport_session:established(Session),
             {ok, Session};

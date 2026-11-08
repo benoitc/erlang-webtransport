@@ -30,6 +30,7 @@
 
 %% Client connection helpers
 -export([connect/4, request_headers/2, request_headers/3]).
+-export([check_tls/1]).
 -export([is_success_response/1]).
 
 -include("webtransport.hrl").
@@ -107,13 +108,20 @@ connect(Host, Port, Path, Opts) ->
     SSLOpts = maps:get(ssl_opts, Opts, []),
     H2Opts = #{
         ssl_opts => [{alpn_advertised_protocols, [<<"h2">>]} | SSLOpts],
-        settings => maps:get(settings, Opts, #{})
+        settings => maps:get(settings, Opts, #{}),
+        %% http2-16 §3.1: SETTINGS_WT_ENABLED can change later; the session's
+        %% data loop watches it once it owns the connection.
+        notify_peer_settings => true
     },
     case h2:connect(H2Host, Port, H2Opts) of
         {ok, H2Conn} ->
             %% h2:connect returns once the SETTINGS exchange is done.
             PeerSettings = h2:get_peer_settings(H2Conn),
-            case check_wt_enabled(PeerSettings) of
+            Checked = case check_tls(H2Conn) of
+                ok -> check_wt_enabled(PeerSettings);
+                TlsError -> TlsError
+            end,
+            case Checked of
                 ok ->
                     send_connect(H2Conn, Host, Port, Path, Opts, PeerSettings);
                 {error, {settings_error, _}} = Err ->
@@ -130,6 +138,19 @@ connect(Host, Port, Path, Opts) ->
             {error, Reason}
     end.
 
+%% http2-16 §7: WebTransport over HTTP/2 needs TLS 1.3, or TLS 1.2 with the
+%% extended master secret extension, which OTP's ssl does not implement. A
+%% client MUST NOT send a WebTransport request on any other connection; a
+%% server treats one as malformed.
+-spec check_tls(pid()) -> ok | {error, term()}.
+check_tls(H2Conn) ->
+    case h2:connection_info(H2Conn) of
+        {ok, #{transport := ssl, tls_version := 'tlsv1.3'}} -> ok;
+        {ok, #{transport := ssl, tls_version := V}} -> {error, {tls_version_not_allowed, V}};
+        {ok, #{transport := tcp}} -> {error, tls_required};
+        {error, _} = Err -> Err
+    end.
+
 %% http2-16 §3.1: a client MUST NOT open a session until the server sent
 %% SETTINGS_WT_ENABLED = 1.
 -spec check_wt_enabled(map()) -> ok | {error, term()}.
@@ -140,11 +161,14 @@ check_wt_enabled(PeerSettings) ->
         _ -> {error, wt_not_enabled}
     end.
 
-send_connect(H2Conn, Host, Port, Path, Opts, PeerSettings) ->
+send_connect(H2Conn, Host, Port, Path, Opts, _PeerSettings0) ->
     Authority = authority(Host, Port),
     Headers = request_headers(Authority, Path, maps:get(headers, Opts, []), Opts),
-    case h2:request(H2Conn, <<"CONNECT">>, Path, Headers) of
-        {ok, StreamId} ->
+    %% http2-16 §4.3.1: the session uses the server SETTINGS in effect when
+    %% the CONNECT is sent; h2 returns them from the same call.
+    case h2:request(H2Conn, connect_pseudo_headers(Headers),
+                    #{end_stream => false, report_peer_settings => true}) of
+        {ok, StreamId, PeerSettings} ->
             receive
                 {h2, H2Conn, {response, StreamId, Status, RespHeaders}}
                   when Status >= 200, Status < 300 ->
@@ -173,6 +197,15 @@ send_connect(H2Conn, Host, Port, Path, Opts, PeerSettings) ->
             h2:close(H2Conn),
             {error, Reason}
     end.
+
+%% request/3 takes the full header block: `:method' first and `:authority'
+%% instead of `host'.
+connect_pseudo_headers(Headers) ->
+    Authority = proplists:get_value(<<"host">>, Headers),
+    Rest = [H || {N, _} = H <- Headers, N =/= <<"host">>],
+    {Pseudo, Regular} = lists:partition(fun({<<$:, _/binary>>, _}) -> true; (_) -> false end,
+                                        Rest),
+    [{<<":method">>, <<"CONNECT">>}, {<<":authority">>, Authority} | Pseudo] ++ Regular.
 
 %% Per-stream limits the server granted: its SETTINGS, raised by a
 %% WebTransport-Init in the response if it sent one.

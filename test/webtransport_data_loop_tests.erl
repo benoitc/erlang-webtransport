@@ -2,6 +2,9 @@
 
 -include_lib("eunit/include/eunit.hrl").
 
+-behaviour(gen_server).
+-export([init/1, handle_call/3, handle_cast/2, handle_info/2]).
+
 %% A bare process that blocks until told to stop. Stands in for the h2
 %% connection or the session, neither of which the loop touches except by
 %% pid identity and gen_statem casts (which a plain process just drops).
@@ -16,6 +19,37 @@ wait_down(Ref) ->
         {'DOWN', Ref, process, _, _} -> ok
     after 1000 -> timeout
     end.
+
+%% Stands in for an h2 connection that answers calls (goaway) and can be
+%% stopped like one (close is gen_statem:stop/1).
+spawn_conn() ->
+    {ok, Pid} = gen_server:start(?MODULE, [], []),
+    Pid.
+
+init([]) -> {ok, #{}}.
+handle_call(_Req, _From, S) -> {reply, ok, S}.
+handle_cast(_Msg, S) -> {noreply, S}.
+handle_info(_Msg, S) -> {noreply, S}.
+
+%% http2-16 §3.1: the server raising SETTINGS_WT_ENABLED above 1 later is a
+%% connection error; the session is told and the loop ends.
+loop_stops_on_bad_wt_enabled_test() ->
+    Conn = spawn_conn(),
+    Parent = self(),
+    Session = spawn(fun() ->
+        receive {'$gen_cast', Msg} -> Parent ! {session_got, Msg} end
+    end),
+    Loop = spawn(fun() -> webtransport:h2_data_loop(Conn, 1, Session) end),
+    LoopRef = erlang:monitor(process, Loop),
+    Loop ! {h2, Conn, {peer_settings, #{16#2b67 => 1}}},
+    Loop ! {h2, Conn, {peer_settings, #{16#2b67 => 2}}},
+    receive
+        {session_got, M} ->
+            ?assertMatch({capsule, {connection_error, _}}, M)
+    after 1000 ->
+        error(no_cast)
+    end,
+    ?assertEqual(ok, wait_down(LoopRef)).
 
 %% The loop must exit when the h2 connection dies, even without a `closed'
 %% message — otherwise it orphans for the life of the VM.
