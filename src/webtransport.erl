@@ -214,13 +214,17 @@ h3_settings(Opts) ->
         #{
             owner => Router,
             stream_type_handler => Claim,
-            h3_datagram_enabled => true
+            h3_datagram_enabled => true,
+            stream_reset_final_size => true
         }
     end,
     #{
         settings => Settings,
         stream_type_handler => Claim,
         h3_datagram_enabled => true,
+        %% http3-17 §5.4: a peer reset reports the stream's final size, so
+        %% the session can count it against WT_MAX_DATA.
+        stream_reset_final_size => true,
         %% http3-17 §7.1: hold requests until the client's SETTINGS are in.
         defer_requests_until_settings => true,
         quic_opts => #{
@@ -1079,7 +1083,8 @@ start_h3_listener(Name, Opts) ->
                     owner => Router,
                     handler => make_h3_handler(Handler, HandlerOpts, Opts, Router),
                     stream_type_handler => Claim,
-                    h3_datagram_enabled => true
+                    h3_datagram_enabled => true,
+                    stream_reset_final_size => true
                 }
             end,
 
@@ -1464,6 +1469,7 @@ build_h3_connect_opts(Opts) ->
         verify => maps:get(verify, Opts, verify_peer),
         quic_opts => build_client_quic_opts(Opts),
         h3_datagram_enabled => true,
+        stream_reset_final_size => true,
         stream_type_handler => fun
             (uni,  _, 16#54) -> claim;
             (bidi, _, 16#41) -> claim;

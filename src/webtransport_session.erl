@@ -1594,9 +1594,11 @@ handle_remote_stream_closed(StreamId, Reason,
                                    handler_state = HState} = StateData) ->
     case maps:find(StreamId, Streams) of
         {ok, Stream} ->
-            {Stream1, Reason1} = remote_close(StreamId, Stream, Reason, StateData),
+            StateData0 = count_unreceived(StreamId, Stream, Reason, StateData),
+            {Stream1, Reason1} = remote_close(StreamId, Stream, strip_final_size(Reason),
+                                              StateData0),
             StateData1 = retire_stream(
-                           StreamId, StateData#data{streams = Streams#{StreamId => Stream1}}),
+                           StreamId, StateData0#data{streams = Streams#{StreamId => Stream1}}),
             case Handler:handle_stream_closed(StreamId, Reason1, HState) of
                 {ok, HState1} ->
                     {StateData1#data{handler_state = HState1}, continue};
@@ -1606,6 +1608,27 @@ handle_remote_stream_closed(StreamId, Reason,
         error ->
             {StateData, continue}
     end.
+
+%% http3-17 §5.4: bytes the peer sent on a stream before resetting it count
+%% against the session data limit even though they never arrived. The reset
+%% carries the stream's final size, which includes the stream header the
+%% peer wrote on a stream it opened; body bytes are what is left.
+count_unreceived(StreamId, Stream, {reset, _Code, FinalSize},
+                 #data{transport = h3, transport_state = H3State,
+                       bytes_received = SessRecv} = StateData) ->
+    Header = case is_local_stream(StreamId, StateData) of
+        true -> 0;
+        false -> webtransport_h3:stream_header_size(H3State, webtransport_stream:type(Stream))
+    end,
+    Missing = max(0, FinalSize - Header - webtransport_stream:bytes_received(Stream)),
+    StateData1 = StateData#data{bytes_received = SessRecv + Missing},
+    {_, StateData2} = grant_credit(StreamId, Stream, StateData1),
+    StateData2;
+count_unreceived(_StreamId, _Stream, _Reason, StateData) ->
+    StateData.
+
+strip_final_size({reset, Code, _FinalSize}) -> {reset, Code};
+strip_final_size(Reason) -> Reason.
 
 %% Apply a stream event from the transport to one direction only: a peer
 %% reset ends the peer's side, a STOP_SENDING ends ours (the QUIC stack has
@@ -2080,6 +2103,20 @@ remote_close_code_zero_test_() ->
                       remote_close(1, webtransport_stream:new(1, bidi, 100, 100),
                                    {stop_sending, 5}, Server))
     ].
+
+%% http3-17 §5.4: a reset's unreceived bytes are counted against the
+%% session data limit; the stream header is not.
+count_unreceived_test() ->
+    State = webtransport_h3:new_for_test(0),
+    Data = (test_data())#data{transport = h3, transport_state = State,
+                              flow_control = false, bytes_received = 100},
+    {ok, Stream} = webtransport_stream:receive_data(webtransport_stream:new(2, uni, 0, 1000),
+                                                     <<0:(10*8)>>),
+    %% Peer uni stream: header is 3 bytes (0x54 is a 2-byte varint, session 0
+    %% one byte), 10 body bytes arrived, final size 53: 40 never arrived.
+    Data1 = count_unreceived(2, Stream, {reset, 1, 53}, Data),
+    ?assertEqual(140, Data1#data.bytes_received),
+    ?assertEqual(Data, count_unreceived(2, Stream, {reset, 1}, Data)).
 
 %% Which side of a stream sends: both on bidi, the opener on uni.
 send_sides_test_() ->

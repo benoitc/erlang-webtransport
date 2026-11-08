@@ -31,6 +31,10 @@
 
 -export_type([state/0, code/0]).
 
+-ifdef(TEST).
+-export([new_for_test/1]).
+-endif.
+
 %% ============================================================================
 %% Lifecycle
 %% ============================================================================
@@ -280,6 +284,10 @@ quic_code_test_() ->
         ?_assertEqual(wt_error:to_quic(7), quic_code({app, 7})),
         ?_assertNotEqual(?WT_SESSION_GONE, quic_code({app, ?WT_SESSION_GONE}))
     ].
+
+%% A state with no live connection, for unit tests elsewhere.
+new_for_test(SessionId) ->
+    #state{h3_conn = self(), quic_conn = self(), session_id = SessionId}.
 
 stream_header_size_test_() ->
     State = #state{h3_conn = self(), quic_conn = self(), session_id = 0},

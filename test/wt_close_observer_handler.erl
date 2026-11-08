@@ -10,6 +10,8 @@
 init(Session, _Req, Opts) ->
     {ok, #{session => Session, owner => maps:get(owner, Opts, undefined)}}.
 
+handle_stream(StreamId, uni, <<"stopme">>, State) ->
+    {ok, State, [{stop_sending, StreamId, 9}]};
 handle_stream(_StreamId, _Type, _Data, State) ->
     {ok, State}.
 

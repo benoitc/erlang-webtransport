@@ -63,6 +63,10 @@ the wire, so peers on older drafts may no longer connect.
 - `close_stream/2` after a large send now waits for the queued data before
   ending the stream, instead of cutting it short.
 - Finished streams are released, so long sessions no longer grow in memory.
+- On HTTP/3, data the peer sent on a stream before resetting it now counts
+  against the session's data limit, so many resets no longer leave a peer
+  stalled. When the peer stops reading a unidirectional stream we opened, the
+  handler is told and further sends on it fail at once.
 - `session_info/1` reports `max_datagram_size`, the largest datagram the
   application can send.
 - A server no longer closes the HTTP/3 connection when its last WebTransport
@@ -71,8 +75,8 @@ the wire, so peers on older drafts may no longer connect.
 - `reset_stream` and `stop_sending` refuse error codes above 32 bits with
   `{error, invalid_error_code}`.
 
-- quic bumped to 2.4.0. It fixes a header decoding issue that let an HTTP/3 peer burn minutes of CPU with one request (GHSA-224p-pchv-5r3r), and a bug that reset a WebTransport client's session stream at the first message the server sent on it after accepting. It also adds what WebTransport draft-17 needs: requests wait for the client's settings, and connections can be closed with an HTTP/3 error code. The version constraint is now `~> 2.4`.
-- Erlang/OTP 27 or later is now required, as quic 2.4.0 no longer supports OTP 26.
+- quic bumped to 2.5.0. Since 2.2.1 it fixes a header decoding issue that let an HTTP/3 peer burn minutes of CPU with one request (GHSA-224p-pchv-5r3r), a listener option that claimed to require client certificates but accepted every client (GHSA-wc8g-r527-q23h; this library does not set it), and a bug that reset a WebTransport client's session stream at the first message the server sent on it. It also adds what WebTransport draft-17 needs: requests wait for the client's settings, connections can be closed with an HTTP/3 error code, a stream reset reports its final size, and our streams keep their header when quic resets them on its own. The version constraint is now `~> 2.5`.
+- Erlang/OTP 27 or later is now required, as quic 2.4 and later no longer support OTP 26.
 - h2 bumped to 0.12.7. It caps the stream resets a client can provoke on the server (MadeYouReset, CVE-2025-8671). The version constraint is now `~> 0.12.7`.
 
 ## 0.4.8 - 2026-10-03

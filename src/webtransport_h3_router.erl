@@ -264,6 +264,11 @@ handle_quic_h3({quic_h3, _Conn, {stream_type_closed, _Direction, StreamId}}, Sta
     {noreply, route_stream_closed(StreamId, normal, State)};
 handle_quic_h3({quic_h3, _Conn, {stream_type_reset, _Direction, StreamId, ErrorCode}}, State) ->
     {noreply, route_stream_closed(StreamId, {reset, map_from_quic(ErrorCode)}, State)};
+%% With `stream_reset_final_size' the reset carries the stream's final size
+%% (http3-17 §5.4); the session counts the bytes it never received.
+handle_quic_h3({quic_h3, _Conn, {stream_type_reset, _Direction, StreamId, ErrorCode, FinalSize}},
+               State) ->
+    {noreply, route_stream_closed(StreamId, {reset, map_from_quic(ErrorCode), FinalSize}, State)};
 handle_quic_h3({quic_h3, _Conn, {stream_type_stop_sending, _Direction, StreamId, ErrorCode}}, State) ->
     {noreply, route_stream_closed(StreamId, {stop_sending, map_from_quic(ErrorCode)}, State)};
 handle_quic_h3({quic_h3, Conn, {datagram, StreamId, Payload}}, State0) ->
@@ -344,15 +349,19 @@ ensure_h3_monitor(Conn, #state{h3_conn = undefined} = State) ->
 ensure_h3_monitor(_Conn, State) ->
     State.
 
+%% quic_h3 opens the stream, writes its type (0x54) and claims it, so the
+%% peer's STOP_SENDING and resets on it reach us; the session id follows.
 do_open_local_uni(SessionId, #state{h3_conn = H3Conn} = State) when H3Conn =/= undefined ->
     case maps:find(SessionId, State#state.sessions) of
         {ok, SessionPid} ->
             QuicConn = quic_h3:get_quic_conn(H3Conn),
-            case quic:open_unidirectional_stream(QuicConn) of
+            case quic_h3:open_uni_stream(H3Conn, ?WT_UNI_STREAM_TYPE) of
                 {ok, StreamId} ->
-                    Header = wt_h3_capsule:encode_uni_stream_header(SessionId),
-                    case quic:send_data(QuicConn, StreamId, Header, false) of
+                    case quic:send_data(QuicConn, StreamId, h2_varint:encode(SessionId), false) of
                         ok ->
+                            keep_header_on_reset(
+                              QuicConn, StreamId,
+                              byte_size(wt_h3_capsule:encode_uni_stream_header(SessionId))),
                             Local = (State#state.local_streams)#{StreamId => SessionPid},
                             {reply, {ok, StreamId}, State#state{local_streams = Local}};
                         {error, _} = Err ->
@@ -366,6 +375,13 @@ do_open_local_uni(SessionId, #state{h3_conn = H3Conn} = State) when H3Conn =/= u
     end;
 do_open_local_uni(_SessionId, State) ->
     {reply, {error, no_h3_conn}, State}.
+
+%% http3-17 §4.4: any reset quic sends on its own for one of our streams
+%% (answering STOP_SENDING) is RESET_STREAM_AT keeping the stream header,
+%% so the peer still learns which session the stream belonged to.
+keep_header_on_reset(QuicConn, StreamId, HeaderSize) ->
+    _ = quic:set_stream_reliable_size(QuicConn, StreamId, HeaderSize),
+    ok.
 
 %% Sessions and slots on this connection other than `SessionId'.
 others(SessionId, #state{sessions = Sessions, reserved = Reserved}) ->
@@ -438,6 +454,7 @@ do_open_local_bidi(SessionId, State) ->
                             Header = wt_h3_capsule:encode_bidi_stream_header(SessionId),
                             QuicConn = quic_h3:get_quic_conn(H3Conn),
                             _ = quic:send_data(QuicConn, StreamId, Header, false),
+                            keep_header_on_reset(QuicConn, StreamId, byte_size(Header)),
                             Local = (State#state.local_streams)#{StreamId => SessionPid},
                             State1 = ensure_h3_monitor(H3Conn, State),
                             {reply, {ok, StreamId},

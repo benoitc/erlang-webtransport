@@ -119,6 +119,19 @@ bad_session_id_test() ->
     ?assertEqual({'$gen_cast', {close, ?H3_ID_ERROR}}, recv(200)),
     gen_server:stop(Router).
 
+%% With stream_reset_final_size the reset's final size goes to the session.
+reset_with_final_size_test() ->
+    {ok, Router} = webtransport_h3_router:start_link(),
+    Session = start_fake_session(self()),
+    ok = webtransport_h3_router:register_session(Router, 0, Session),
+    Router ! {quic_h3, self(), {stream_type_open, uni, 14, 16#54}},
+    Router ! {quic_h3, self(), {stream_type_data, uni, 14, <<0>>, false}},
+    ?assertEqual({stream_opened, 14, uni}, recv(200)),
+    Router ! {quic_h3, self(), {stream_type_reset, uni, 14, wt_error:to_quic(42), 100}},
+    ?assertEqual({stream_closed, 14, {reset, 42, 100}}, recv(200)),
+    Session ! stop,
+    gen_server:stop(Router).
+
 %% A refused CONNECT frees its slot and resets streams held for it.
 session_gone_resets_parked_test() ->
     {ok, Router} = webtransport_h3_router:start_link(),

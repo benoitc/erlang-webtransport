@@ -62,6 +62,7 @@
     flow_control_credit_test/1,
     server_close_reaches_client_test/1,
     init_actions_after_accept_test/1,
+    stop_sending_on_own_uni_test/1,
     handler_stop_closes_session_test/1,
     drain_completes_test/1,
     reset_unseen_stream_test/1,
@@ -103,6 +104,7 @@ groups() ->
         flow_control_credit_test,
         server_close_reaches_client_test,
         init_actions_after_accept_test,
+        stop_sending_on_own_uni_test,
         handler_stop_closes_session_test,
         drain_completes_test,
         reset_unseen_stream_test,
@@ -984,6 +986,25 @@ init_actions_after_accept_test(Config) ->
         {ok, Info} = webtransport:session_info(Session),
         %% overview-14 §4.2: the largest datagram we can send.
         ?assert(maps:get(max_datagram_size, Info) > 0),
+        webtransport:close_session(Session)
+    end).
+
+%% The peer's STOP_SENDING on a uni stream we opened reaches the handler,
+%% and the stream no longer accepts data.
+stop_sending_on_own_uni_test(Config) ->
+    with_observer_listener(stopme, Config, fun(Port, Transport) ->
+        {ok, Session} = webtransport:connect("localhost", Port, <<"/test">>, #{
+            transport => Transport,
+            verify => verify_none
+        }),
+        {ok, U} = webtransport:open_stream(Session, uni),
+        ok = webtransport:send(Session, U, <<"stopme">>, nofin),
+        receive
+            {webtransport, Session, {stream_closed, U, {stop_sending, 9}}} -> ok
+        after 5000 ->
+            error(no_stop_sending)
+        end,
+        ?assertMatch({error, _}, webtransport:send(Session, U, <<"more">>, nofin)),
         webtransport:close_session(Session)
     end).
 

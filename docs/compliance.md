@@ -20,7 +20,7 @@ Draft-02 (`compat_mode => legacy_browser_compat`) is kept on a separate path
 for Chrome, Firefox and webtransport-go. It never mixes with the latest
 drafts in one handshake.
 
-Audited 2026-11-07 against quic 2.4.0 and h2 0.12.7.
+Audited 2026-11-08 against quic 2.5.0 and h2 0.12.7.
 
 ## What is covered
 
@@ -34,11 +34,13 @@ Audited 2026-11-07 against quic 2.4.0 and h2 0.12.7.
   missing and required.
 - **Wire format.** h3 stream headers, 32-bit close codes, UTF-8 close reasons
   of at most 1024 bytes, h2 capsule codepoints of http2-16, Reliable Size on
-  WT_RESET_STREAM, RESET_STREAM_AT on h3, unknown capsules dropped.
+  WT_RESET_STREAM, RESET_STREAM_AT on h3 for every reset of our streams
+  (including quic's answer to STOP_SENDING), unknown capsules dropped.
 - **Flow control.** Initial limits from SETTINGS (and WebTransport-Init on
   h2), flow control on or off per http3-17 §5.1, one session per h3
   connection without it, strictly increasing limits, the 2^60 stream cap,
-  overruns as WT_FLOW_CONTROL_ERROR, credit returned with WT_MAX_DATA,
+  overruns as WT_FLOW_CONTROL_ERROR, bytes of a reset stream counted from its
+  final size, credit returned with WT_MAX_DATA,
   WT_MAX_STREAM_DATA and WT_MAX_STREAMS, blocked capsules sent.
 - **Stream state (h2).** Resets, STOP_SENDING, data and flow-control capsules
   on a stream in the wrong state are WT_STREAM_STATE_ERROR session errors;
@@ -68,9 +70,10 @@ Audited 2026-11-07 against quic 2.4.0 and h2 0.12.7.
 | h2 | http2-16 §7 | The TLS requirement (TLS 1.3, or 1.2 with extended master secret) is not checked: the h2 library does not expose the negotiated version per connection. |
 | h2 | http2-16 §4.3.1 | Initial limits use the peer SETTINGS current when the session starts, not the ones acknowledged at the moment of the request. They differ only if the peer changes its WT SETTINGS mid-connection. |
 | h2 | http2-16 §3.1 | A SETTINGS frame that later raises SETTINGS_WT_ENABLED above 1 is not seen: h2 does not report SETTINGS changes after the connection is up. The value is checked once, before the first session. |
-| h3 | http3-17 §5.4 | When the peer resets a stream, the bytes it sent but we never received are not counted against the session data limit, because quic does not report a reset's final size. After many resets with data in flight the two sides' views of the limit can drift. Upstream: `~/Projects/erlang_quic_wt_stream_events_prompt.md`. |
-| h3 | http3-17 §4.4 | When the peer sends STOP_SENDING, quic answers with RESET_STREAM rather than RESET_STREAM_AT. The peer has seen the stream to stop it, so in practice it already has the stream header. |
-| h3 | RFC 9000 §3.5 | STOP_SENDING on a unidirectional stream we opened is not reported to the handler: quic resets the stream and our next send on it fails. |
+
+The last three need h2 to report the connection's TLS version, SETTINGS
+changes, and the SETTINGS in effect when HEADERS are sent. OTP's `ssl` has no
+extended master secret support, so on OTP only TLS 1.3 meets §7.
 
 ## Classes used by the audit
 
