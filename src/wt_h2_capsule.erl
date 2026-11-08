@@ -84,7 +84,6 @@ wt_stream_fin(StreamId, Data, true) ->
 wt_stream_fin(StreamId, Data, false) ->
     {wt_stream, StreamId, Data}.
 
-%% @doc Construct a RESET_STREAM capsule for the given stream and error code.
 %% @doc WT_RESET_STREAM with a Reliable Size of 0, for a stream we never
 %% sent data on.
 -spec reset_stream(stream_id(), error_code()) -> capsule().
@@ -147,8 +146,6 @@ streams_blocked_uni(Limit) ->
 close_session(ErrorCode) ->
     {close_session, ErrorCode, <<>>}.
 
-%% @doc Construct a CLOSE_SESSION capsule with the given error code and reason.
-%% draft-14 §4.6: the Reason field MUST be at most 1024 UTF-8 bytes.
 %% @doc WT_CLOSE_SESSION, shared with h3 (http2-16 §6.12). Same rules as
 %% {@link wt_h3_capsule:close_session/2}.
 -spec close_session(error_code(), binary()) -> capsule() | {error, bad_close_reason}.

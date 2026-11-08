@@ -264,8 +264,7 @@ close_remote(Stream) ->
 close(Stream) ->
     Stream#stream{state = closed, local_fin = true, remote_fin = true}.
 
-%% @doc Reset the stream with the given error code, discarding the send buffer.
-%% @doc We abruptly end our send side. The peer may still be sending on a
+%% @doc We abruptly end our send side, discarding the send buffer. The peer may still be sending on a
 %% bidirectional stream, so only the send direction closes.
 -spec reset(stream(), non_neg_integer()) -> stream().
 reset(#stream{state = State} = Stream, ErrorCode) ->

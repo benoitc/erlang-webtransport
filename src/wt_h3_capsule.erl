@@ -87,8 +87,6 @@ streams_blocked_uni(Limit) ->
 close_session(ErrorCode) ->
     {close_session, ErrorCode, <<>>}.
 
-%% @doc Construct a CLOSE_SESSION capsule with the given error code and reason.
-%% draft-15 §5: the Reason field MUST be at most 1024 UTF-8 bytes.
 %% @doc Build a WT_CLOSE_SESSION capsule. The code must fit in 32 bits and
 %% the reason must be valid UTF-8 of at most 1024 bytes (http3-17 §6).
 -spec close_session(non_neg_integer(), binary()) -> capsule() | {error, bad_close_reason}.

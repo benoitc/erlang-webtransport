@@ -99,7 +99,6 @@ set_passthrough(Router, Pid) ->
 register_session(Router, SessionId, SessionPid) ->
     gen_server:call(Router, {register, SessionId, SessionPid}).
 
-%% @doc Remove the session registration for the given session ID.
 %% @doc Client side: the CONNECT request for `SessionId' was sent. Hold the
 %% data the server sends on that stream until the session registers, so
 %% capsules that follow the 2xx response (flow control, close, drain) reach
@@ -136,6 +135,7 @@ session_gone(Router, SessionId) ->
 session_ended(Router, SessionId, PeerClosed) ->
     gen_server:call(Router, {ended, SessionId, PeerClosed}, 5000).
 
+%% @doc Remove the session registration for the given session ID.
 -spec unregister_session(pid(), non_neg_integer()) -> ok.
 unregister_session(Router, SessionId) ->
     gen_server:call(Router, {unregister, SessionId}).
@@ -154,13 +154,13 @@ open_bidi_stream(Router, SessionId) ->
     %% unresponsive H3 connection must not stall the session indefinitely.
     gen_server:call(Router, {open_bidi_stream, SessionId}, 30000).
 
-%% @doc Return the H3 connection pid, or undefined if not yet connected.
 %% @doc Open a unidirectional stream for a session, write its header and
 %% remember it, so events on it reach the session.
 -spec open_uni_stream(pid(), non_neg_integer()) -> {ok, non_neg_integer()} | {error, term()}.
 open_uni_stream(Router, SessionId) ->
     gen_server:call(Router, {open_uni_stream, SessionId}, 30000).
 
+%% @doc Return the H3 connection pid, or undefined if not yet connected.
 -spec get_h3_conn(pid()) -> undefined | pid().
 get_h3_conn(Router) ->
     gen_server:call(Router, get_h3_conn).
