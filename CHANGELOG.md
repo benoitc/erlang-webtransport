@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.5.3 - 2026-11-08
 
 - Requires quic 2.6.1.
 - When `open_stream` fails because the QUIC connection is out of streams,
