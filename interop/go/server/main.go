@@ -34,7 +34,7 @@ func main() {
 	}
 
 	s := &webtransport.Server{
-		H3: http3.Server{
+		H3: &http3.Server{
 			Addr: ":" + *port,
 			TLSConfig: &tls.Config{
 				Certificates: []tls.Certificate{cert},
@@ -54,6 +54,12 @@ func main() {
 		go handleSession(sess, *www)
 	})
 	s.H3.Handler = mux
+
+	// webtransport-go v0.10.0 no longer auto-configures the HTTP/3 server during
+	// ListenAndServe; the WebTransport SETTINGS (enable flag + datagrams) and the
+	// QUIC-conn context wiring must now be installed explicitly via this call.
+	// Without it the server never advertises WebTransport and peers reject it.
+	webtransport.ConfigureHTTP3Server(s.H3)
 
 	log.Printf("go interop server listening on :%s", *port)
 	if err := s.ListenAndServe(); err != nil {
