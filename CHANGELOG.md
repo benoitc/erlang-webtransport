@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-- Requires quic 2.6.0.
+- Requires quic 2.6.1.
 - When `open_stream` fails because the QUIC connection is out of streams,
   the handler is now told through `handle_stream_credit/2` when it can try
   again, as it already was for the session's own stream limit. Before, you

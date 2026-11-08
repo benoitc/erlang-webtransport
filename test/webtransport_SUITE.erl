@@ -80,6 +80,7 @@
     %% Embedding (accept/4 from a non-connection process)
     embedded_accept_round_trip_test/1,
     quic_stream_limit_credit_test/1,
+    quic_uni_stream_limit_credit_test/1,
 
     %% Listener lifecycle
     stop_listener_does_not_kill_caller_test/1,
@@ -158,7 +159,8 @@ groups() ->
         sni_callback_round_trip_test
     ],
     %% Embedding via h3_settings/0 + accept/4 is HTTP/3-only.
-    H3Only = [embedded_accept_round_trip_test, quic_stream_limit_credit_test],
+    H3Only = [embedded_accept_round_trip_test, quic_stream_limit_credit_test,
+              quic_uni_stream_limit_credit_test],
     %% WebTransport-Init is an HTTP/2 header.
     H2Only = [invalid_webtransport_init_test, client_refuses_tls12_server_test,
               h2_embedded_accept_round_trip_test,
@@ -1414,11 +1416,45 @@ collect_stream_echo(Session, StreamId, Acc, Timeout) ->
 %% limit: open_stream fails with stream_limit, and once a stream finishes
 %% the handler is told it can open one again.
 quic_stream_limit_credit_test(Config) ->
+    with_quic_limited_server(Config, #{max_streams_bidi => 3}, fun(Session) ->
+        {ok, S1} = webtransport:open_stream(Session, bidi),
+        {ok, _S2} = webtransport:open_stream(Session, bidi),
+        ?assertEqual({error, stream_limit}, webtransport:open_stream(Session, bidi)),
+        ok = webtransport:send(Session, S1, <<"done">>, fin),
+        <<"done">> = collect_stream_echo(Session, S1, <<>>, 3000),
+        await_stream_credit(Session, bidi),
+        ?assertMatch({ok, _}, webtransport:open_stream(Session, bidi))
+    end).
+
+%% Same for uni streams. The client's HTTP/3 control and QPACK streams take
+%% three of the five. quic gives streams back in steps of half the limit
+%% (two here), so both of ours have to finish.
+quic_uni_stream_limit_credit_test(Config) ->
+    with_quic_limited_server(Config, #{max_streams_uni => 5}, fun(Session) ->
+        {ok, U1} = webtransport:open_stream(Session, uni),
+        {ok, U2} = webtransport:open_stream(Session, uni),
+        ?assertEqual({error, stream_limit}, webtransport:open_stream(Session, uni)),
+        ok = webtransport:send(Session, U1, <<"done">>, fin),
+        ok = webtransport:send(Session, U2, <<"done">>, fin),
+        await_stream_credit(Session, uni),
+        ?assertMatch({ok, _}, webtransport:open_stream(Session, uni))
+    end).
+
+await_stream_credit(Session, Type) ->
+    receive
+        {webtransport, Session, {stream_credit, Type}} -> ok
+    after 5000 ->
+        error({no_stream_credit, Type})
+    end.
+
+%% An embedded server with tight QUIC stream limits, so the connection runs
+%% out before the session's own limits.
+with_quic_limited_server(Config, Limits, Fun) ->
     CertFile = proplists:get_value(certfile, Config),
     KeyFile = proplists:get_value(keyfile, Config),
     {ok, CertDer, PrivateKey} = read_cert_key_der(CertFile, KeyFile),
     Port = test_helpers:find_free_port(),
-    Name = quic_stream_limit_server,
+    Name = list_to_atom("quic_limited_" ++ integer_to_list(erlang:unique_integer([positive]))),
     Dispatch = fun(Conn, StreamId, <<"CONNECT">>, _Path, Headers) ->
                        _ = spawn(fun() ->
                                {ok, _} = webtransport:accept(
@@ -1428,8 +1464,7 @@ quic_stream_limit_credit_test(Config) ->
                        ok
                end,
     Settings = webtransport:h3_settings(),
-    %% Three client bidi streams: the CONNECT stream and two more.
-    QuicOpts = (maps:get(quic_opts, Settings))#{max_streams_bidi => 3},
+    QuicOpts = maps:merge(maps:get(quic_opts, Settings), Limits),
     {ok, _} = quic_h3:start_server(Name, Port, Settings#{
         cert => CertDer, key => PrivateKey, handler => Dispatch,
         quic_opts => QuicOpts
@@ -1441,17 +1476,7 @@ quic_stream_limit_credit_test(Config) ->
             verify => verify_none,
             handler_opts => #{owner => self()}
         }),
-        {ok, S1} = webtransport:open_stream(Session, bidi),
-        {ok, _S2} = webtransport:open_stream(Session, bidi),
-        ?assertEqual({error, stream_limit}, webtransport:open_stream(Session, bidi)),
-        ok = webtransport:send(Session, S1, <<"done">>, fin),
-        <<"done">> = collect_stream_echo(Session, S1, <<>>, 3000),
-        receive
-            {webtransport, Session, {stream_credit, bidi}} -> ok
-        after 5000 ->
-            error(no_stream_credit)
-        end,
-        ?assertMatch({ok, _}, webtransport:open_stream(Session, bidi)),
+        Fun(Session),
         ok = webtransport:close_session(Session)
     after
         quic_h3:stop_server(Name)
