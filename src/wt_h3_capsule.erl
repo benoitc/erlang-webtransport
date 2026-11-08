@@ -18,6 +18,7 @@
 -export([max_streams_bidi/1, max_streams_uni/1]).
 -export([streams_blocked_bidi/1, streams_blocked_uni/1]).
 -export([close_session/1, close_session/2, drain_session/0]).
+-export([encode_close_payload/2, decode_close_payload/1, valid_close_reason/1]).
 
 %% Native stream helpers
 -export([encode_uni_stream_header/1, encode_bidi_stream_header/1]).
@@ -38,6 +39,9 @@
     {streams_blocked_uni, non_neg_integer()} |
     {close_session, non_neg_integer(), binary()} |
     {drain_session} |
+    {datagram, binary()} |
+    {max_stream_data, non_neg_integer(), non_neg_integer()} |
+    {stream_data_blocked, non_neg_integer(), non_neg_integer()} |
     {unknown, non_neg_integer(), binary()}.
 
 -type stream_kind() :: bidi | uni.
@@ -83,13 +87,43 @@ streams_blocked_uni(Limit) ->
 close_session(ErrorCode) ->
     {close_session, ErrorCode, <<>>}.
 
-%% @doc Construct a CLOSE_SESSION capsule with the given error code and reason.
-%% draft-15 §5: the Reason field MUST be at most 1024 UTF-8 bytes.
--spec close_session(non_neg_integer(), binary()) -> capsule() | {error, reason_too_long}.
-close_session(_ErrorCode, Reason) when byte_size(Reason) > 1024 ->
-    {error, reason_too_long};
-close_session(ErrorCode, Reason) ->
-    {close_session, ErrorCode, Reason}.
+%% @doc Build a WT_CLOSE_SESSION capsule. The code must fit in 32 bits and
+%% the reason must be valid UTF-8 of at most 1024 bytes (http3-17 §6).
+-spec close_session(non_neg_integer(), binary()) -> capsule() | {error, bad_close_reason}.
+close_session(ErrorCode, Reason) when is_integer(ErrorCode), ErrorCode >= 0,
+                                      ErrorCode =< 16#ffffffff ->
+    case valid_close_reason(Reason) of
+        true -> {close_session, ErrorCode, Reason};
+        false -> {error, bad_close_reason}
+    end;
+close_session(_ErrorCode, _Reason) ->
+    {error, bad_close_reason}.
+
+%% @doc True when `Reason' is valid UTF-8 of at most 1024 bytes.
+-spec valid_close_reason(binary()) -> boolean().
+valid_close_reason(Reason) when is_binary(Reason),
+                                byte_size(Reason) =< ?WT_CLOSE_REASON_MAX ->
+    unicode:characters_to_binary(Reason) =:= Reason;
+valid_close_reason(_) ->
+    false.
+
+%% @doc Payload of a WT_CLOSE_SESSION capsule: a 32-bit error code followed
+%% by the reason. Shared by the h2 and h3 codecs.
+-spec encode_close_payload(non_neg_integer(), binary()) -> binary().
+encode_close_payload(ErrorCode, Reason) ->
+    <<ErrorCode:32, Reason/binary>>.
+
+%% @doc Decode a WT_CLOSE_SESSION payload. Fails when the payload is shorter
+%% than the error code, or when the reason is too long or not UTF-8.
+-spec decode_close_payload(binary()) ->
+    {ok, {close_session, non_neg_integer(), binary()}} | {error, term()}.
+decode_close_payload(<<ErrorCode:32, Reason/binary>>) ->
+    case valid_close_reason(Reason) of
+        true -> {ok, {close_session, ErrorCode, Reason}};
+        false -> {error, bad_close_reason}
+    end;
+decode_close_payload(_) ->
+    {error, truncated_close_session}.
 
 %% @doc Construct a DRAIN_SESSION capsule to signal graceful shutdown.
 -spec drain_session() -> capsule().
@@ -115,10 +149,11 @@ encode({streams_blocked_bidi, Limit}) ->
 encode({streams_blocked_uni, Limit}) ->
     h2_capsule:encode(?WT_STREAMS_BLOCKED_UNI, h2_varint:encode(Limit));
 encode({close_session, ErrorCode, Reason}) ->
-    Payload = <<(h2_varint:encode(ErrorCode))/binary, Reason/binary>>,
-    h2_capsule:encode(?WT_CLOSE_SESSION_H3, Payload);
+    h2_capsule:encode(?WT_CLOSE_SESSION, encode_close_payload(ErrorCode, Reason));
 encode({drain_session}) ->
-    h2_capsule:encode(?WT_DRAIN_SESSION_H3, <<>>).
+    h2_capsule:encode(?WT_DRAIN_SESSION, <<>>);
+encode({datagram, Data}) ->
+    h2_capsule:encode(?DATAGRAM, Data).
 
 %% ============================================================================
 %% Decoding
@@ -149,20 +184,26 @@ decode_payload(?WT_STREAMS_BLOCKED_BIDI, Payload) ->
     decode_limit(streams_blocked_bidi, Payload);
 decode_payload(?WT_STREAMS_BLOCKED_UNI, Payload) ->
     decode_limit(streams_blocked_uni, Payload);
-decode_payload(?WT_CLOSE_SESSION_H3, Payload) ->
-    case h2_varint:decode(Payload) of
-        {ok, _ErrorCode, Reason} when byte_size(Reason) > 1024 ->
-            {error, reason_too_long};
-        {ok, ErrorCode, Reason} ->
-            {ok, {close_session, ErrorCode, Reason}};
-        {error, _} = Err ->
-            Err
-    end;
-decode_payload(?WT_DRAIN_SESSION_H3, <<>>) ->
+decode_payload(?WT_CLOSE_SESSION, Payload) ->
+    decode_close_payload(Payload);
+%% http3-17 §5.4: these two are not used on h3 and receiving one is a
+%% session error, so they are decoded for the session to reject.
+decode_payload(?WT_MAX_STREAM_DATA, Payload) ->
+    decode_pair(max_stream_data, Payload);
+decode_payload(?WT_STREAM_DATA_BLOCKED, Payload) ->
+    decode_pair(stream_data_blocked, Payload);
+decode_payload(?WT_DRAIN_SESSION, <<>>) ->
     {ok, {drain_session}};
-decode_payload(?WT_DRAIN_SESSION_H3, _) ->
+decode_payload(?WT_DRAIN_SESSION, _) ->
     {error, extra_data};
+decode_payload(?DATAGRAM, Payload) ->
+    {ok, {datagram, Payload}};
+decode_payload(datagram, Payload) ->
+    %% h2_capsule names the RFC 9297 type.
+    {ok, {datagram, Payload}};
 decode_payload(Type, Payload) when is_integer(Type) ->
+    {ok, {unknown, Type, Payload}};
+decode_payload(Type, Payload) when is_atom(Type) ->
     {ok, {unknown, Type, Payload}}.
 
 %% @doc Decode all capsules from a binary, returning the list and any trailing bytes.
@@ -178,6 +219,18 @@ decode_all(Bin, Acc) ->
             decode_all(Rest, [Capsule | Acc]);
         {more, _} ->
             {ok, lists:reverse(Acc), Bin};
+        {error, _} = Err ->
+            Err
+    end.
+
+decode_pair(Name, Payload) ->
+    case h2_varint:decode(Payload) of
+        {ok, StreamId, Rest} ->
+            case h2_varint:decode(Rest) of
+                {ok, Limit, <<>>} -> {ok, {Name, StreamId, Limit}};
+                {ok, _, _} -> {error, extra_data};
+                {error, _} = Err -> Err
+            end;
         {error, _} = Err ->
             Err
     end.
@@ -271,8 +324,8 @@ type_name(?WT_MAX_STREAMS_BIDI) -> max_streams_bidi;
 type_name(?WT_MAX_STREAMS_UNI) -> max_streams_uni;
 type_name(?WT_STREAMS_BLOCKED_BIDI) -> streams_blocked_bidi;
 type_name(?WT_STREAMS_BLOCKED_UNI) -> streams_blocked_uni;
-type_name(?WT_CLOSE_SESSION_H3) -> close_session;
-type_name(?WT_DRAIN_SESSION_H3) -> drain_session;
+type_name(?WT_CLOSE_SESSION) -> close_session;
+type_name(?WT_DRAIN_SESSION) -> drain_session;
 type_name(N) -> N.
 
 validate_session_id(SessionId) when is_integer(SessionId), SessionId >= 0, SessionId rem 4 =:= 0 ->
@@ -310,17 +363,51 @@ datagram_roundtrip_test() ->
 invalid_session_id_test() ->
     ?assertError({invalid_session_id, 3}, encode_bidi_stream_header(3)).
 
-close_session_reason_length_test_() ->
+close_session_reason_test_() ->
     Boundary = binary:copy(<<"x">>, 1024),
     TooLong = <<Boundary/binary, "!">>,
     [
         ?_assertMatch({close_session, 1, _}, close_session(1, Boundary)),
-        ?_assertEqual({error, reason_too_long}, close_session(1, TooLong))
+        ?_assertEqual({error, bad_close_reason}, close_session(1, TooLong)),
+        ?_assertEqual({error, bad_close_reason}, close_session(1, <<255>>)),
+        ?_assertEqual({error, bad_close_reason}, close_session(1 bsl 32, <<>>))
     ].
 
-close_session_decode_reason_too_long_test() ->
-    Payload = <<(h2_varint:encode(7))/binary, (binary:copy(<<"z">>, 2048))/binary>>,
-    Encoded = h2_capsule:encode(?WT_CLOSE_SESSION_H3, Payload),
-    ?assertEqual({error, reason_too_long}, decode(Encoded)).
+%% http3-17 §6: the error code is a fixed 32 bits, not a varint.
+close_session_wire_format_test() ->
+    Encoded = encode(close_session(7, <<"x">>)),
+    ?assertEqual(h2_capsule:encode(16#2843, <<0, 0, 0, 7, "x">>), Encoded),
+    ?assertEqual({ok, {close_session, 7, <<"x">>}, <<>>},
+                 decode(h2_capsule:encode(16#2843, <<0, 0, 0, 7, "x">>))).
+
+close_session_decode_bad_reason_test_() ->
+    TooLong = h2_capsule:encode(?WT_CLOSE_SESSION,
+                                <<7:32, (binary:copy(<<"z">>, 1025))/binary>>),
+    NotUtf8 = h2_capsule:encode(?WT_CLOSE_SESSION, <<7:32, 16#ff>>),
+    Short = h2_capsule:encode(?WT_CLOSE_SESSION, <<7:16>>),
+    [
+        ?_assertEqual({error, bad_close_reason}, decode(TooLong)),
+        ?_assertEqual({error, bad_close_reason}, decode(NotUtf8)),
+        ?_assertEqual({error, truncated_close_session}, decode(Short))
+    ].
+
+drain_session_wire_format_test() ->
+    ?assertEqual(h2_capsule:encode(16#78ae, <<>>), encode(drain_session())).
+
+per_stream_capsules_decoded_test_() ->
+    [
+        ?_assertEqual({ok, {max_stream_data, 4, 100}, <<>>},
+                      decode(h2_capsule:encode(16#190B4D3E, <<4, 64, 100>>))),
+        ?_assertEqual({ok, {stream_data_blocked, 4, 100}, <<>>},
+                      decode(h2_capsule:encode(16#190B4D42, <<4, 64, 100>>)))
+    ].
+
+unknown_and_datagram_capsule_test_() ->
+    [
+        ?_assertEqual({ok, {unknown, 16#17, <<"x">>}, <<>>},
+                      decode(h2_capsule:encode(16#17, <<"x">>))),
+        ?_assertEqual({ok, {datagram, <<"d">>}, <<>>},
+                      decode(encode({datagram, <<"d">>})))
+    ].
 
 -endif.

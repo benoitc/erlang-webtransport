@@ -1,4 +1,4 @@
-FROM erlang:26-alpine AS builder
+FROM erlang:27-alpine AS builder
 
 WORKDIR /build
 
@@ -23,7 +23,7 @@ RUN mkdir -p /build/_build/default/lib/webtransport/ebin && \
         interop/interop_client.erl
 
 # Runtime image
-FROM erlang:26-alpine
+FROM erlang:27-alpine
 
 WORKDIR /app
 

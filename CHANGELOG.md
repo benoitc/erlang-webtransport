@@ -2,8 +2,94 @@
 
 ## Unreleased
 
-- quic bumped to 2.2.1. The version constraint is now `~> 2.2`.
-- h2 bumped to 0.12.5.
+This release moves to the current WebTransport drafts: HTTP/3 draft-17,
+HTTP/2 draft-16 and the protocol framework draft-14. It changes what goes on
+the wire, so peers on older drafts may no longer connect.
+
+- HTTP/3 servers and clients on draft-17 now find each other. The server
+  still accepts draft-15 clients (such as Safari 26). Draft-02 clients
+  (Chrome, Firefox) keep working through `compat_mode`, unchanged.
+- HTTP/2 now follows draft-16. HTTP/2 peers still on draft-14 no longer
+  interoperate: the end-of-stream marker on stream data, the session close
+  message and stream resets all changed in the draft.
+- Sessions can negotiate a subprotocol. Clients pass `protocols` (and
+  optionally `require_protocol`), servers pick one with the new
+  `select_protocol/2` handler callback, and the choice shows up in the
+  request map and in `session_info/1`.
+- Flow control now follows the drafts on both transports. Limits come from
+  the peer's settings, stream limits count every stream opened in the
+  session, and credit is given back as streams finish, so long-lived
+  sessions no longer run out of streams. A peer that sends more data or
+  opens more streams than it was allowed, or lowers a limit, now has its
+  session closed instead of having the excess dropped. HTTP/3 sends are now
+  held back when the peer's session limit is reached.
+- WebTransport over HTTP/2 now requires TLS 1.3, as the draft asks for TLS
+  1.3 or a TLS 1.2 feature OTP does not provide. The HTTP/2 listener offers
+  only TLS 1.3, clients refuse to open a session over anything else, and
+  `accept/4` resets such a request. A server that later turns
+  WebTransport support into an invalid value now closes the client's
+  connection, and session limits use the settings in effect when the
+  session was set up.
+- `accept/4` now works from an HTTP/2 server's request handler. h2 passes
+  the method and path as arguments, which `accept/4` did not see, so it
+  always answered `{error, not_connect_method}`. Pass the path with the new
+  `path` option. Sessions on the HTTP/2 listener also report their real path
+  instead of `/`.
+- New `max_stream_data` option sets the per-stream window granted on
+  HTTP/2. The HTTP/2 WebTransport-Init header now carries per-stream limits,
+  as the draft defines it, and a malformed one is refused with 400.
+- A handler that failed to open a stream because of the peer's limit is told
+  when it can try again, through the new `handle_stream_credit/2` callback;
+  the default client handler forwards it as a `stream_credit` message.
+- On HTTP/2, invalid stream operations by the peer (data or a reset on a
+  finished stream, a second stop-sending request) close the session, and a
+  stop-sending request is answered with a reset, as the draft requires.
+  Resetting a stream now ends only our sending side; the peer can still
+  finish sending on a bidirectional stream.
+- Closing a session from the server now reaches the client with its code and
+  reason on both transports; before, an HTTP/3 client never saw it. The
+  reason must be valid UTF-8: `close_session/3` returns
+  `{error, invalid_reason}` or `{error, invalid_error_code}` otherwise.
+- A session also ends when the peer closes or resets its session stream
+  without a close message, and a malformed session message ends it instead of
+  crashing the session process. Draining sessions no longer crash on
+  incoming messages.
+- On HTTP/3 the connection is closed only when its last session ends, and a
+  client's HTTP/2 connection is closed with its session instead of lingering.
+- Streams and datagrams that arrive just before their session is set up are
+  held and delivered instead of being reset or dropped.
+- Error codes of a stream reset from an HTTP/3 peer that are not application
+  codes are now reported as `undefined` instead of a raw transport code, and
+  a reset with code 0 is no longer mistaken for a clean end of stream.
+- A session always tells the peer when it ends, including when the handler
+  stops, crashes or a drain completes; before, the peer was left waiting.
+- Actions returned by a handler's `init/3` now run once the session is set
+  up, after the server's response. Before, they could go out ahead of it, and
+  opening a stream from `init/3` failed on HTTP/3.
+- Draining sessions now stop once their streams are done, can still close or
+  reset those streams, and keep exchanging datagrams. An HTTP/3 GOAWAY now
+  drains the sessions on the connection.
+- On HTTP/2, a reset or stop-sending request for a stream the peer has not
+  used yet now opens it as the draft requires, so two instances of this
+  library no longer end each other's sessions.
+- `close_stream/2` after a large send now waits for the queued data before
+  ending the stream, instead of cutting it short.
+- Finished streams are released, so long sessions no longer grow in memory.
+- On HTTP/3, data the peer sent on a stream before resetting it now counts
+  against the session's data limit, so many resets no longer leave a peer
+  stalled. When the peer stops reading a unidirectional stream we opened, the
+  handler is told and further sends on it fail at once.
+- `session_info/1` reports `max_datagram_size`, the largest datagram the
+  application can send.
+- A server no longer closes the HTTP/3 connection when its last WebTransport
+  session ends, so other requests on it are not cut off. A client closes its
+  connection once the server has closed the session.
+- `reset_stream` and `stop_sending` refuse error codes above 32 bits with
+  `{error, invalid_error_code}`.
+
+- quic bumped to 2.5.0. Since 2.2.1 it fixes a header decoding issue that let an HTTP/3 peer burn minutes of CPU with one request (GHSA-224p-pchv-5r3r), a listener option that claimed to require client certificates but accepted every client (GHSA-wc8g-r527-q23h; this library does not set it), and a bug that reset a WebTransport client's session stream at the first message the server sent on it. It also adds what WebTransport draft-17 needs: requests wait for the client's settings, connections can be closed with an HTTP/3 error code, a stream reset reports its final size, and our streams keep their header when quic resets them on its own. The version constraint is now `~> 2.5`.
+- Erlang/OTP 27 or later is now required, as quic 2.4 and later no longer support OTP 26.
+- h2 bumped to 0.14.0. It fixes two denial-of-service issues, one where a client could run more requests at once than the server allows (MadeYouReset, CVE-2025-8671) and a SETTINGS flood (CVE-2019-9515), and adds what WebTransport over HTTP/2 needs: the TLS version of a connection, notice of SETTINGS changes, and the SETTINGS in effect when a request or response is sent. It also stops an HTTP/2 server from refusing connections once the process that started it exits, and makes stopping a server immediate. The version constraint is now `~> 0.14.0`.
 
 ## 0.4.8 - 2026-10-03
 

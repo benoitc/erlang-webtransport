@@ -14,9 +14,10 @@ webtransport:start_listener(Name, Opts).
 | `keyfile` | yes | -- | Path to TLS private key (PEM) |
 | `handler` | yes | -- | Module implementing `webtransport_handler` |
 | `handler_opts` | no | `#{}` | Map passed to `handler:init/3` |
-| `max_data` | no | 1048576 (1 MB) | Session-level flow-control window (bytes) |
-| `max_streams_bidi` | no | 100 | Max concurrent bidirectional streams |
-| `max_streams_uni` | no | 100 | Max concurrent unidirectional streams |
+| `max_data` | no | 1048576 (1 MB) | Session data the peer may send before we grant more (bytes) |
+| `max_stream_data` | no | 262144 (256 KB) | Per-stream data window granted to the peer (HTTP/2 only) |
+| `max_streams_bidi` | no | 100 | Bidirectional streams the peer may have open at once |
+| `max_streams_uni` | no | 100 | Unidirectional streams the peer may have open at once |
 | `ip` | no | wildcard | Bind address (`inet:ip_address()`; IPv4 4-tuple or IPv6 8-tuple) |
 | `family` | no | `inet` | `inet` or `inet6`; forces the family when no `ip` is given (e.g. the IPv6 wildcard) |
 | `socket_opts` | no | `[]` | Extra options for the underlying listener socket (h3 only) |
@@ -88,7 +89,26 @@ webtransport:connect(Host, Port, Path, Opts).
 | `happy_eyeballs` | `true` | RFC 8305 v6/v4 racing for multi-address hosts (h3 only) |
 | `connection_attempt_delay` | 250 | Happy Eyeballs stagger between attempts, ms (h3 only) |
 | `session_ticket` | -- | Stored 0-RTT resumption ticket (h3 only; see below) |
+| `protocols` | `[]` | Subprotocols to offer, in preference order |
+| `require_protocol` | `false` | Fail with `{error, {alpn_error, _}}` when the server picks none |
+| `max_data`, `max_stream_data`, `max_streams_bidi`, `max_streams_uni` | as for listeners | Limits we grant the server |
 | `compat_mode` | `latest` | HTTP/3 draft selection (see below) |
+
+## Subprotocols
+
+Offer subprotocols when you connect; the server picks one with its
+handler's `select_protocol/2` (see [handlers](handlers.md)):
+
+```erlang
+{ok, Session} = webtransport:connect("example.com", 443, <<"/wt">>, #{
+    protocols => [<<"chat/2">>, <<"chat/1">>],
+    require_protocol => true
+}),
+{ok, #{protocol := <<"chat/2">>}} = webtransport:session_info(Session).
+```
+
+The server's choice must be one you offered, or the session is closed
+with `WT_ALPN_ERROR` and `connect` returns `{error, {alpn_error, _}}`.
 
 `Host` accepts a hostname (string/binary), an IP-literal string, or an
 `inet:ip_address()` tuple. IPv6 literals are bracketed in the `:authority`
@@ -115,13 +135,13 @@ data) is not supported through the current synchronous connect path.
 
 ## Compatibility Mode
 
-The HTTP/3 WebTransport spec has evolved through multiple drafts. As of April
-2026, Safari and the IETF are on draft-15 while Chrome and Firefox still use
-draft-02. This library keeps the two paths separate:
+The HTTP/3 WebTransport spec has evolved through multiple drafts. The IETF is
+on draft-17 while Chrome and Firefox still use draft-02. This library keeps
+the two paths separate:
 
 | Mode | `:protocol` | SETTINGS | Use when |
 |------|-------------|----------|----------|
-| `latest` | `webtransport-h3` | `wt_enabled=1` + initial flow-control | Draft-15 peers (Safari, spec-conformant servers) |
+| `latest` | `webtransport-h3` | `SETTINGS_WT_ENABLED=1` + initial flow-control | Draft-17 and draft-15 peers |
 | `legacy_browser_compat` | `webtransport` | `SETTINGS_ENABLE_WEBTRANSPORT_DRAFT02=1` | Draft-02 peers (Chrome, Firefox, quic-go v0.9) |
 | `auto` (server only) | accepts both | advertises both | Accept either draft per request |
 
@@ -133,11 +153,15 @@ In `auto` mode, the server inspects each CONNECT request:
 - `:protocol = webtransport` -> legacy_browser_compat
 - Conflicting signals (e.g. `webtransport-h3` plus the draft-02 header) -> 400
 
+In `latest` mode the server advertises SETTINGS_WT_ENABLED under the
+draft-17 and the draft-15 codepoints and picks the version from the client's
+SETTINGS; the two drafts share a wire format.
+
 The decision is frozen at session init. Pin to `latest` or
 `legacy_browser_compat` to refuse the other:
 
 ```erlang
-%% Accept only draft-15 clients
+%% Accept only draft-17 and draft-15 clients
 webtransport:start_listener(strict, #{
     transport => h3,
     port => 4433,
@@ -163,13 +187,16 @@ HTTP/2 has no draft-02 variant; `compat_mode` applies only to HTTP/3.
 
 ## Flow Control
 
-WebTransport provides session-level and per-stream flow control:
+WebTransport provides session-level and per-stream flow control. These
+options set what you grant the peer; what the peer grants you comes from its
+SETTINGS:
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `max_data` | 1048576 (1 MB) | Session-level byte limit |
-| `max_streams_bidi` | 100 | Max concurrent bidirectional streams |
-| `max_streams_uni` | 100 | Max concurrent unidirectional streams |
+| `max_stream_data` | 262144 (256 KB) | Per-stream byte limit (HTTP/2) |
+| `max_streams_bidi` | 100 | Bidirectional streams the peer may have open |
+| `max_streams_uni` | 100 | Unidirectional streams the peer may have open |
 
 Override at listener or connect time:
 
@@ -188,30 +215,38 @@ webtransport:start_listener(my_server, #{
 
 ### Enforcement
 
-The library enforces these rules from the
-[spec](https://datatracker.ietf.org/doc/html/draft-ietf-webtrans-http3-15):
+The library enforces these rules from
+[draft-17](https://datatracker.ietf.org/doc/html/draft-ietf-webtrans-http3-17)
+and [draft-16](https://datatracker.ietf.org/doc/html/draft-ietf-webtrans-http2-16):
 
-- **Monotonicity** -- a peer sending a decreased `WT_MAX_DATA` or
-  `WT_MAX_STREAMS` closes the session with `WT_FLOW_CONTROL_ERROR`.
-- **Peer stream count** -- streams opened beyond the advertised limit are
-  rejected with `WT_BUFFERED_STREAM_REJECTED`.
+- **When it applies** -- always on HTTP/2; on HTTP/3 only when both sides
+  sent a non-zero initial limit. Otherwise limits are not enforced and
+  flow-control capsules are ignored.
+- **Strictly increasing limits** -- a limit that does not rise above the
+  previous one, or a stream limit above 2^60, closes the session with
+  `WT_FLOW_CONTROL_ERROR`.
+- **Overruns** -- data beyond what we granted, or one stream too many,
+  closes the session with `WT_FLOW_CONTROL_ERROR`.
+- **Cumulative stream limits** -- every stream opened in the session counts.
+  As the peer's streams finish, `WT_MAX_STREAMS` gives the credit back. When
+  your own open fails with `stream_limit_reached`, the handler's
+  `handle_stream_credit/2` runs once the peer grants more.
 - **HTTP/3 prohibition** -- `WT_MAX_STREAM_DATA` and `WT_STREAM_DATA_BLOCKED`
   capsules are session errors on HTTP/3 (per-stream flow control uses native
   QUIC).
-- **HTTP/2 WebTransport-Init** -- the `WebTransport-Init` structured-field
-  header
-  ([draft-14 section 4.3.2](https://datatracker.ietf.org/doc/html/draft-ietf-webtrans-http2-14#section-4.3.2))
-  carries initial flow-control windows. When both SETTINGS and the header are
-  present, the greater value is used.
+- **HTTP/2 WebTransport-Init** -- the `WebTransport-Init` header
+  ([draft-16 section 4.3.2](https://datatracker.ietf.org/doc/html/draft-ietf-webtrans-http2-16#section-4.3.2))
+  carries initial per-stream data limits. When both SETTINGS and the header
+  are present, the greater value is used. A header that does not parse is
+  refused with 400.
 - **Large sends** -- `send/4` accepts a payload of any size and returns `ok`
-  once it is queued. On HTTP/3 the bytes go straight to QUIC, which does the
-  flow control. On HTTP/2 the bytes that exceed the session or stream window
-  (256 KB per stream by default) wait in order on the stream, FIN is held
-  until they are out, and the queue drains as the peer raises `WT_MAX_DATA`
-  or `WT_MAX_STREAM_DATA`.
-- **Credit on receive** -- on HTTP/2 the library sends `WT_MAX_STREAM_DATA`
-  and `WT_MAX_DATA` on its own once half of a window has been consumed, so a
-  peer that honours our windows is never left waiting.
+  once it is queued. Bytes beyond the session window (both transports) or the
+  stream window (HTTP/2) wait in order on the stream, FIN is held until they
+  are out, and the queue drains as the peer raises its limits.
+  `WT_DATA_BLOCKED` tells the peer we are waiting.
+- **Credit on receive** -- the library sends `WT_MAX_DATA` (both transports)
+  and `WT_MAX_STREAM_DATA` (HTTP/2) once half of a window has been consumed,
+  so a peer that honours our windows is never left waiting.
 
 ## Datagram Limits
 
@@ -227,7 +262,7 @@ Sending a datagram larger than the limit returns `{error, datagram_too_large}`.
 ## Error Codes
 
 The library uses the error codes defined in the
-[spec](https://datatracker.ietf.org/doc/html/draft-ietf-webtrans-http3-15#section-9.5):
+[spec](https://datatracker.ietf.org/doc/html/draft-ietf-webtrans-http3-17#section-9.5):
 
 | Constant | Value | Meaning |
 |----------|-------|---------|
@@ -235,19 +270,33 @@ The library uses the error codes defined in the
 | `WT_SESSION_GONE` | `0x170d7b68` | Session terminated |
 | `WT_FLOW_CONTROL_ERROR` | `0x045d4487` | Flow-control violation |
 | `WT_REQUIREMENTS_NOT_MET` | `0x212c0d48` | Protocol requirements not satisfied |
+| `WT_ALPN_ERROR` | `0x0817b3dd` | Subprotocol negotiation failed |
 
-Application-level error codes are mapped to/from QUIC error codes per
-[draft-15 section 3.3](https://datatracker.ietf.org/doc/html/draft-ietf-webtrans-http3-15#section-3.3).
+On HTTP/3, application error codes (32 bits) are mapped into the
+`WT_APPLICATION_ERROR` range per
+[draft-17 section 4.4](https://datatracker.ietf.org/doc/html/draft-ietf-webtrans-http3-17#section-4.4);
+protocol codes such as `WT_SESSION_GONE` are sent as is, and a reset with a
+code outside that range reaches the handler as `{reset, undefined}`.
+
+On HTTP/2 the error codes for session errors are not assigned yet. A session
+error is sent as `WT_CLOSE_SESSION` followed by `RST_STREAM(PROTOCOL_ERROR)`,
+or `RST_STREAM(FLOW_CONTROL_ERROR)` for flow-control violations.
 
 ## Session Termination
 
 When a session closes (locally or by the peer):
 
-1. All live streams are reset with `WT_SESSION_GONE`.
-2. A `CLOSE_SESSION` capsule is sent (or received) with an error code and
-   reason (max 1024 bytes).
-3. The CONNECT stream is half-closed (FIN sent).
+1. All live streams are reset with `WT_SESSION_GONE`; on HTTP/3 the streams
+   we read also get `STOP_SENDING(WT_SESSION_GONE)`.
+2. A `CLOSE_SESSION` capsule is sent (or received) with a 32-bit error code
+   and a reason of at most 1024 bytes of UTF-8. `close_session/3` returns
+   `{error, reason_too_long}`, `{error, invalid_reason}` or
+   `{error, invalid_error_code}` otherwise.
+3. The CONNECT stream is closed (FIN on HTTP/3, END_STREAM on HTTP/2).
 4. The handler's `terminate/2` receives `{closed, ErrorCode, Reason}`.
+5. On HTTP/3 a client closes its QUIC connection once its last session has
+   ended and the server closed the CONNECT stream; a server leaves it open.
 
-If the peer FINs the CONNECT stream without sending `CLOSE_SESSION`, the
-session terminates with `{closed, 0, <<"peer closed CONNECT">>}`.
+If the peer closes the CONNECT stream without sending `CLOSE_SESSION`, the
+session terminates with `{closed, 0, <<"peer closed CONNECT">>}`; if it
+resets it, with `{closed, 0, <<"CONNECT stream reset">>}`.

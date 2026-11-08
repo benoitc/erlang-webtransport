@@ -48,8 +48,12 @@ init(Session, Request, Opts) ->
 ```
 
 - `Session` -- the session pid, used for `webtransport:open_stream/2`, etc.
-- `Request` -- `#{path := binary(), authority := binary(), headers => [{binary(), binary()}]}`
+- `Request` -- `#{path := binary(), authority := binary(), headers => [{binary(), binary()}], wt_draft => atom(), protocol => binary()}`
 - `Opts` -- the `handler_opts` map from the listener or connect call
+
+`Actions` run once the session is established: on a server after the 200 is
+sent, on a client once the session is registered. Calls from `init/3` itself
+to the session API would deadlock; return actions instead.
 
 `init/2` is a back-compat shim. It is called only when `init/3` is not
 exported and loses the `Opts` argument.
@@ -136,7 +140,7 @@ origin_check(Headers, Opts) ->
 When not exported, the default behaviour is:
 
 - **Requests with an `origin` header** (browser clients): rejected with 403.
-  The [spec](https://datatracker.ietf.org/doc/html/draft-ietf-webtrans-http3-15#section-3.2)
+  The [spec](https://datatracker.ietf.org/doc/html/draft-ietf-webtrans-http3-17#section-3.2)
   requires server-side origin verification.
 - **Requests without an `origin` header** (non-browser clients): accepted.
 
@@ -149,6 +153,43 @@ origin_check(Headers, _Opts) ->
         _ -> {reject, 403, <<"origin not allowed">>}
     end.
 ```
+
+### `select_protocol/2` (optional)
+
+Called before `init/3` when you need to pick a subprotocol from the ones the
+client offered in `WT-Available-Protocols`. `Offered` is empty when the client
+sent none. The value you return is sent back in `WT-Protocol` and appears as
+`protocol` in the request map passed to `init/3`.
+
+```erlang
+select_protocol(Offered, Opts) ->
+    {ok, binary()} | none | {reject, 400..599}
+```
+
+```erlang
+select_protocol(Offered, _Opts) ->
+    case lists:member(<<"chat/2">>, Offered) of
+        true -> {ok, <<"chat/2">>};
+        false -> {reject, 400}
+    end.
+```
+
+Return a value that is in `Offered`; anything else fails the request with
+500. When not exported, sessions are accepted without a protocol.
+
+### `handle_stream_credit/2` (optional)
+
+Called when the peer raises its stream limit after an `open_stream` of that
+type failed with `{error, stream_limit_reached}`. Opening a stream of `Type`
+will now succeed.
+
+```erlang
+handle_stream_credit(bidi | uni, State) ->
+    {ok, State} | {ok, State, Actions} | {stop, Reason, State}
+```
+
+The default client handler forwards it as
+`{webtransport, Session, {stream_credit, Type}}`.
 
 ### `terminate/2` (required)
 

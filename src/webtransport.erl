@@ -197,14 +197,7 @@ h3_settings() ->
 
 -spec h3_settings(map()) -> map().
 h3_settings(Opts) ->
-    CompatMode = maps:get(compat_mode, Opts, auto),
-    Settings = case CompatMode of
-        auto ->
-            maps:merge(wt_h3:default_settings(latest),
-                       wt_h3:default_settings(legacy_browser_compat));
-        Mode ->
-            wt_h3:default_settings(Mode)
-    end,
+    Settings = h3_server_settings(Opts),
     Claim = wt_stream_type_handler(),
     ConnectionHandler = fun(QuicConnPid) ->
         {ok, Router} = webtransport_h3_router:start(undefined),
@@ -221,19 +214,39 @@ h3_settings(Opts) ->
         #{
             owner => Router,
             stream_type_handler => Claim,
-            h3_datagram_enabled => true
+            h3_datagram_enabled => true,
+            stream_reset_final_size => true
         }
     end,
     #{
         settings => Settings,
         stream_type_handler => Claim,
         h3_datagram_enabled => true,
+        %% http3-17 §5.4: a peer reset reports the stream's final size, so
+        %% the session can count it against WT_MAX_DATA.
+        stream_reset_final_size => true,
+        %% http3-17 §7.1: hold requests until the client's SETTINGS are in.
+        defer_requests_until_settings => true,
         quic_opts => #{
             max_datagram_frame_size => 65535,
             reset_stream_at => true
         },
         connection_handler => ConnectionHandler
     }.
+
+%% H3 SETTINGS for a listener. `auto' advertises both the latest-draft and
+%% the draft-02 keys: SETTINGS are connection-scoped and sent before any
+%% CONNECT, so the server cannot know the client's draft yet. Peers MUST
+%% ignore unknown settings (RFC 9114 §7.2.4.1), so the merged shape is
+%% wire-safe. Pinning a mode sends only that mode's settings.
+h3_server_settings(Opts) ->
+    case maps:get(compat_mode, Opts, auto) of
+        auto ->
+            maps:merge(wt_h3:server_settings(latest, Opts),
+                       wt_h3:server_settings(legacy_browser_compat, Opts));
+        Mode ->
+            wt_h3:server_settings(Mode, Opts)
+    end.
 
 %% @doc Return HTTP/2 settings to merge into an h2 server configuration.
 %%
@@ -253,15 +266,25 @@ h2_settings() ->
 h2_settings(Opts) ->
     #{
         enable_connect_protocol => true,
-        settings => #{
-            enable_connect_protocol => 1,
-            wt_initial_max_data =>
-                maps:get(max_data, Opts, ?DEFAULT_MAX_DATA),
-            wt_initial_max_streams_bidi =>
-                maps:get(max_streams_bidi, Opts, ?DEFAULT_MAX_STREAMS_BIDI),
-            wt_initial_max_streams_uni =>
-                maps:get(max_streams_uni, Opts, ?DEFAULT_MAX_STREAMS_UNI)
-        }
+        settings => h2_wt_settings(Opts)
+    }.
+
+%% SETTINGS an h2 endpoint sends for WebTransport (http2-16 §3.1, §4.3.1).
+%% SETTINGS_WT_ENABLED has no atom in h2, so it goes under its raw id.
+h2_wt_settings(Opts) ->
+    StreamData = maps:get(max_stream_data, Opts, ?DEFAULT_MAX_STREAM_DATA),
+    #{
+        enable_connect_protocol => 1,
+        ?SETTINGS_WT_ENABLED_H2 => 1,
+        wt_initial_max_data =>
+            maps:get(max_data, Opts, ?DEFAULT_MAX_DATA),
+        wt_initial_max_streams_bidi =>
+            maps:get(max_streams_bidi, Opts, ?DEFAULT_MAX_STREAMS_BIDI),
+        wt_initial_max_streams_uni =>
+            maps:get(max_streams_uni, Opts, ?DEFAULT_MAX_STREAMS_UNI),
+        wt_initial_max_stream_data_uni => StreamData,
+        wt_initial_max_stream_data_bidi_local => StreamData,
+        wt_initial_max_stream_data_bidi_remote => StreamData
     }.
 
 %% @doc Accept a WebTransport session on an incoming CONNECT request.
@@ -285,109 +308,309 @@ h2_settings(Opts) ->
 %% '''
 -spec accept(pid(), non_neg_integer(), [{binary(), binary()}], map()) ->
     {ok, session()} | {error, term()}.
-accept(Conn, StreamId, Headers, Opts) ->
+accept(Conn, StreamId, Headers0, Opts) ->
     Transport = maps:get(transport, Opts, h3),
     Handler = maps:get(handler, Opts, undefined),
     HandlerOpts = maps:get(handler_opts, Opts, #{}),
+    Headers = with_request_pseudo(Headers0, undefined, maps:get(path, Opts, undefined)),
     Method = proplists:get_value(<<":method">>, Headers, <<>>),
-    Path = proplists:get_value(<<":path">>, Headers, <<"/">>),
     case {Handler, Method} of
         {undefined, _} ->
             {error, missing_handler};
         {_, <<"CONNECT">>} ->
-            case run_origin_check(Handler, Headers, HandlerOpts) of
-                accept ->
-                    do_accept(Transport, Conn, StreamId, Path,
-                              Headers, Handler, HandlerOpts, Opts);
-                {reject, Status, Reason} ->
-                    send_reject(Transport, Conn, StreamId, Status, Reason),
-                    {error, {rejected, Status}}
-            end;
+            Router = case Transport of
+                h3 -> get_or_create_router(Conn);
+                h2 -> undefined
+            end,
+            accept_connect(Transport, Conn, StreamId, Headers,
+                           Handler, HandlerOpts, Opts, Router);
         {_, _} ->
             {error, not_connect_method}
     end.
 
-do_accept(h3, H3Conn, StreamId, Path, Headers, Handler, HandlerOpts, Opts) ->
-    CompatMode = maps:get(compat_mode, Opts, auto),
-    case classify_h3_connect(Headers, CompatMode) of
+%% h2 hands its request handler the method and path as arguments, not as
+%% `:method' and `:path' headers. Put them back so every path reads the
+%% same header list. Without a method, a request carrying `:protocol' is an
+%% extended CONNECT: RFC 8441 §4 allows `:protocol' only there.
+with_request_pseudo(Headers, Method0, Path) ->
+    Method = case {Method0, proplists:is_defined(<<":protocol">>, Headers)} of
+        {undefined, true} -> <<"CONNECT">>;
+        {M, _} -> M
+    end,
+    Add = [{K, V} || {K, V} <- [{<<":method">>, Method}, {<<":path">>, Path}],
+                     V =/= undefined, not proplists:is_defined(K, Headers)],
+    Add ++ Headers.
+
+%% Turn an extended CONNECT into a session. Shared by accept/4 and the
+%% listeners. Steps, in spec order (http3-17 §3.2, http2-16 §3.2):
+%% check the request, verify the Origin, check the client's SETTINGS (h3)
+%% or WebTransport-Init (h2), negotiate the subprotocol, start the session,
+%% then send the 2xx. On h3 the CONNECT stream's buffered capsules are only
+%% handed to the session after the 2xx is sent.
+accept_connect(Transport, Conn, StreamId, Headers, Handler, HandlerOpts, Opts, Router) ->
+    Steps = [
+        fun() -> check_connect_request(Transport, Conn, Headers, Opts) end,
+        fun(Ctx) -> check_origin(Ctx, Handler, Headers, HandlerOpts) end,
+        fun(Ctx) -> check_peer(Transport, Conn, Headers, Ctx) end,
+        fun(Ctx) -> check_session_limit(Transport, Router, StreamId, Opts, Ctx) end,
+        fun(Ctx) -> select_protocol(Ctx, Handler, Headers, HandlerOpts) end
+    ],
+    Result = case run_steps(Steps) of
+        {ok, Ctx} ->
+            start_accepted(Transport, Conn, StreamId, Headers,
+                           Handler, HandlerOpts, Opts, Router, Ctx);
+        {reject, Status, Body, Reason} ->
+            send_reject(Transport, Conn, StreamId, Status, Body),
+            {error, Reason};
+        {reset, Code, Reason} ->
+            %% A malformed request (RFC 9114 §4.1.2, RFC 9113 §8.1.1):
+            %% reset the stream.
+            _ = case Transport of
+                h3 -> quic_h3:cancel(Conn, StreamId, Code);
+                h2 -> h2:cancel(Conn, StreamId, Code)
+            end,
+            {error, Reason}
+    end,
+    case {Result, Router} of
+        {{error, _}, R} when is_pid(R) ->
+            %% No session will come for this CONNECT stream: free its slot
+            %% and reset any stream that arrived for it.
+            ok = webtransport_h3_router:session_gone(R, StreamId);
+        _ ->
+            ok
+    end,
+    Result.
+
+run_steps([First | Rest]) ->
+    lists:foldl(fun(Step, {ok, Ctx}) -> Step(Ctx);
+                   (_Step, Stop) -> Stop
+                end, First(), Rest).
+
+%% http3-17 §3.2, http2-16 §3.2: `:scheme' MUST be https.
+check_connect_request(Transport, Conn, Headers, Opts) ->
+    case proplists:get_value(<<":scheme">>, Headers) of
+        <<"https">> -> check_connect_protocol(Transport, Conn, Headers, Opts);
+        _ -> {reject, 400, <<"Bad Request: :scheme must be https">>, bad_scheme}
+    end.
+
+check_connect_protocol(h3, _Conn, Headers, Opts) ->
+    case classify_h3_connect(Headers, maps:get(compat_mode, Opts, auto)) of
         {ok, ClientMode} ->
-            Router = get_or_create_router(H3Conn),
-            Opts1 = Opts#{compat_mode => ClientMode},
-            do_accept_h3(H3Conn, StreamId, Path, Headers,
-                         Handler, HandlerOpts, Opts1, Router);
+            {ok, #{compat_mode => ClientMode}};
         {error, Reason} ->
-            send_reject(h3, H3Conn, StreamId, 400,
-                        iolist_to_binary(io_lib:format("~p", [Reason]))),
-            {error, Reason}
+            {reject, 400, iolist_to_binary(io_lib:format("Bad Request: ~p", [Reason])),
+             Reason}
     end;
-do_accept(h2, Conn, StreamId, Path, Headers, Handler, HandlerOpts, Opts) ->
+check_connect_protocol(h2, _Conn, Headers, _Opts) ->
     case is_webtransport_request(Headers) of
-        true ->
-            do_accept_h2(Conn, StreamId, Path, Headers,
-                         Handler, HandlerOpts, Opts);
-        false ->
-            send_reject(h2, Conn, StreamId, 400, <<"Bad Request">>),
-            {error, not_webtransport}
+        true -> {ok, #{}};
+        false -> {reject, 400, <<"Bad Request">>, not_webtransport}
     end.
 
-do_accept_h3(H3Conn, StreamId, Path, Headers, Handler, HandlerOpts, Opts, Router) ->
-    TransportState = webtransport_h3:new(H3Conn, StreamId, Router),
-    Authority = proplists:get_value(<<":authority">>, Headers, <<>>),
-    Request = #{path => Path, authority => Authority, headers => Headers},
-    SessionOpts = maps:merge(HandlerOpts, #{
-        request => Request,
-        is_server => true,
-        handler_opts => HandlerOpts,
-        max_data => maps:get(max_data, Opts, ?DEFAULT_MAX_DATA),
-        max_streams_bidi => maps:get(max_streams_bidi, Opts, ?DEFAULT_MAX_STREAMS_BIDI),
-        max_streams_uni => maps:get(max_streams_uni, Opts, ?DEFAULT_MAX_STREAMS_UNI)
-    }),
-    case webtransport_session:start_link(h3, TransportState, Handler, SessionOpts) of
-        {ok, Session} ->
-            quic_h3:set_stream_handler(H3Conn, StreamId, Session),
-            webtransport_h3_router:register_session(Router, StreamId, Session),
-            quic_h3:send_response(H3Conn, StreamId, 200, []),
-            {ok, Session};
+check_origin(Ctx, Handler, Headers, HandlerOpts) ->
+    case run_origin_check(Handler, Headers, HandlerOpts) of
+        accept -> {ok, Ctx};
+        {reject, Status, Body} -> {reject, Status, Body, {rejected, Status}}
+    end.
+
+%% h3: http3-17 §3.1 requires the client's SETTINGS and transport
+%% parameters to enable HTTP/3 datagrams, QUIC datagrams and
+%% RESET_STREAM_AT; otherwise the session is malformed. The client's
+%% SETTINGS_WT_ENABLED codepoints pick the draft version, so the server
+%% must not process the request before they arrive (§7.1). The listener
+%% sets quic's `defer_requests_until_settings' for that; an embedder that
+%% did not merge h3_settings/1 may still see a request ahead of them, and it
+%% is refused.
+check_peer(h3, Conn, _Headers, #{compat_mode := latest} = Ctx) ->
+    case quic_h3:get_peer_settings(Conn) of
+        undefined ->
+            {reset, ?H3_REQUEST_REJECTED, peer_settings_not_received};
+        Settings ->
+            case wt_h3:validate_client(Conn, Settings) of
+                ok ->
+                    {ok, Ctx#{wt_draft => wt_h3:select_draft(Settings),
+                              peer_settings => Settings}};
+                {error, Reason} ->
+                    {reset, ?H3_MESSAGE_ERROR, Reason}
+            end
+    end;
+check_peer(h3, _Conn, _Headers, Ctx) ->
+    {ok, Ctx#{wt_draft => draft02}};
+%% h2: http2-16 §4.3.2: a WebTransport-Init field that does not parse, or
+%% that has an invalid value for a defined key, rejects the request.
+check_peer(h2, Conn, Headers, Ctx) ->
+    case webtransport_h2:check_tls(Conn) of
+        ok ->
+            check_h2_init(Conn, Headers, Ctx);
         {error, Reason} ->
-            send_reject(h3, H3Conn, StreamId, 500,
-                        iolist_to_binary(io_lib:format("~p", [Reason]))),
-            {error, Reason}
+            %% http2-16 §7: a request on a connection without TLS 1.3 is
+            %% malformed (RFC 9113 §8.1.1: stream error PROTOCOL_ERROR).
+            {reset, protocol_error, Reason}
     end.
 
-do_accept_h2(Conn, StreamId, Path, Headers, Handler, HandlerOpts, Opts) ->
-    h2:send_response(Conn, StreamId, 200, []),
-    TransportState = webtransport_h2:new(Conn, StreamId),
-    Authority = proplists:get_value(<<":authority">>, Headers, <<>>),
-    Request = #{path => Path, authority => Authority, headers => Headers},
-    ServerDefaults = #{
-        u  => maps:get(max_streams_uni, Opts, ?DEFAULT_MAX_STREAMS_UNI),
-        bl => maps:get(max_streams_bidi, Opts, ?DEFAULT_MAX_STREAMS_BIDI),
-        br => maps:get(max_data, Opts, ?DEFAULT_MAX_DATA)
-    },
-    Negotiated = case proplists:get_value(<<"webtransport-init">>, Headers) of
-        undefined -> ServerDefaults;
+check_h2_init(Conn, Headers, Ctx) ->
+    PeerSettings = h2:get_peer_settings(Conn),
+    FromSettings = wt_h2_init:from_settings(PeerSettings),
+    case proplists:get_value(<<"webtransport-init">>, Headers) of
+        undefined ->
+            {ok, Ctx#{wt_draft => h2_16, peer_settings => PeerSettings,
+                      peer_stream_data => FromSettings}};
         InitBin ->
             case wt_h2_init:parse(InitBin) of
-                {ok, Init} -> wt_h2_init:apply_greater_of(Init, ServerDefaults);
-                {error, _} -> ServerDefaults
+                {ok, Init} ->
+                    {ok, Ctx#{wt_draft => h2_16, peer_settings => PeerSettings,
+                              webtransport_init => Init,
+                              peer_stream_data =>
+                                  wt_h2_init:apply_greater_of(Init, FromSettings)}};
+                {error, Reason} ->
+                    {reject, 400, <<"Invalid WebTransport-Init">>, Reason}
             end
+    end.
+
+%% http3-17 §5.1: without flow control a connection carries one session; a
+%% server resets further CONNECT streams with H3_REQUEST_REJECTED. Flow
+%% control is in force when both sides sent a non-zero initial limit.
+%% Every h3 session holds a slot in the router from here until it registers,
+%% so concurrent requests are counted too.
+check_session_limit(h3, Router, StreamId, Opts, Ctx) when is_pid(Router) ->
+    case webtransport_h3_router:reserve_session(Router, StreamId, alone_required(Opts, Ctx)) of
+        ok -> {ok, Ctx};
+        {error, busy} -> {reset, ?H3_REQUEST_REJECTED, second_session_without_flow_control}
+    end;
+check_session_limit(_Transport, _Router, _StreamId, _Opts, Ctx) ->
+    {ok, Ctx}.
+
+alone_required(Opts, #{compat_mode := latest} = Ctx) ->
+    Peer = maps:get(peer_settings, Ctx, #{}),
+    PeerDeclares = lists:any(fun(Id) ->
+        case wt_h3:peer_setting(Peer, Id) of
+            V when is_integer(V), V > 0 -> true;
+            _ -> false
+        end
+    end, [16#2b61, 16#2b64, 16#2b65]),
+    WeDeclare = lists:any(fun(K) -> maps:get(K, Opts, 1) > 0 end,
+                          [max_data, max_streams_bidi, max_streams_uni]),
+    not (PeerDeclares andalso WeDeclare);
+alone_required(_Opts, _Ctx) ->
+    false.
+
+%% http3-17 §3.3, http2-16 §3.3: the client lists protocols in
+%% WT-Available-Protocols; the handler may pick one, returned in
+%% WT-Protocol. A malformed list is ignored.
+select_protocol(Ctx, Handler, Headers, HandlerOpts) ->
+    Offered = offered_protocols(Headers),
+    case code:ensure_loaded(Handler) =:= {module, Handler} andalso
+         erlang:function_exported(Handler, select_protocol, 2) of
+        false ->
+            {ok, Ctx#{protocol => undefined}};
+        true ->
+            case Handler:select_protocol(Offered, HandlerOpts) of
+                {ok, Protocol} when is_binary(Protocol) ->
+                    case lists:member(Protocol, Offered) of
+                        true -> {ok, Ctx#{protocol => Protocol}};
+                        false -> {reject, 500, <<"protocol not offered">>,
+                                  {protocol_not_offered, Protocol}}
+                    end;
+                none ->
+                    {ok, Ctx#{protocol => undefined}};
+                {reject, Status} when is_integer(Status), Status >= 400, Status < 600 ->
+                    {reject, Status, <<"no acceptable protocol">>, {rejected, Status}}
+            end
+    end.
+
+offered_protocols(Headers) ->
+    case proplists:get_value(<<"wt-available-protocols">>, Headers) of
+        undefined -> [];
+        Bin -> string_list(Bin)
+    end.
+
+%% Strings of an SF List. Any member that is not a String makes the whole
+%% field ignored (http3-17 §3.3).
+string_list(Bin) ->
+    case wt_sf:parse_list(Bin) of
+        {ok, Members} ->
+            case lists:all(fun({string, _}) -> true; (_) -> false end, Members) of
+                true -> [S || {string, S} <- Members];
+                false -> []
+            end;
+        {error, _} ->
+            []
+    end.
+
+start_accepted(Transport, Conn, StreamId, Headers, Handler, HandlerOpts, Opts, Router, Ctx) ->
+    Protocol = maps:get(protocol, Ctx),
+    Request0 = #{
+        path => proplists:get_value(<<":path">>, Headers, <<"/">>),
+        authority => proplists:get_value(<<":authority">>, Headers, <<>>),
+        headers => Headers,
+        wt_draft => maps:get(wt_draft, Ctx)
+    },
+    Request = case Protocol of
+        undefined -> Request0;
+        _ -> Request0#{protocol => Protocol}
+    end,
+    RespHeaders = case Protocol of
+        undefined -> [];
+        _ -> [{<<"wt-protocol">>, wt_sf:serialize_string(Protocol)}]
     end,
     SessionOpts = maps:merge(HandlerOpts, #{
         request => Request,
         is_server => true,
         handler_opts => HandlerOpts,
-        max_data => maps:get(br, Negotiated, ?DEFAULT_MAX_DATA),
-        max_streams_bidi => maps:get(bl, Negotiated, ?DEFAULT_MAX_STREAMS_BIDI),
-        max_streams_uni => maps:get(u, Negotiated, ?DEFAULT_MAX_STREAMS_UNI)
+        max_data => maps:get(max_data, Opts, ?DEFAULT_MAX_DATA),
+        max_stream_data => maps:get(max_stream_data, Opts, ?DEFAULT_MAX_STREAM_DATA),
+        max_streams_bidi => maps:get(max_streams_bidi, Opts, ?DEFAULT_MAX_STREAMS_BIDI),
+        max_streams_uni => maps:get(max_streams_uni, Opts, ?DEFAULT_MAX_STREAMS_UNI),
+        peer_settings => maps:get(peer_settings, Ctx, #{}),
+        peer_stream_data => maps:get(peer_stream_data, Ctx, #{}),
+        webtransport_init => maps:get(webtransport_init, Ctx, #{})
     }),
-    case webtransport_session:start_link(h2, TransportState, Handler, SessionOpts) of
+    start_accepted(Transport, Conn, StreamId, Handler, SessionOpts, RespHeaders, Router).
+
+start_accepted(h3, H3Conn, StreamId, Handler, SessionOpts, RespHeaders, Router) ->
+    TransportState = webtransport_h3:new(H3Conn, StreamId, Router),
+    case webtransport_session:start_link(h3, TransportState, Handler, SessionOpts) of
         {ok, Session} ->
-            LoopPid = spawn(fun() -> h2_data_loop(Conn, StreamId, Session) end),
-            _ = h2:set_stream_handler(Conn, StreamId, LoopPid),
+            %% Register with the router before the 2xx: the client may open
+            %% streams as soon as it sees it.
+            case Router of
+                undefined -> ok;
+                _ -> webtransport_h3_router:register_session(Router, StreamId, Session)
+            end,
+            quic_h3:send_response(H3Conn, StreamId, 200, RespHeaders),
+            %% http3-17 §3.2: capsules the client sent with the request are
+            %% not processed until the 2xx is out. quic buffers them until a
+            %% handler registers; with drain_buffer => false it replays them
+            %% to the session, in order, ahead of later data.
+            _ = quic_h3:set_stream_handler(H3Conn, StreamId, Session,
+                                           #{drain_buffer => false}),
+            ok = webtransport_session:established(Session),
             {ok, Session};
         {error, Reason} ->
-            h2:send_data(Conn, StreamId,
-                         iolist_to_binary(io_lib:format("~p", [Reason])), true),
+            send_reject(h3, H3Conn, StreamId, 500,
+                        iolist_to_binary(io_lib:format("~p", [Reason]))),
+            {error, Reason}
+    end;
+start_accepted(h2, Conn, StreamId, Handler, SessionOpts, RespHeaders, _Router) ->
+    TransportState = webtransport_h2:new(Conn, StreamId),
+    case webtransport_session:start_link(h2, TransportState, Handler, SessionOpts) of
+        {ok, Session} ->
+            %% http2-16 §4.3.1: the session uses the client SETTINGS in
+            %% effect when the response is sent; h2 returns them from the
+            %% same call.
+            PeerSettings = case h2:send_response(Conn, StreamId, 200, RespHeaders,
+                                                 #{report_peer_settings => true}) of
+                {ok, PS} -> PS;
+                _ -> h2:get_peer_settings(Conn)
+            end,
+            %% h2 buffers server stream events until a handler registers.
+            LoopPid = spawn(fun() -> h2_data_loop(Conn, StreamId, Session) end),
+            _ = h2:set_stream_handler(Conn, StreamId, LoopPid),
+            ok = webtransport_session:established(Session, #{peer_settings => PeerSettings}),
+            {ok, Session};
+        {error, Reason} ->
+            send_reject(h2, Conn, StreamId, 500,
+                        iolist_to_binary(io_lib:format("~p", [Reason]))),
             {error, Reason}
     end.
 
@@ -661,12 +884,19 @@ close_session(Session, ErrorCode) ->
     close_session(Session, ErrorCode, <<>>).
 
 %% @doc Close the session with an error code and reason.
-%% draft-14 §4.6 / draft-15 §5: Reason must be at most 1024 UTF-8 bytes.
--spec close_session(session(), non_neg_integer(), binary()) -> ok | {error, reason_too_long}.
+%% http3-17 §6, http2-16 §6.12: the code is 32 bits and the reason is valid
+%% UTF-8 of at most 1024 bytes.
+-spec close_session(session(), non_neg_integer(), binary()) ->
+    ok | {error, reason_too_long | invalid_reason | invalid_error_code}.
 close_session(_Session, _ErrorCode, Reason) when byte_size(Reason) > 1024 ->
     {error, reason_too_long};
+close_session(_Session, ErrorCode, _Reason) when ErrorCode > 16#ffffffff ->
+    {error, invalid_error_code};
 close_session(Session, ErrorCode, Reason) ->
-    webtransport_session:close(Session, ErrorCode, Reason).
+    case wt_h3_capsule:valid_close_reason(Reason) of
+        true -> webtransport_session:close(Session, ErrorCode, Reason);
+        false -> {error, invalid_reason}
+    end.
 
 %% @doc Get session information.
 -spec session_info(session()) -> {ok, map()} | {error, term()}.
@@ -802,15 +1032,7 @@ start_h2_listener(Name, Opts) ->
     %% Create wrapper handler for H2
     H2Handler = make_h2_handler(Handler, HandlerOpts, Opts),
 
-    WtSettings = #{
-        enable_connect_protocol => 1,
-        wt_initial_max_data =>
-            maps:get(max_data, Opts, ?DEFAULT_MAX_DATA),
-        wt_initial_max_streams_bidi =>
-            maps:get(max_streams_bidi, Opts, ?DEFAULT_MAX_STREAMS_BIDI),
-        wt_initial_max_streams_uni =>
-            maps:get(max_streams_uni, Opts, ?DEFAULT_MAX_STREAMS_UNI)
-    },
+    WtSettings = h2_wt_settings(Opts),
     ServerOpts0 = #{
         cert => CertFile,
         key => KeyFile,
@@ -820,7 +1042,7 @@ start_h2_listener(Name, Opts) ->
     },
     %% h2:start_server reads `ip' / `inet6' from its server-opts map. Map our
     %% `ip' / `family' listener opts onto those keys.
-    ServerOpts1 = add_h2_bind_opts(ServerOpts0, Opts),
+    ServerOpts1 = add_h2_bind_opts(ServerOpts0#{ssl_opts => [{versions, ['tlsv1.3']}]}, Opts),
     %% Per-SNI cert selection: adapt the quic-style `sni_callback' to an `ssl'
     %% `sni_fun' and pass it through `ssl_opts' (h2 merges these on top of its
     %% defaults). When no callback is set the static certfile/keyfile is used.
@@ -898,30 +1120,20 @@ start_h3_listener(Name, Opts) ->
                     owner => Router,
                     handler => make_h3_handler(Handler, HandlerOpts, Opts, Router),
                     stream_type_handler => Claim,
-                    h3_datagram_enabled => true
+                    h3_datagram_enabled => true,
+                    stream_reset_final_size => true
                 }
             end,
 
-            ServerCompatMode = maps:get(compat_mode, Opts, auto),
-            %% `auto' advertises both latest (draft-15) AND legacy
-            %% (draft-02) setting keys. H3 SETTINGS are connection-
-            %% scoped and sent before any CONNECT, so the server cannot
-            %% know the client's draft at SETTINGS time. Peers MUST
-            %% ignore unknown settings (RFC 9114 §7.2.4.1), so the
-            %% merged shape is wire-safe. Pinning to a specific mode
-            %% sends only that mode's settings.
-            AdvertisedSettings = case ServerCompatMode of
-                auto ->
-                    maps:merge(wt_h3:default_settings(latest),
-                               wt_h3:default_settings(legacy_browser_compat));
-                Other ->
-                    wt_h3:default_settings(Other)
-            end,
+            AdvertisedSettings = h3_server_settings(Opts),
             ServerOpts = #{
                 cert => CertDer,
                 key => PrivateKey,
                 handler => make_h3_handler(Handler, HandlerOpts, Opts, undefined),
                 settings => AdvertisedSettings,
+                %% http3-17 §7.1: hold requests until the client's SETTINGS
+                %% are in, since they select the draft version.
+                defer_requests_until_settings => true,
                 %% `sni_callback' rides inside `quic_opts' so it reaches
                 %% `quic:start_server'; `quic_h3' only lifts cert/key from
                 %% the top level. quic selects the cert per ClientHello SNI.
@@ -966,127 +1178,22 @@ listener_loop(Name) ->
 %% Internal Functions - Request Handling
 %% ============================================================================
 
-handle_h2_request(Conn, StreamId, <<"CONNECT">>, Path, Headers, Handler, HandlerOpts, Opts) ->
-    case is_webtransport_request(Headers) of
-        true ->
-            case run_origin_check(Handler, Headers, HandlerOpts) of
-                accept ->
-                    accept_h2_session(Conn, StreamId, Path, Headers,
-                                      Handler, HandlerOpts, Opts);
-                {reject, Status, Reason} ->
-                    h2:send_response(Conn, StreamId, Status, []),
-                    h2:send_data(Conn, StreamId, Reason, true)
-            end;
-        false ->
-            h2:send_response(Conn, StreamId, 400, []),
-            h2:send_data(Conn, StreamId, <<"Bad Request">>, true)
-    end;
-
+handle_h2_request(Conn, StreamId, <<"CONNECT">> = Method, Path, Headers, Handler, HandlerOpts, Opts) ->
+    _ = accept_connect(h2, Conn, StreamId, with_request_pseudo(Headers, Method, Path),
+                       Handler, HandlerOpts, Opts, undefined),
+    ok;
 handle_h2_request(Conn, StreamId, _Method, _Path, _Headers, _Handler, _HandlerOpts, _Opts) ->
     h2:send_response(Conn, StreamId, 405, []),
     h2:send_data(Conn, StreamId, <<"Method Not Allowed">>, true).
 
-handle_h3_request(H3Conn, StreamId, <<"CONNECT">>, Path, Headers,
+handle_h3_request(H3Conn, StreamId, <<"CONNECT">>, _Path, Headers,
                   Handler, HandlerOpts, Opts, Router) ->
-    ListenerMode = maps:get(compat_mode, Opts, auto),
-    case classify_h3_connect(Headers, ListenerMode) of
-        {ok, ClientMode} ->
-            case run_origin_check(Handler, Headers, HandlerOpts) of
-                accept ->
-                    Opts1 = Opts#{compat_mode => ClientMode},
-                    accept_h3_session(H3Conn, StreamId, Path, Headers,
-                                      Handler, HandlerOpts, Opts1, Router);
-                {reject, Status, Reason} ->
-                    quic_h3:send_response(H3Conn, StreamId, Status, []),
-                    quic_h3:send_data(H3Conn, StreamId, Reason, true)
-            end;
-        {error, Reason} ->
-            Body = iolist_to_binary(io_lib:format("Bad Request: ~p", [Reason])),
-            quic_h3:send_response(H3Conn, StreamId, 400, []),
-            quic_h3:send_data(H3Conn, StreamId, Body, true)
-    end;
-
+    _ = accept_connect(h3, H3Conn, StreamId, Headers, Handler, HandlerOpts, Opts, Router),
+    ok;
 handle_h3_request(H3Conn, StreamId, _Method, _Path, _Headers,
                   _Handler, _HandlerOpts, _Opts, _Router) ->
     quic_h3:send_response(H3Conn, StreamId, 405, []),
     quic_h3:send_data(H3Conn, StreamId, <<"Method Not Allowed">>, true).
-
-accept_h2_session(Conn, StreamId, Path, Headers, Handler, HandlerOpts, Opts) ->
-    h2:send_response(Conn, StreamId, 200, []),
-    TransportState = webtransport_h2:new(Conn, StreamId),
-    Authority = proplists:get_value(<<":authority">>, Headers, <<>>),
-    Request = #{
-        path => Path,
-        authority => Authority,
-        headers => Headers
-    },
-    %% Parse WebTransport-Init from the client's CONNECT request and
-    %% apply the greater-of rule (draft-14 §4.3.2) against our defaults.
-    ServerDefaults = #{
-        u  => maps:get(max_streams_uni, Opts, ?DEFAULT_MAX_STREAMS_UNI),
-        bl => maps:get(max_streams_bidi, Opts, ?DEFAULT_MAX_STREAMS_BIDI),
-        br => maps:get(max_data, Opts, ?DEFAULT_MAX_DATA)
-    },
-    Negotiated = case proplists:get_value(<<"webtransport-init">>, Headers) of
-        undefined -> ServerDefaults;
-        InitBin ->
-            case wt_h2_init:parse(InitBin) of
-                {ok, Init} -> wt_h2_init:apply_greater_of(Init, ServerDefaults);
-                {error, _} -> ServerDefaults
-            end
-    end,
-    SessionOpts = maps:merge(HandlerOpts, #{
-        request => Request,
-        is_server => true,
-        handler_opts => HandlerOpts,
-        max_data => maps:get(br, Negotiated, ?DEFAULT_MAX_DATA),
-        max_streams_bidi => maps:get(bl, Negotiated, ?DEFAULT_MAX_STREAMS_BIDI),
-        max_streams_uni => maps:get(u, Negotiated, ?DEFAULT_MAX_STREAMS_UNI)
-    }),
-    case webtransport_session:start_link(h2, TransportState, Handler, SessionOpts) of
-        {ok, Session} ->
-            LoopPid = spawn(fun() -> h2_data_loop(Conn, StreamId, Session) end),
-            _ = h2:set_stream_handler(Conn, StreamId, LoopPid);
-        {error, Reason} ->
-            h2:send_response(Conn, StreamId, 500, []),
-            h2:send_data(Conn, StreamId,
-                         iolist_to_binary(io_lib:format("~p", [Reason])), true)
-    end.
-
-accept_h3_session(H3Conn, StreamId, Path, Headers, Handler, HandlerOpts, Opts, Router) ->
-    TransportState = webtransport_h3:new(H3Conn, StreamId, Router),
-    Authority = proplists:get_value(<<":authority">>, Headers, <<>>),
-    Request = #{
-        path => Path,
-        authority => Authority,
-        headers => Headers
-    },
-    SessionOpts = maps:merge(HandlerOpts, #{
-        request => Request,
-        is_server => true,
-        handler_opts => HandlerOpts,
-        max_data => maps:get(max_data, Opts, ?DEFAULT_MAX_DATA),
-        max_streams_bidi => maps:get(max_streams_bidi, Opts, ?DEFAULT_MAX_STREAMS_BIDI),
-        max_streams_uni => maps:get(max_streams_uni, Opts, ?DEFAULT_MAX_STREAMS_UNI)
-    }),
-    %% Register the session with the router BEFORE the 200 goes out.
-    %% Otherwise the client sees 200, opens extension streams, and the
-    %% stream_type_data arrives at the router while sessions is still
-    %% empty. The router then silently drops the data.
-    case webtransport_session:start_link(h3, TransportState, Handler, SessionOpts) of
-        {ok, Session} ->
-            quic_h3:set_stream_handler(H3Conn, StreamId, Session),
-            case Router of
-                undefined -> ok;
-                _ -> webtransport_h3_router:register_session(Router, StreamId, Session)
-            end,
-            quic_h3:send_response(H3Conn, StreamId, 200, []),
-            ok;
-        {error, Reason} ->
-            quic_h3:send_response(H3Conn, StreamId, 500, []),
-            quic_h3:send_data(H3Conn, StreamId,
-                              iolist_to_binary(io_lib:format("~p", [Reason])), true)
-    end.
 
 %% Defaults to accept when the handler does not export origin_check/2.
 run_origin_check(Handler, Headers, Opts) ->
@@ -1149,61 +1256,128 @@ allowed_by_listener(_, _) -> false.
 %% ============================================================================
 
 h2_data_loop(Conn, StreamId, Session) ->
+    h2_data_loop(Conn, StreamId, Session, []).
+
+%% `Prefix' are events for the CONNECT stream that reached another process
+%% before this loop became the stream's handler; they are handled first, so
+%% the order is kept.
+h2_data_loop(Conn, StreamId, Session, Prefix) ->
     %% Monitor both ends so the loop can never orphan: if the h2 connection
     %% dies without a `closed' message, or the session goes away, we exit
     %% instead of blocking in `receive' forever.
     ConnRef = erlang:monitor(process, Conn),
     SessionRef = erlang:monitor(process, Session),
-    h2_data_loop(Conn, StreamId, Session, ConnRef, SessionRef, <<>>).
+    Loop = {Conn, StreamId, Session, ConnRef, SessionRef},
+    case h2_data_events(Prefix, Loop, <<>>) of
+        {continue, Buf} -> h2_data_loop_receive(Loop, Buf);
+        stop -> ok
+    end.
+
+h2_data_events([], _Loop, Buf) ->
+    {continue, Buf};
+h2_data_events([Msg | Rest], Loop, Buf) ->
+    case h2_data_event(Msg, Loop, Buf) of
+        {continue, Buf1} -> h2_data_events(Rest, Loop, Buf1);
+        stop -> stop
+    end.
+
+h2_data_loop_receive(Loop, Buf) ->
+    receive
+        Msg ->
+            case h2_data_event(Msg, Loop, Buf) of
+                {continue, Buf1} -> h2_data_loop_receive(Loop, Buf1);
+                stop -> ok
+            end
+    end.
 
 %% `Buf' holds the tail of the previous DATA frame that did not end on a
 %% capsule boundary. A WT_STREAM capsule carries a whole send/4 payload, and
 %% h2 splits it into DATA frames of at most SETTINGS_MAX_FRAME_SIZE (16 KiB
-%% by default), so most capsules over that size arrive in pieces. Dropping
-%% the tail, as earlier versions did, truncated every such payload.
-h2_data_loop(Conn, StreamId, Session, ConnRef, SessionRef, Buf) ->
-    receive
-        {h2, Conn, {data, StreamId, Data, _IsFin}} ->
-            %% Decode every complete capsule, keep the partial tail.
-            case webtransport_h2:decode_capsules(<<Buf/binary, Data/binary>>) of
-                {ok, Capsules, Rest} when byte_size(Rest) =< ?H2_CAPSULE_BUFFER_MAX ->
-                    lists:foreach(fun(Capsule) ->
-                        dispatch_h2_capsule(Session, Capsule)
-                    end, Capsules),
-                    h2_data_loop(Conn, StreamId, Session, ConnRef, SessionRef, Rest);
-                {ok, _Capsules, _Rest} ->
-                    %% A single capsule larger than we are willing to hold
-                    %% in memory. Treat as a protocol violation.
-                    logger:warning("h2 capsule exceeds ~p bytes", [?H2_CAPSULE_BUFFER_MAX]),
+%% by default), so most capsules over that size arrive in pieces.
+h2_data_event({h2, Conn, {data, StreamId, Data, IsFin}},
+              {Conn, StreamId, Session, ConnRef, SessionRef}, Buf) ->
+    case webtransport_h2:decode_capsules(<<Buf/binary, Data/binary>>) of
+        {ok, Capsules, Rest} when byte_size(Rest) =< ?H2_CAPSULE_BUFFER_MAX ->
+            lists:foreach(fun(Capsule) -> dispatch_h2_capsule(Session, Capsule) end,
+                          Capsules),
+            case IsFin of
+                true when Rest =/= <<>> ->
+                    %% RFC 9297 §3.3: the stream ended inside a capsule.
                     cleanup_data_loop(ConnRef, SessionRef),
-                    webtransport_session:close(Session, 0, <<"capsule too large">>);
-                {error, Reason} ->
-                    %% Malformed capsule framing on the CONNECT stream is
-                    %% a protocol violation. Close the session.
-                    logger:warning("h2 capsule decode error: ~p", [Reason]),
+                    webtransport_session:handle_capsule(Session, {malformed, <<"truncated capsule">>}),
+                    stop;
+                true ->
+                    %% http2-16 §3.4: the peer closing the stream ends the
+                    %% session.
                     cleanup_data_loop(ConnRef, SessionRef),
-                    webtransport_session:close(Session, 0, <<"malformed capsule">>)
+                    webtransport_session:handle_capsule(Session, connect_fin),
+                    stop;
+                false ->
+                    {continue, Rest}
             end;
-        {h2, Conn, {stream_reset, StreamId, _ErrorCode}} ->
+        {ok, _Capsules, _Rest} ->
+            %% A single capsule larger than we are willing to hold.
+            logger:warning("h2 capsule exceeds ~p bytes", [?H2_CAPSULE_BUFFER_MAX]),
             cleanup_data_loop(ConnRef, SessionRef),
-            webtransport_session:close(Session, 0, <<"stream reset">>);
-        %% h2 0.12 always reports the reason; older ones sent the bare atom.
-        {h2, Conn, {closed, _Reason}} ->
+            webtransport_session:handle_capsule(Session, {malformed, <<"capsule too large">>}),
+            stop;
+        {error, Reason} ->
+            logger:warning("h2 capsule decode error: ~p", [Reason]),
             cleanup_data_loop(ConnRef, SessionRef),
-            webtransport_session:close(Session, 0, <<"connection closed">>);
-        {h2, Conn, closed} ->
+            webtransport_session:handle_capsule(Session, {malformed, <<"malformed capsule">>}),
+            stop
+    end;
+%% Client: the server changed its SETTINGS (notify_peer_settings). http2-16
+%% §3.1: SETTINGS_WT_ENABLED above 1 is a connection error of type
+%% PROTOCOL_ERROR. Turning it off does not affect this session.
+h2_data_event({h2, Conn, {peer_settings, Settings}},
+              {Conn, _, Session, ConnRef, SessionRef}, Buf) ->
+    case maps:get(?SETTINGS_WT_ENABLED_H2, Settings, 0) of
+        V when is_integer(V), V > 1 ->
+            _ = h2:goaway(Conn, protocol_error),
             cleanup_data_loop(ConnRef, SessionRef),
-            webtransport_session:close(Session, 0, <<"connection closed">>);
-        {'DOWN', ConnRef, process, Conn, _Reason} ->
-            erlang:demonitor(SessionRef, [flush]),
-            webtransport_session:close(Session, 0, <<"connection closed">>);
-        {'DOWN', SessionRef, process, Session, _Reason} ->
-            %% Session is gone; nothing left to forward to. Exit so we don't
-            %% leak this process for the life of the h2 connection.
-            erlang:demonitor(ConnRef, [flush]),
-            ok;
+            webtransport_session:handle_capsule(
+              Session, {connection_error, <<"SETTINGS_WT_ENABLED above 1">>}),
+            h2:close(Conn),
+            stop;
         _ ->
-            h2_data_loop(Conn, StreamId, Session, ConnRef, SessionRef, Buf)
+            {continue, Buf}
+    end;
+h2_data_event({h2, Conn, {stream_reset, StreamId, _ErrorCode}},
+              {Conn, StreamId, Session, ConnRef, SessionRef}, _Buf) ->
+    cleanup_data_loop(ConnRef, SessionRef),
+    webtransport_session:handle_capsule(Session, connect_reset),
+    stop;
+%% h2 0.12 always reports the reason; older ones sent the bare atom.
+h2_data_event({h2, Conn, Closed}, {Conn, _, Session, ConnRef, SessionRef}, _Buf)
+  when Closed =:= closed; element(1, Closed) =:= closed ->
+    cleanup_data_loop(ConnRef, SessionRef),
+    webtransport_session:close(Session, 0, <<"connection closed">>),
+    stop;
+h2_data_event({'DOWN', ConnRef, process, _, _}, {_, _, Session, ConnRef, SessionRef}, _Buf) ->
+    erlang:demonitor(SessionRef, [flush]),
+    webtransport_session:close(Session, 0, <<"connection closed">>),
+    stop;
+h2_data_event({'DOWN', SessionRef, process, _, _}, {_, _, _, ConnRef, SessionRef}, _Buf) ->
+    %% Session is gone; nothing left to forward to. Exit so we don't leak
+    %% this process for the life of the h2 connection.
+    erlang:demonitor(ConnRef, [flush]),
+    stop;
+h2_data_event(_Msg, _Loop, Buf) ->
+    {continue, Buf}.
+
+%% Client side: events for the CONNECT stream that reached the connecting
+%% process between the 2xx and the data loop taking over the stream.
+take_h2_stream_events(Conn, StreamId, Acc) ->
+    receive
+        {h2, Conn, {Tag, StreamId, _, _}} = Msg when Tag =:= data ->
+            take_h2_stream_events(Conn, StreamId, [Msg | Acc]);
+        {h2, Conn, {stream_reset, StreamId, _}} = Msg ->
+            take_h2_stream_events(Conn, StreamId, [Msg | Acc]);
+        {h2, Conn, {peer_settings, _}} = Msg ->
+            take_h2_stream_events(Conn, StreamId, [Msg | Acc])
+    after 0 ->
+        lists:reverse(Acc)
     end.
 
 cleanup_data_loop(ConnRef, SessionRef) ->
@@ -1224,10 +1398,6 @@ dispatch_h2_capsule(Session, {wt_stream_fin, WtStreamId, Data}) ->
     webtransport_session:handle_stream_data(Session, WtStreamId, Data, true);
 dispatch_h2_capsule(Session, {datagram, Data}) ->
     webtransport_session:handle_datagram_data(Session, Data);
-dispatch_h2_capsule(Session, {reset_stream, WtStreamId, ErrorCode}) ->
-    webtransport_session:handle_stream_closed(Session, WtStreamId, {reset, ErrorCode});
-dispatch_h2_capsule(Session, {stop_sending, WtStreamId, ErrorCode}) ->
-    webtransport_session:handle_stream_closed(Session, WtStreamId, {stop_sending, ErrorCode});
 dispatch_h2_capsule(Session, Capsule) ->
     webtransport_session:handle_capsule(Session, Capsule).
 
@@ -1239,36 +1409,59 @@ connect_h2(Host, Port, Path, Opts, Handler) ->
     Caller = self(),
     UserHandlerOpts = maps:get(handler_opts, Opts, #{}),
     HandlerOpts = maps:merge(#{owner => Caller}, UserHandlerOpts),
-    Opts1 = Opts#{ssl_opts => build_h2_ssl_opts(Opts)},
+    Opts1 = Opts#{
+        ssl_opts => build_h2_ssl_opts(Opts),
+        settings => h2_wt_settings(Opts),
+        headers => protocol_headers(Opts) ++ maps:get(headers, Opts, []),
+        handler_opts => HandlerOpts
+    },
     case webtransport_h2:connect(Host, Port, Path, Opts1) of
         {ok, TransportState} ->
-            %% Default handler for client
-            ActualHandler = case Handler of
-                undefined -> webtransport_client_handler;
-                _ -> Handler
-            end,
-            Request = #{
-                path => Path,
-                authority => authority(Host, Port),
-                headers => maps:get(headers, Opts, [])
-            },
-            SessionOpts = #{
-                request => Request,
-                is_server => false,
-                handler_opts => HandlerOpts
-            },
-            case webtransport_session:start_link(h2, TransportState, ActualHandler, SessionOpts) of
-                {ok, Session} ->
-                    H2Conn = webtransport_h2:h2_conn(TransportState),
-                    StreamId = webtransport_h2:connect_stream_id(TransportState),
-                    LoopPid = spawn(fun() -> h2_data_loop(H2Conn, StreamId, Session) end),
-                    _ = h2:set_stream_handler(H2Conn, StreamId, LoopPid),
-                    {ok, Session};
-                {error, _} = Err ->
-                    Err
+            RespHeaders = webtransport_h2:response_headers(TransportState),
+            case selected_protocol(Opts1, RespHeaders) of
+                {ok, Protocol} ->
+                    h2_start_session(TransportState, Path, authority(Host, Port),
+                                     RespHeaders, Protocol, Opts1, Handler);
+                {error, Reason} ->
+                    %% http2-16 §3.3: close the session with WT_ALPN_ERROR.
+                    _ = webtransport_h2:close_session(TransportState, ?WT_ALPN_ERROR, <<>>),
+                    h2:close(webtransport_h2:h2_conn(TransportState)),
+                    {error, Reason}
             end;
         {error, Reason} ->
             {error, Reason}
+    end.
+
+h2_start_session(TransportState, Path, Authority, RespHeaders, Protocol, Opts, Handler) ->
+    ActualHandler = case Handler of
+        undefined -> webtransport_client_handler;
+        _ -> Handler
+    end,
+    Request = client_request(Path, Authority, RespHeaders, Protocol, h2_16),
+    SessionOpts = (client_session_opts(Request, Opts))#{
+        peer_settings => webtransport_h2:peer_settings(TransportState),
+        peer_stream_data => webtransport_h2:peer_stream_data(TransportState)
+    },
+    case webtransport_session:start_link(h2, TransportState, ActualHandler, SessionOpts) of
+        {ok, Session} ->
+            H2Conn = webtransport_h2:h2_conn(TransportState),
+            StreamId = webtransport_h2:connect_stream_id(TransportState),
+            %% Data the server sent right after the 2xx went to us. The loop
+            %% waits for it before reading its own mailbox.
+            LoopPid = spawn(fun() ->
+                receive
+                    {prefix, Prefix} -> h2_data_loop(H2Conn, StreamId, Session, Prefix)
+                end
+            end),
+            _ = h2:set_stream_handler(H2Conn, StreamId, LoopPid),
+            %% The loop owns the connection from here: it gets its close and
+            %% SETTINGS-change events instead of the connecting process.
+            _ = h2:controlling_process(H2Conn, LoopPid),
+            LoopPid ! {prefix, take_h2_stream_events(H2Conn, StreamId, [])},
+            ok = webtransport_session:established(Session),
+            {ok, Session};
+        {error, _} = Err ->
+            Err
     end.
 
 connect_h3(Host, Port, Path, Opts0, Handler) ->
@@ -1320,14 +1513,14 @@ build_h2_ssl_opts(Opts) ->
     end.
 
 build_h3_connect_opts(Opts) ->
-    %% Client picks a compat_mode explicitly; default `latest' (draft-15).
+    %% Client picks a compat_mode explicitly; default `latest' (http3-17).
     %% Clients must not auto-probe the server, so the default is a single
     %% disjoint handshake shape.
     CompatMode = case maps:get(compat_mode, Opts, latest) of
         legacy_browser_compat -> legacy_browser_compat;
         _ -> latest
     end,
-    WTSettings = wt_h3:default_settings(CompatMode),
+    WTSettings = wt_h3:client_settings(CompatMode, Opts),
     BaseOpts = #{
         settings => WTSettings,
         sync => true,
@@ -1335,6 +1528,7 @@ build_h3_connect_opts(Opts) ->
         verify => maps:get(verify, Opts, verify_peer),
         quic_opts => build_client_quic_opts(Opts),
         h3_datagram_enabled => true,
+        stream_reset_final_size => true,
         stream_type_handler => fun
             (uni,  _, 16#54) -> claim;
             (bidi, _, 16#41) -> claim;
@@ -1418,15 +1612,23 @@ h3_validate_and_request(H3Conn, Authority, Path, Opts, Handler, Router) ->
     case wt_h3:validate_wt_support(H3Conn, QuicConn, CompatMode) of
         ok ->
             h3_send_connect(H3Conn, Authority, Path, Opts, Handler, Router, CompatMode);
+        {error, {settings_error, _} = Reason} ->
+            %% http3-17 §3.1: a SETTINGS_WT_ENABLED above 1 is a connection
+            %% error of type H3_SETTINGS_ERROR.
+            quic_h3:close(H3Conn, ?H3_SETTINGS_ERROR),
+            {error, Reason};
         {error, Reason} ->
             quic_h3:close(H3Conn),
             {error, Reason}
     end.
 
+
+
 h3_send_connect(H3Conn, Authority, Path, Opts, Handler, Router, CompatMode) ->
-    Headers = maps:get(headers, Opts, []),
+    Headers = protocol_headers(Opts) ++ maps:get(headers, Opts, []),
     case wt_h3:request_session(H3Conn, Authority, Path, Headers, CompatMode) of
         {ok, SessionId} ->
+            ok = webtransport_h3_router:expect_session(Router, SessionId),
             h3_await_response(H3Conn, SessionId, Authority, Path, Opts, Handler, Router);
         {error, Reason} ->
             quic_h3:close(H3Conn),
@@ -1453,25 +1655,32 @@ h3_await_response(H3Conn, SessionId, Authority, Path, Opts, Handler, Router) ->
     end.
 
 h3_start_session(H3Conn, SessionId, Authority, Path, Headers, Opts, Handler, Router) ->
+    case selected_protocol(Opts, Headers) of
+        {ok, Protocol} ->
+            h3_start_session(H3Conn, SessionId, Authority, Path, Headers, Opts,
+                             Handler, Router, Protocol);
+        {error, Reason} ->
+            %% http3-17 §3.3: close the session with WT_ALPN_ERROR. §6: a
+            %% WT_CLOSE_SESSION is followed at once by a FIN.
+            Close = wt_h3_capsule:encode(wt_h3_capsule:close_session(?WT_ALPN_ERROR, <<>>)),
+            _ = quic_h3:send_data(H3Conn, SessionId, Close, true),
+            quic_h3:close(H3Conn),
+            {error, Reason}
+    end.
+
+h3_start_session(H3Conn, SessionId, Authority, Path, Headers, Opts, Handler, Router,
+                 Protocol) ->
     TransportState = webtransport_h3:new(H3Conn, SessionId, Router),
     ActualHandler = case Handler of
         undefined -> webtransport_client_handler;
         _ -> Handler
     end,
-    Request = #{
-        path => Path,
-        authority => Authority,
-        headers => Headers
-    },
-    HandlerOpts = maps:get(handler_opts, Opts, #{}),
-    SessionOpts = #{
-        request => Request,
-        is_server => false,
-        handler_opts => HandlerOpts
-    },
+    Request = client_request(Path, Authority, Headers, Protocol, h3_17),
+    SessionOpts = client_session_opts(Request, Opts),
     case webtransport_session:start_link(h3, TransportState, ActualHandler, SessionOpts) of
         {ok, Session} ->
             webtransport_h3_router:register_session(Router, SessionId, Session),
+            ok = webtransport_session:established(Session),
             {ok, Session};
         {error, _} = Err ->
             %% Session failed to start after a successful CONNECT. Closing the
@@ -1480,6 +1689,56 @@ h3_start_session(H3Conn, SessionId, Authority, Path, Headers, Opts, Handler, Rou
             quic_h3:close(H3Conn),
             Err
     end.
+
+%% WT-Available-Protocols for a client that set `protocols'.
+protocol_headers(Opts) ->
+    case maps:get(protocols, Opts, []) of
+        [] -> [];
+        Protocols -> [{<<"wt-available-protocols">>,
+                       wt_sf:serialize_string_list(Protocols)}]
+    end.
+
+%% http3-17 §3.3, http2-16 §3.3: the server's WT-Protocol must be one we
+%% offered; with `require_protocol => true' it must also be present. A
+%% WT-Protocol that is not a String is ignored.
+selected_protocol(Opts, RespHeaders) ->
+    Offered = maps:get(protocols, Opts, []),
+    Selected = case proplists:get_value(<<"wt-protocol">>, RespHeaders) of
+        undefined -> undefined;
+        Bin ->
+            case wt_sf:parse_item(Bin) of
+                {ok, {string, P}} -> P;
+                _ -> undefined
+            end
+    end,
+    case {Selected, maps:get(require_protocol, Opts, false)} of
+        {undefined, true} -> {error, {alpn_error, no_protocol}};
+        {undefined, false} -> {ok, undefined};
+        {P1, _} ->
+            case lists:member(P1, Offered) of
+                true -> {ok, P1};
+                false -> {error, {alpn_error, {not_offered, P1}}}
+            end
+    end.
+
+client_request(Path, Authority, Headers, Protocol, Draft) ->
+    Request = #{path => Path, authority => Authority, headers => Headers,
+                wt_draft => Draft},
+    case Protocol of
+        undefined -> Request;
+        _ -> Request#{protocol => Protocol}
+    end.
+
+client_session_opts(Request, Opts) ->
+    #{
+        request => Request,
+        is_server => false,
+        handler_opts => maps:get(handler_opts, Opts, #{}),
+        max_data => maps:get(max_data, Opts, ?DEFAULT_MAX_DATA),
+        max_stream_data => maps:get(max_stream_data, Opts, ?DEFAULT_MAX_STREAM_DATA),
+        max_streams_bidi => maps:get(max_streams_bidi, Opts, ?DEFAULT_MAX_STREAMS_BIDI),
+        max_streams_uni => maps:get(max_streams_uni, Opts, ?DEFAULT_MAX_STREAMS_UNI)
+    }.
 
 %% ============================================================================
 %% Handler Factories
@@ -1581,3 +1840,38 @@ read_cacerts_file(CAFile) ->
         {error, Reason} ->
             {error, {cacerts_read_failed, Reason}}
     end.
+
+%% ============================================================================
+%% Eunit
+%% ============================================================================
+
+-ifdef(TEST).
+-include_lib("eunit/include/eunit.hrl").
+
+%% http3-17 §5.1: a second session on a connection without flow control is
+%% refused; with flow control declared by both sides it is accepted.
+session_limit_test_() ->
+    {ok, Router} = webtransport_h3_router:start_link(),
+    NoFc = #{compat_mode => latest},
+    WithFc = NoFc#{peer_settings => #{wt_initial_max_data => 1000}},
+    %% Alone on the connection: accepted.
+    R1 = check_session_limit(h3, Router, 0, #{}, NoFc),
+    %% A second CONNECT racing the first, before either registered:
+    %% refused without flow control, accepted with it.
+    R2 = check_session_limit(h3, Router, 4, #{}, NoFc),
+    R3 = check_session_limit(h3, Router, 8, #{}, WithFc),
+    %% Draft-02 has no such rule.
+    R4 = check_session_limit(h3, Router, 12, #{}, NoFc#{compat_mode => legacy_browser_compat}),
+    %% A refused or failed session frees its slot.
+    [ok = webtransport_h3_router:session_gone(Router, Id) || Id <- [0, 8, 12]],
+    R5 = check_session_limit(h3, Router, 16, #{}, NoFc),
+    gen_server:stop(Router),
+    [
+        ?_assertMatch({ok, _}, R1),
+        ?_assertMatch({reset, ?H3_REQUEST_REJECTED, _}, R2),
+        ?_assertMatch({ok, _}, R3),
+        ?_assertMatch({ok, _}, R4),
+        ?_assertMatch({ok, _}, R5)
+    ].
+
+-endif.

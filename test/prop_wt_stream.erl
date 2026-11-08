@@ -201,10 +201,10 @@ prop_client_server_exclusive() ->
     ?FORALL(Id, stream_id(),
         webtransport_stream:is_client_initiated(Id) =/= webtransport_stream:is_server_initiated(Id)).
 
-%% Property: reset closes the stream
+%% Property: reset closes our send side
 prop_reset_closes() ->
     ?FORALL({S, Code}, {stream(), range(0, 255)},
-        webtransport_stream:state(webtransport_stream:reset(S, Code)) =:= closed).
+        not webtransport_stream:is_writable(webtransport_stream:reset(S, Code))).
 
 %% Property: reset clears send buffer
 prop_reset_clears_send_buffer() ->

@@ -30,7 +30,9 @@
 %% State transitions
 -export([send/2, receive_data/2, receive_fin/1]).
 -export([close_local/1, close_remote/1, close/1]).
--export([reset/2, stop_sending/2, peer_stop_sending/2]).
+-export([reset/2, receive_reset/2, stop_sending/2, peer_stop_sending/2]).
+-export([reset_code/1, remote_reset_code/1, remote_fin/1, local_fin/1,
+         peer_stop_sending_code/1]).
 -export([update_send_window/2, update_recv_window/2]).
 
 %% Buffer management
@@ -61,7 +63,10 @@
     %% flow-control credit; sent once the send buffer drains (h2 only).
     fin_pending = false :: boolean(),
     remote_fin = false :: boolean(),
+    %% We reset our send side with this code.
     reset_code :: undefined | non_neg_integer(),
+    %% The peer reset its send side with this code.
+    remote_reset_code :: undefined | non_neg_integer(),
     %% We sent STOP_SENDING to the peer: our read side is finished.
     local_stop_sending_code :: undefined | non_neg_integer(),
     %% Peer sent us STOP_SENDING: our write side must stop.
@@ -123,10 +128,25 @@ is_writable(#stream{state = State, local_fin = Fin, reset_code = Reset,
 
 %% @doc Return true if the remote side can still send data on this stream.
 -spec is_readable(stream()) -> boolean().
-is_readable(#stream{state = State, remote_fin = Fin,
+is_readable(#stream{state = State, remote_fin = Fin, remote_reset_code = Reset,
                     local_stop_sending_code = LocalStop}) ->
-    LocalStop =:= undefined andalso not Fin andalso
+    LocalStop =:= undefined andalso Reset =:= undefined andalso not Fin andalso
     (State =:= open orelse State =:= half_closed_local).
+
+-spec reset_code(stream()) -> undefined | non_neg_integer().
+reset_code(#stream{reset_code = C}) -> C.
+
+-spec remote_reset_code(stream()) -> undefined | non_neg_integer().
+remote_reset_code(#stream{remote_reset_code = C}) -> C.
+
+-spec remote_fin(stream()) -> boolean().
+remote_fin(#stream{remote_fin = F}) -> F.
+
+-spec local_fin(stream()) -> boolean().
+local_fin(#stream{local_fin = F}) -> F.
+
+-spec peer_stop_sending_code(stream()) -> undefined | non_neg_integer().
+peer_stop_sending_code(#stream{peer_stop_sending_code = C}) -> C.
 
 %% @doc Return the send flow-control window size.
 -spec send_window(stream()) -> non_neg_integer().
@@ -244,14 +264,37 @@ close_remote(Stream) ->
 close(Stream) ->
     Stream#stream{state = closed, local_fin = true, remote_fin = true}.
 
-%% @doc Reset the stream with the given error code, discarding the send buffer.
+%% @doc We abruptly end our send side, discarding the send buffer. The peer may still be sending on a
+%% bidirectional stream, so only the send direction closes.
 -spec reset(stream(), non_neg_integer()) -> stream().
-reset(Stream, ErrorCode) ->
+reset(#stream{state = State} = Stream, ErrorCode) ->
     Stream#stream{
-        state = closed,
+        state = close_direction(local, State),
         reset_code = ErrorCode,
-        send_buffer = <<>>
+        send_buffer = <<>>,
+        fin_pending = false
     }.
+
+%% @doc The peer abruptly ended its send side. Fails when that side was
+%% already finished (FIN or an earlier reset).
+-spec receive_reset(stream(), non_neg_integer()) -> {ok, stream()} | {error, invalid_state}.
+receive_reset(#stream{remote_fin = true}, _ErrorCode) ->
+    {error, invalid_state};
+receive_reset(#stream{remote_reset_code = C}, _ErrorCode) when C =/= undefined ->
+    {error, invalid_state};
+receive_reset(#stream{state = State} = Stream, ErrorCode)
+  when State =:= open; State =:= half_closed_local ->
+    {ok, Stream#stream{state = close_direction(remote, State),
+                       remote_reset_code = ErrorCode,
+                       recv_buffer = <<>>}};
+receive_reset(_Stream, _ErrorCode) ->
+    {error, invalid_state}.
+
+close_direction(local, open) -> half_closed_local;
+close_direction(local, half_closed_remote) -> closed;
+close_direction(remote, open) -> half_closed_remote;
+close_direction(remote, half_closed_local) -> closed;
+close_direction(_, State) -> State.
 
 %% @doc Record that we sent STOP_SENDING to the peer, shutting our read side.
 -spec stop_sending(stream(), non_neg_integer()) -> stream().

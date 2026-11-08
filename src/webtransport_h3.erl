@@ -14,8 +14,8 @@
 -export([session_id/1, h3_conn/1, quic_conn/1, peer_settings/1, router/1]).
 -export([open_bidi_stream/1, open_uni_stream/1]).
 -export([send/4, send_datagram/2]).
--export([close_session/3, drain_session/1]).
--export([reset_stream/4, stop_sending/3]).
+-export([close_session/3, drain_session/1, send_capsule/2]).
+-export([reset_stream/4, stop_sending/3, stream_header_size/2]).
 -export([decode_stream_header/1, decode_datagram/1]).
 
 -record(state, {
@@ -27,8 +27,13 @@
 }).
 
 -opaque state() :: #state{}.
+-type code() :: {app, non_neg_integer()} | {wt, non_neg_integer()}.
 
--export_type([state/0]).
+-export_type([state/0, code/0]).
+
+-ifdef(TEST).
+-export([new_for_test/1]).
+-endif.
 
 %% ============================================================================
 %% Lifecycle
@@ -124,6 +129,12 @@ open_bidi_stream(#state{h3_conn = H3Conn, quic_conn = QuicConn, session_id = Ses
 
 %% @doc Open a new unidirectional WebTransport stream on the QUIC connection.
 -spec open_uni_stream(state()) -> {ok, non_neg_integer(), state()} | {error, term()}.
+open_uni_stream(#state{router = Router, session_id = SessionId} = State) when is_pid(Router) ->
+    %% Through the router, so events on the stream reach the session.
+    case webtransport_h3_router:open_uni_stream(Router, SessionId) of
+        {ok, StreamId} -> {ok, StreamId, State};
+        {error, _} = Error -> Error
+    end;
 open_uni_stream(#state{quic_conn = QuicConn, session_id = SessionId} = State) ->
     case quic:open_unidirectional_stream(QuicConn) of
         {ok, StreamId} ->
@@ -174,9 +185,18 @@ decode_datagram(Bin) ->
 %% @doc Send a CLOSE_WEBTRANSPORT_SESSION capsule and FIN the CONNECT stream.
 -spec close_session(state(), non_neg_integer(), binary()) -> ok | {error, term()}.
 close_session(#state{h3_conn = H3Conn, session_id = SessionId}, ErrorCode, Reason) ->
-    %% Send CLOSE_WEBTRANSPORT_SESSION capsule
-    Capsule = wt_h3_capsule:encode(wt_h3_capsule:close_session(ErrorCode, Reason)),
-    quic_h3:send_data(H3Conn, SessionId, Capsule, true).
+    %% WT_CLOSE_SESSION then FIN on the CONNECT stream (http3-17 §6).
+    case wt_h3_capsule:close_session(ErrorCode, Reason) of
+        {error, _} = Err ->
+            Err;
+        Capsule ->
+            quic_h3:send_data(H3Conn, SessionId, wt_h3_capsule:encode(Capsule), true)
+    end.
+
+%% @doc Send a session-level capsule (flow control) on the CONNECT stream.
+-spec send_capsule(state(), wt_h3_capsule:capsule()) -> ok | {error, term()}.
+send_capsule(#state{h3_conn = H3Conn, session_id = SessionId}, Capsule) ->
+    quic_h3:send_data(H3Conn, SessionId, wt_h3_capsule:encode(Capsule), false).
 
 %% @doc Send a DRAIN_WEBTRANSPORT_SESSION capsule to signal graceful shutdown.
 -spec drain_session(state()) -> ok | {error, term()}.
@@ -189,29 +209,52 @@ drain_session(#state{h3_conn = H3Conn, session_id = SessionId}) ->
 %% Stream Control
 %% ============================================================================
 
-%% @doc Reset a stream with the given application error code mapped to the QUIC error space.
--spec reset_stream(state(), non_neg_integer(), non_neg_integer(), non_neg_integer()) ->
+%% @doc Reset the send side of a stream.
+%%
+%% On a WebTransport data stream this is RESET_STREAM_AT with `ReliableSize'
+%% covering the stream header we wrote plus any application offset
+%% (http3-17 §4.4), so the peer still learns which session the stream
+%% belonged to. With a `ReliableSize' of 0 (a peer-initiated stream, where we
+%% wrote no header) a plain RESET_STREAM is sent.
+-spec reset_stream(state(), non_neg_integer(), code(), non_neg_integer()) ->
     ok | {error, term()}.
-reset_stream(#state{quic_conn = QuicConn, h3_conn = H3Conn, session_id = SessionId}, StreamId, ErrorCode, _ReliableSize) ->
-    %% draft-15 §3.3: app error codes are mapped into a reserved QUIC space.
-    QuicCode = wt_error:to_quic(ErrorCode),
+reset_stream(#state{quic_conn = QuicConn, h3_conn = H3Conn, session_id = SessionId},
+             StreamId, Code, ReliableSize) ->
+    QuicCode = quic_code(Code),
     case StreamId =:= SessionId of
         true ->
             quic_h3:cancel(H3Conn, StreamId, QuicCode);
+        false when ReliableSize > 0 ->
+            quic:reset_stream_at(QuicConn, StreamId, QuicCode, ReliableSize);
         false ->
             quic:reset_stream(QuicConn, StreamId, QuicCode)
     end.
 
-%% @doc Request that the peer stop sending on a stream with the given error code.
--spec stop_sending(state(), non_neg_integer(), non_neg_integer()) -> ok | {error, term()}.
-stop_sending(#state{quic_conn = QuicConn, h3_conn = H3Conn, session_id = SessionId}, StreamId, ErrorCode) ->
-    QuicCode = wt_error:to_quic(ErrorCode),
+%% @doc Ask the peer to stop sending on a stream.
+-spec stop_sending(state(), non_neg_integer(), code()) -> ok | {error, term()}.
+stop_sending(#state{quic_conn = QuicConn, h3_conn = H3Conn, session_id = SessionId},
+             StreamId, Code) ->
+    QuicCode = quic_code(Code),
     case StreamId =:= SessionId of
         true ->
             quic_h3:cancel(H3Conn, StreamId, QuicCode);
         false ->
             quic:stop_sending(QuicConn, StreamId, QuicCode)
     end.
+
+%% `{app, Code}' is a WebTransport application code, mapped into the
+%% WT_APPLICATION_ERROR range (http3-17 §4.4). `{wt, Code}' is a protocol
+%% code such as WT_SESSION_GONE, sent unchanged (http3-17 §6).
+quic_code({app, Code}) -> wt_error:to_quic(Code);
+quic_code({wt, Code}) -> Code.
+
+%% @doc Size of the header we write on a stream we open for this session:
+%% the stream type or signal, then the session id.
+-spec stream_header_size(state(), bidi | uni) -> pos_integer().
+stream_header_size(#state{session_id = SessionId}, bidi) ->
+    byte_size(wt_h3_capsule:encode_bidi_stream_header(SessionId));
+stream_header_size(#state{session_id = SessionId}, uni) ->
+    byte_size(wt_h3_capsule:encode_uni_stream_header(SessionId)).
 
 %% ============================================================================
 %% Incoming Data Helpers
@@ -224,3 +267,36 @@ stop_sending(#state{quic_conn = QuicConn, h3_conn = H3Conn, session_id = Session
     {error, term()}.
 decode_stream_header(Bin) ->
     wt_h3_capsule:decode_stream_header(Bin).
+
+%% ============================================================================
+%% Eunit
+%% ============================================================================
+
+-ifdef(TEST).
+-include_lib("eunit/include/eunit.hrl").
+
+%% http3-17 §6: WT_SESSION_GONE is a protocol code and goes on the wire as
+%% is; application codes are mapped into the WT_APPLICATION_ERROR range.
+quic_code_test_() ->
+    [
+        ?_assertEqual(16#170d7b68, quic_code({wt, ?WT_SESSION_GONE})),
+        ?_assertEqual(16#3994bd84, quic_code({wt, ?WT_BUFFERED_STREAM_REJECTED})),
+        ?_assertEqual(wt_error:to_quic(7), quic_code({app, 7})),
+        ?_assertNotEqual(?WT_SESSION_GONE, quic_code({app, ?WT_SESSION_GONE}))
+    ].
+
+%% A state with no live connection, for unit tests elsewhere.
+new_for_test(SessionId) ->
+    #state{h3_conn = self(), quic_conn = self(), session_id = SessionId}.
+
+stream_header_size_test_() ->
+    State = #state{h3_conn = self(), quic_conn = self(), session_id = 0},
+    Big = State#state{session_id = 1024},
+    [
+        %% 0x54 and 0x41 are two-byte varints; session 0 is one byte.
+        ?_assertEqual(3, stream_header_size(State, uni)),
+        ?_assertEqual(3, stream_header_size(State, bidi)),
+        ?_assertEqual(4, stream_header_size(Big, bidi))
+    ].
+
+-endif.

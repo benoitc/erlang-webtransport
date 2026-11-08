@@ -15,7 +15,7 @@
 %% Capsule constructors
 -export([padding/1]).
 -export([wt_stream/2, wt_stream/3, wt_stream_fin/2, wt_stream_fin/3]).
--export([reset_stream/2, stop_sending/2]).
+-export([reset_stream/2, reset_stream/3, stop_sending/2]).
 -export([max_data/1, max_stream_data/2]).
 -export([max_streams_bidi/1, max_streams_uni/1]).
 -export([data_blocked/1, stream_data_blocked/2]).
@@ -32,7 +32,7 @@
     {padding, binary()} |
     {wt_stream, stream_id(), binary()} |
     {wt_stream_fin, stream_id(), binary()} |
-    {reset_stream, stream_id(), error_code()} |
+    {reset_stream, stream_id(), error_code(), non_neg_integer()} |
     {stop_sending, stream_id(), error_code()} |
     {max_data, non_neg_integer()} |
     {max_stream_data, stream_id(), non_neg_integer()} |
@@ -84,10 +84,17 @@ wt_stream_fin(StreamId, Data, true) ->
 wt_stream_fin(StreamId, Data, false) ->
     {wt_stream, StreamId, Data}.
 
-%% @doc Construct a RESET_STREAM capsule for the given stream and error code.
+%% @doc WT_RESET_STREAM with a Reliable Size of 0, for a stream we never
+%% sent data on.
 -spec reset_stream(stream_id(), error_code()) -> capsule().
 reset_stream(StreamId, ErrorCode) ->
-    {reset_stream, StreamId, ErrorCode}.
+    reset_stream(StreamId, ErrorCode, 0).
+
+%% @doc WT_RESET_STREAM. http2-16 §6.2: `ReliableSize' MUST equal the bytes
+%% sent on the stream in WT_STREAM capsules.
+-spec reset_stream(stream_id(), error_code(), non_neg_integer()) -> capsule().
+reset_stream(StreamId, ErrorCode, ReliableSize) ->
+    {reset_stream, StreamId, ErrorCode, ReliableSize}.
 
 %% @doc Construct a STOP_SENDING capsule for the given stream and error code.
 -spec stop_sending(stream_id(), error_code()) -> capsule().
@@ -139,13 +146,11 @@ streams_blocked_uni(Limit) ->
 close_session(ErrorCode) ->
     {close_session, ErrorCode, <<>>}.
 
-%% @doc Construct a CLOSE_SESSION capsule with the given error code and reason.
-%% draft-14 §4.6: the Reason field MUST be at most 1024 UTF-8 bytes.
--spec close_session(error_code(), binary()) -> capsule() | {error, reason_too_long}.
-close_session(_ErrorCode, Reason) when byte_size(Reason) > 1024 ->
-    {error, reason_too_long};
+%% @doc WT_CLOSE_SESSION, shared with h3 (http2-16 §6.12). Same rules as
+%% {@link wt_h3_capsule:close_session/2}.
+-spec close_session(error_code(), binary()) -> capsule() | {error, bad_close_reason}.
 close_session(ErrorCode, Reason) ->
-    {close_session, ErrorCode, Reason}.
+    wt_h3_capsule:close_session(ErrorCode, Reason).
 
 %% @doc Construct a DRAIN_SESSION capsule to signal graceful shutdown.
 -spec drain_session() -> capsule().
@@ -174,9 +179,10 @@ encode({wt_stream_fin, StreamId, Data}) ->
     Payload = <<(h2_varint:encode(StreamId))/binary, Data/binary>>,
     h2_capsule:encode(?WT_STREAM_FIN, Payload);
 
-encode({reset_stream, StreamId, ErrorCode}) ->
+encode({reset_stream, StreamId, ErrorCode, ReliableSize}) ->
     Payload = <<(h2_varint:encode(StreamId))/binary,
-                (h2_varint:encode(ErrorCode))/binary>>,
+                (h2_varint:encode(ErrorCode))/binary,
+                (h2_varint:encode(ReliableSize))/binary>>,
     h2_capsule:encode(?WT_RESET_STREAM, Payload);
 
 encode({stop_sending, StreamId, ErrorCode}) ->
@@ -213,8 +219,8 @@ encode({streams_blocked_uni, Limit}) ->
     h2_capsule:encode(?WT_STREAMS_BLOCKED_UNI, h2_varint:encode(Limit));
 
 encode({close_session, ErrorCode, Reason}) ->
-    Payload = <<(h2_varint:encode(ErrorCode))/binary, Reason/binary>>,
-    h2_capsule:encode(?WT_CLOSE_SESSION, Payload);
+    h2_capsule:encode(?WT_CLOSE_SESSION,
+                      wt_h3_capsule:encode_close_payload(ErrorCode, Reason));
 
 encode({drain_session}) ->
     h2_capsule:encode(?WT_DRAIN_SESSION, <<>>);
@@ -255,14 +261,11 @@ decode_payload(?WT_STREAM_FIN, Payload) ->
     end;
 
 decode_payload(?WT_RESET_STREAM, Payload) ->
-    case h2_varint:decode(Payload) of
-        {ok, StreamId, Rest} ->
-            case h2_varint:decode(Rest) of
-                {ok, ErrorCode, <<>>} -> {ok, {reset_stream, StreamId, ErrorCode}};
-                {ok, _, _} -> {error, extra_data};
-                {error, _} = Err -> Err
-            end;
-        {error, _} = Err -> Err
+    case decode_varints(Payload, 3) of
+        {ok, [StreamId, ErrorCode, ReliableSize]} ->
+            {ok, {reset_stream, StreamId, ErrorCode, ReliableSize}};
+        {error, _} = Err ->
+            Err
     end;
 
 decode_payload(?WT_STOP_SENDING, Payload) ->
@@ -341,14 +344,7 @@ decode_payload(?WT_STREAMS_BLOCKED_UNI, Payload) ->
     end;
 
 decode_payload(?WT_CLOSE_SESSION, Payload) ->
-    case h2_varint:decode(Payload) of
-        {ok, _ErrorCode, Reason} when byte_size(Reason) > 1024 ->
-            {error, reason_too_long};
-        {ok, ErrorCode, Reason} ->
-            {ok, {close_session, ErrorCode, Reason}};
-        {error, _} = Err ->
-            Err
-    end;
+    wt_h3_capsule:decode_close_payload(Payload);
 
 decode_payload(?WT_DRAIN_SESSION, <<>>) ->
     {ok, {drain_session}};
@@ -366,6 +362,20 @@ decode_payload(Type, Payload) when is_atom(Type) ->
     {ok, {unknown, Type, Payload}}.
 
 %% @doc Decode all capsules from binary.
+%% Decode exactly N varints that fill the payload.
+decode_varints(Bin, N) ->
+    decode_varints(Bin, N, []).
+
+decode_varints(<<>>, 0, Acc) ->
+    {ok, lists:reverse(Acc)};
+decode_varints(_Bin, 0, _Acc) ->
+    {error, extra_data};
+decode_varints(Bin, N, Acc) ->
+    case h2_varint:decode(Bin) of
+        {ok, V, Rest} -> decode_varints(Rest, N - 1, [V | Acc]);
+        {error, _} = Err -> Err
+    end.
+
 -spec decode_all(binary()) -> {ok, [capsule()], binary()} | {error, term()}.
 decode_all(Bin) ->
     decode_all(Bin, []).

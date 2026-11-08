@@ -58,6 +58,23 @@
     server_initiated_bidi_test/1,
     close_session_reason_too_long_test/1,
     origin_check_reject_test/1,
+    protocol_negotiation_test/1,
+    flow_control_credit_test/1,
+    server_close_reaches_client_test/1,
+    init_actions_after_accept_test/1,
+    stop_sending_on_own_uni_test/1,
+    handler_stop_closes_session_test/1,
+    drain_completes_test/1,
+    reset_unseen_stream_test/1,
+    close_stream_with_queue_test/1,
+    server_drain_reaches_client_test/1,
+    stream_credit_replenish_test/1,
+    server_without_wt_enabled_test/1,
+    invalid_webtransport_init_test/1,
+    client_refuses_tls12_server_test/1,
+    h2_embedded_accept_round_trip_test/1,
+    listener_refuses_tls12_client_test/1,
+    accept_refuses_tls12_test/1,
 
     %% Embedding (accept/4 from a non-connection process)
     embedded_accept_round_trip_test/1,
@@ -86,6 +103,18 @@ groups() ->
     Cases = [
         close_session_reason_too_long_test,
         origin_check_reject_test,
+        protocol_negotiation_test,
+        server_without_wt_enabled_test,
+        flow_control_credit_test,
+        server_close_reaches_client_test,
+        init_actions_after_accept_test,
+        stop_sending_on_own_uni_test,
+        handler_stop_closes_session_test,
+        drain_completes_test,
+        reset_unseen_stream_test,
+        close_stream_with_queue_test,
+        server_drain_reaches_client_test,
+        stream_credit_replenish_test,
         connect_disconnect_test,
         session_info_test,
         open_bidi_stream_test,
@@ -122,9 +151,13 @@ groups() ->
     ],
     %% Embedding via h3_settings/0 + accept/4 is HTTP/3-only.
     H3Only = [embedded_accept_round_trip_test],
+    %% WebTransport-Init is an HTTP/2 header.
+    H2Only = [invalid_webtransport_init_test, client_refuses_tls12_server_test,
+              h2_embedded_accept_round_trip_test,
+              listener_refuses_tls12_client_test, accept_refuses_tls12_test],
     [
         {h3_tests, [sequence], Cases ++ H3Only},
-        {h2_tests, [sequence], Cases}
+        {h2_tests, [sequence], Cases ++ H2Only}
     ].
 
 init_per_suite(Config) ->
@@ -434,42 +467,66 @@ stream_limit_test(Config) ->
 %% Error Handling Tests
 %% ============================================================================
 
+%% After a reset the session stays up: on h2 the WT_RESET_STREAM carries a
+%% Reliable Size equal to what we sent (http2-16 §6.2), so the server
+%% accepts it. A second reset of the same send side is refused locally.
 reset_stream_test(Config) ->
     Port = proplists:get_value(port, Config),
-
     {ok, Session} = webtransport:connect("localhost", Port, <<"/test">>, #{
         transport => proplists:get_value(transport, Config),
         verify => verify_none
     }),
-
     {ok, StreamId} = webtransport:open_stream(Session, bidi),
-
-    %% Send some data
     ok = webtransport:send(Session, StreamId, <<"data">>, nofin),
-
-    %% Reset the stream
     ok = webtransport:reset_stream(Session, StreamId, 1),
-
-    timer:sleep(200),
-
+    ?assertEqual({error, stream_send_side_closed},
+                 webtransport:reset_stream(Session, StreamId, 1)),
+    assert_session_usable(Session),
     webtransport:close_session(Session).
 
+%% STOP_SENDING makes the peer reset its send side with our code
+%% (http2-16 §6.3, RFC 9000 §3.5). A second STOP_SENDING for the same
+%% stream is refused locally.
 stop_sending_test(Config) ->
     Port = proplists:get_value(port, Config),
-
     {ok, Session} = webtransport:connect("localhost", Port, <<"/test">>, #{
         transport => proplists:get_value(transport, Config),
         verify => verify_none
     }),
-
     {ok, StreamId} = webtransport:open_stream(Session, bidi),
-
-    %% Request peer to stop sending
-    ok = webtransport:stop_sending(Session, StreamId, 1),
-
-    timer:sleep(200),
-
+    ok = webtransport:send(Session, StreamId, <<"hello">>, nofin),
+    <<"hello">> = collect_until(Session, StreamId, 5),
+    ok = webtransport:stop_sending(Session, StreamId, 7),
+    receive
+        {webtransport, Session, {stream_closed, StreamId, {reset, Code}}} ->
+            ?assertEqual(7, Code)
+    after 5000 ->
+        error(no_reset_after_stop_sending)
+    end,
+    ?assertEqual({error, stream_receive_side_closed},
+                 webtransport:stop_sending(Session, StreamId, 7)),
+    assert_session_usable(Session),
     webtransport:close_session(Session).
+
+%% A fresh stream still echoes.
+assert_session_usable(Session) ->
+    {ok, S} = webtransport:open_stream(Session, bidi),
+    ok = webtransport:send(Session, S, <<"ping">>, fin),
+    Echoed = collect_stream_echo(Session, S, <<>>, 5000),
+    ?assertEqual(<<"ping">>, binary:part(Echoed, byte_size(Echoed) - 4, 4)).
+
+collect_until(Session, StreamId, Size) ->
+    collect_until(Session, StreamId, Size, <<>>).
+
+collect_until(_Session, _StreamId, Size, Acc) when byte_size(Acc) >= Size ->
+    Acc;
+collect_until(Session, StreamId, Size, Acc) ->
+    receive
+        {webtransport, Session, {stream, StreamId, _, Data}} ->
+            collect_until(Session, StreamId, Size, <<Acc/binary, Data/binary>>)
+    after 5000 ->
+        error({no_data, Acc})
+    end.
 
 %% ============================================================================
 %% Session Management Tests
@@ -765,8 +822,8 @@ wait_for_pushed_bidi(Session, ClientStreamId, Acc, Timeout) ->
         error({no_pushed_bidi, Acc})
     end.
 
-%% Reason strings over 1024 bytes must be refused at the public API,
-%% matching draft-14 §4.6 and draft-15 §5.
+%% Bad close arguments must be refused at the public API (http3-17 §6,
+%% http2-16 §6.12).
 close_session_reason_too_long_test(Config) ->
     Port = proplists:get_value(port, Config),
     {ok, Session} = webtransport:connect("localhost", Port, <<"/test">>, #{
@@ -776,6 +833,11 @@ close_session_reason_too_long_test(Config) ->
     Too = binary:copy(<<"x">>, 1025),
     ?assertEqual({error, reason_too_long},
                  webtransport:close_session(Session, 1, Too)),
+    %% http3-17 §6: the reason must be UTF-8 and the code 32 bits.
+    ?assertEqual({error, invalid_reason},
+                 webtransport:close_session(Session, 1, <<16#ff>>)),
+    ?assertEqual({error, invalid_error_code},
+                 webtransport:close_session(Session, 1 bsl 32, <<>>)),
     ?assert(is_process_alive(Session)),
     ok = webtransport:close_session(Session).
 
@@ -810,6 +872,485 @@ origin_check_reject_test(Config) ->
         timer:sleep(100),
         flush_exits(),
         process_flag(trap_exit, false)
+    end.
+
+%% http3-17 §3.3, http2-16 §3.3: the client offers protocols, the server
+%% picks one of them, and the client refuses a missing pick when it
+%% requires one.
+protocol_negotiation_test(Config) ->
+    process_flag(trap_exit, true),
+    Transport = proplists:get_value(transport, Config),
+    Port = test_helpers:find_free_port(),
+    Name = list_to_atom("proto_listener_" ++ atom_to_list(Transport)),
+    {ok, _} = webtransport:start_listener(Name, #{
+        transport => Transport,
+        port => Port,
+        certfile => proplists:get_value(certfile, Config),
+        keyfile => proplists:get_value(keyfile, Config),
+        handler => wt_protocol_handler
+    }),
+    Connect = fun(Extra) ->
+        webtransport:connect("localhost", Port, <<"/test">>,
+                             maps:merge(#{transport => Transport,
+                                          verify => verify_none}, Extra))
+    end,
+    try
+        timer:sleep(100),
+        {ok, S1} = Connect(#{protocols => [<<"chat/1">>, <<"chat/2">>]}),
+        {ok, Info} = webtransport:session_info(S1),
+        ?assertEqual(<<"chat/2">>, maps:get(protocol, Info)),
+        ok = webtransport:close_session(S1),
+        {ok, S2} = Connect(#{protocols => [<<"other">>]}),
+        {ok, Info2} = webtransport:session_info(S2),
+        ?assertNot(maps:is_key(protocol, Info2)),
+        ok = webtransport:close_session(S2),
+        ?assertEqual({error, {alpn_error, no_protocol}},
+                     Connect(#{protocols => [<<"other">>], require_protocol => true})),
+        ?assertMatch({error, {http_error, 400}},
+                     Connect(#{protocols => [<<"reject-me">>]}))
+    after
+        webtransport:stop_listener(Name),
+        timer:sleep(100),
+        flush_exits(),
+        process_flag(trap_exit, false)
+    end.
+
+%% http3-17 §5.4, http2-16 §6.5/§6.6: with windows far smaller than the
+%% payload, the echo only completes if each side keeps granting credit as
+%% it consumes data (WT_MAX_DATA, and WT_MAX_STREAM_DATA on h2), and the
+%% sender queues what does not fit instead of dropping it.
+flow_control_credit_test(Config) ->
+    Port = proplists:get_value(port, Config),
+    {ok, Session} = webtransport:connect("localhost", Port, <<"/test">>, #{
+        transport => proplists:get_value(transport, Config),
+        verify => verify_none,
+        max_data => 256,
+        max_stream_data => 256
+    }),
+    {ok, StreamId} = webtransport:open_stream(Session, bidi),
+    Payload = test_helpers:random_data(16 * 1024),
+    ok = webtransport:send(Session, StreamId, Payload, fin),
+    Echoed = collect_stream_echo(Session, StreamId, <<>>, 10000),
+    Size = byte_size(Payload),
+    ?assert(byte_size(Echoed) >= Size),
+    ?assertEqual(Payload, binary:part(Echoed, byte_size(Echoed) - Size, Size)),
+    webtransport:close_session(Session).
+
+%% A WT_CLOSE_SESSION from the server reaches the client session with its
+%% code and reason (http3-17 §6, http2-16 §6.12).
+server_close_reaches_client_test(Config) ->
+    with_observer_listener(close, Config, fun(Port, Transport) ->
+        {ok, Session} = webtransport:connect("localhost", Port, <<"/test">>, #{
+            transport => Transport,
+            verify => verify_none,
+            handler_opts => #{owner => self()}
+        }, wt_close_observer_handler),
+        {ok, S} = webtransport:open_stream(Session, bidi),
+        ok = webtransport:send(Session, S, <<"close">>, fin),
+        receive
+            {terminated, Session, Reason} ->
+                ?assertEqual({closed, 5, <<"bye">>}, Reason)
+        after 5000 ->
+            error(client_session_not_closed)
+        end
+    end).
+
+%% A WT_DRAIN_SESSION from the server puts the client session in draining:
+%% new streams are refused, existing ones keep working (http3-17 §4.7).
+server_drain_reaches_client_test(Config) ->
+    with_observer_listener(drain, Config, fun(Port, Transport) ->
+        {ok, Session} = webtransport:connect("localhost", Port, <<"/test">>, #{
+            transport => Transport,
+            verify => verify_none,
+            handler_opts => #{owner => self()}
+        }, wt_close_observer_handler),
+        %% A stream the server knows and that stays open, so the drain has
+        %% something to wait for.
+        {ok, Keep} = webtransport:open_stream(Session, bidi),
+        ok = webtransport:send(Session, Keep, <<"keep ">>, nofin),
+        {ok, S} = webtransport:open_stream(Session, bidi),
+        ok = webtransport:send(Session, S, <<"drain">>, fin),
+        ok = wait_for_draining(Session, 5000),
+        ?assertEqual({error, session_draining}, webtransport:open_stream(Session, bidi)),
+        ok = webtransport:send(Session, Keep, <<"still here">>, fin),
+        webtransport:close_session(Session)
+    end).
+
+%% Actions returned by a server handler's init go out once the session is
+%% established, after the 2xx: the client sees the datagram and the stream.
+init_actions_after_accept_test(Config) ->
+    with_listener(init_actions, wt_init_actions_handler, Config, fun(Port, Transport) ->
+        {ok, Session} = webtransport:connect("localhost", Port, <<"/test">>, #{
+            transport => Transport,
+            verify => verify_none
+        }),
+        receive
+            {webtransport, Session, {datagram, D}} -> ?assertEqual(<<"hello from init">>, D)
+        after 5000 ->
+            error(no_datagram_from_init)
+        end,
+        {ok, Info} = webtransport:session_info(Session),
+        %% overview-14 §4.2: the largest datagram we can send.
+        ?assert(maps:get(max_datagram_size, Info) > 0),
+        webtransport:close_session(Session)
+    end).
+
+%% The peer's STOP_SENDING on a uni stream we opened reaches the handler,
+%% and the stream no longer accepts data.
+stop_sending_on_own_uni_test(Config) ->
+    with_observer_listener(stopme, Config, fun(Port, Transport) ->
+        {ok, Session} = webtransport:connect("localhost", Port, <<"/test">>, #{
+            transport => Transport,
+            verify => verify_none
+        }),
+        {ok, U} = webtransport:open_stream(Session, uni),
+        ok = webtransport:send(Session, U, <<"stopme">>, nofin),
+        receive
+            {webtransport, Session, {stream_closed, U, {stop_sending, 9}}} -> ok
+        after 5000 ->
+            error(no_stop_sending)
+        end,
+        ?assertMatch({error, _}, webtransport:send(Session, U, <<"more">>, nofin)),
+        webtransport:close_session(Session)
+    end).
+
+%% A server handler that stops without closing still ends the session for
+%% the client (http3-17 §6, http2-16 §3.4).
+handler_stop_closes_session_test(Config) ->
+    with_observer_listener(stop, Config, fun(Port, Transport) ->
+        {ok, Session} = webtransport:connect("localhost", Port, <<"/test">>, #{
+            transport => Transport,
+            verify => verify_none,
+            handler_opts => #{owner => self()}
+        }, wt_close_observer_handler),
+        {ok, S} = webtransport:open_stream(Session, bidi),
+        ok = webtransport:send(Session, S, <<"stop">>, fin),
+        receive
+            {terminated, Session, {closed, 0, _}} -> ok
+        after 5000 ->
+            error(client_session_not_closed)
+        end
+    end).
+
+%% A draining server session stops once its streams are done, uni streams
+%% included, and the client learns the session ended.
+drain_completes_test(Config) ->
+    with_observer_listener(drain_done, Config, fun(Port, Transport) ->
+        {ok, Session} = webtransport:connect("localhost", Port, <<"/test">>, #{
+            transport => Transport,
+            verify => verify_none,
+            handler_opts => #{owner => self()}
+        }, wt_close_observer_handler),
+        {ok, U} = webtransport:open_stream(Session, uni),
+        ok = webtransport:send(Session, U, <<"uni data">>, fin),
+        {ok, S} = webtransport:open_stream(Session, bidi),
+        ok = webtransport:send(Session, S, <<"drain">>, fin),
+        %% The server's WT_DRAIN_SESSION drains the client too; with all its
+        %% streams done the client session ends, whichever close comes first.
+        receive
+            {terminated, Session, _Reason} -> ok
+        after 5000 ->
+            error(drain_did_not_complete)
+        end
+    end).
+
+%% A reset on a stream the peer has not seen yet opens it, as in QUIC
+%% (http2-16 §5.2): the session stays up.
+reset_unseen_stream_test(Config) ->
+    Port = proplists:get_value(port, Config),
+    {ok, Session} = webtransport:connect("localhost", Port, <<"/test">>, #{
+        transport => proplists:get_value(transport, Config),
+        verify => verify_none
+    }),
+    {ok, S} = webtransport:open_stream(Session, bidi),
+    ok = webtransport:reset_stream(Session, S, 3),
+    ?assertEqual({error, invalid_error_code},
+                 webtransport:reset_stream(Session, S, 1 bsl 32)),
+    assert_session_usable(Session),
+    webtransport:close_session(Session).
+
+%% close_stream after a send larger than the peer's window: the FIN waits
+%% for the queued bytes, so the peer gets the whole stream.
+close_stream_with_queue_test(Config) ->
+    Port = proplists:get_value(port, Config),
+    {ok, Session} = webtransport:connect("localhost", Port, <<"/test">>, #{
+        transport => proplists:get_value(transport, Config),
+        verify => verify_none
+    }),
+    {ok, S} = webtransport:open_stream(Session, bidi),
+    Payload = test_helpers:random_data(1536 * 1024),
+    ok = webtransport:send(Session, S, Payload, nofin),
+    ok = webtransport:close_stream(Session, S),
+    Echoed = collect_stream_echo(Session, S, <<>>, 15000),
+    Size = byte_size(Payload),
+    ?assertEqual(Payload, binary:part(Echoed, byte_size(Echoed) - Size, Size)),
+    webtransport:close_session(Session).
+
+with_listener(Tag, Handler, Config, Fun) ->
+    process_flag(trap_exit, true),
+    Transport = proplists:get_value(transport, Config),
+    Port = test_helpers:find_free_port(),
+    Name = list_to_atom(lists:concat(["listener_", Tag, "_", Transport])),
+    {ok, _} = webtransport:start_listener(Name, #{
+        transport => Transport,
+        port => Port,
+        certfile => proplists:get_value(certfile, Config),
+        keyfile => proplists:get_value(keyfile, Config),
+        handler => Handler
+    }),
+    try
+        timer:sleep(100),
+        Fun(Port, Transport)
+    after
+        webtransport:stop_listener(Name),
+        timer:sleep(100),
+        flush_exits(),
+        process_flag(trap_exit, false)
+    end.
+
+with_observer_listener(Tag, Config, Fun) ->
+    process_flag(trap_exit, true),
+    Transport = proplists:get_value(transport, Config),
+    Port = test_helpers:find_free_port(),
+    Name = list_to_atom(lists:concat(["observer_", Tag, "_", Transport])),
+    {ok, _} = webtransport:start_listener(Name, #{
+        transport => Transport,
+        port => Port,
+        certfile => proplists:get_value(certfile, Config),
+        keyfile => proplists:get_value(keyfile, Config),
+        handler => wt_close_observer_handler
+    }),
+    try
+        timer:sleep(100),
+        Fun(Port, Transport)
+    after
+        webtransport:stop_listener(Name),
+        timer:sleep(100),
+        flush_exits(),
+        process_flag(trap_exit, false)
+    end.
+
+%% http3-17 §5.6.2, http2-16 §6.7: stream limits are cumulative. The server
+%% allows 2 bidi streams and returns credit (WT_MAX_STREAMS) as each one
+%% finishes, so the client can open many more over the session's life. A
+%% client that hits the limit is told when credit comes back
+%% (overview-14 §4.3).
+stream_credit_replenish_test(Config) ->
+    process_flag(trap_exit, true),
+    Transport = proplists:get_value(transport, Config),
+    Port = test_helpers:find_free_port(),
+    Name = list_to_atom("credit_listener_" ++ atom_to_list(Transport)),
+    {ok, _} = webtransport:start_listener(Name, #{
+        transport => Transport,
+        port => Port,
+        certfile => proplists:get_value(certfile, Config),
+        keyfile => proplists:get_value(keyfile, Config),
+        handler => wt_echo_handler,
+        max_streams_bidi => 2
+    }),
+    try
+        timer:sleep(100),
+        {ok, Session} = webtransport:connect("localhost", Port, <<"/test">>, #{
+            transport => Transport,
+            verify => verify_none
+        }),
+        {ok, Info} = webtransport:session_info(Session),
+        ?assertEqual(2, maps:get(remote_max_streams_bidi, Info)),
+        lists:foreach(fun(N) ->
+            StreamId = open_bidi_when_allowed(Session),
+            Payload = <<"msg ", (integer_to_binary(N))/binary>>,
+            ok = webtransport:send(Session, StreamId, Payload, fin),
+            Echoed = collect_stream_echo(Session, StreamId, <<>>, 5000),
+            ?assertEqual(Payload, binary:part(Echoed, byte_size(Echoed) - byte_size(Payload),
+                                              byte_size(Payload)))
+        end, lists:seq(1, 10)),
+        {ok, Info2} = webtransport:session_info(Session),
+        ?assert(maps:get(remote_max_streams_bidi, Info2) >= 10),
+        webtransport:close_session(Session)
+    after
+        webtransport:stop_listener(Name),
+        timer:sleep(100),
+        flush_exits(),
+        process_flag(trap_exit, false)
+    end.
+
+open_bidi_when_allowed(Session) ->
+    case webtransport:open_stream(Session, bidi) of
+        {ok, StreamId} ->
+            StreamId;
+        {error, stream_limit_reached} ->
+            receive
+                {webtransport, Session, {stream_credit, bidi}} ->
+                    open_bidi_when_allowed(Session)
+            after 5000 ->
+                error(no_stream_credit)
+            end
+    end.
+
+%% http3-17 §3.1, http2-16 §3.1: a client MUST NOT open a session until the
+%% server sent SETTINGS_WT_ENABLED. Run a bare server that only enables
+%% extended CONNECT.
+server_without_wt_enabled_test(Config) ->
+    process_flag(trap_exit, true),
+    Transport = proplists:get_value(transport, Config),
+    Port = test_helpers:find_free_port(),
+    Stop = start_bare_server(Transport, Port, Config),
+    try
+        timer:sleep(100),
+        ?assertEqual({error, wt_not_enabled},
+                     webtransport:connect("localhost", Port, <<"/test">>,
+                                          #{transport => Transport,
+                                            verify => verify_none}))
+    after
+        Stop(),
+        flush_exits(),
+        process_flag(trap_exit, false)
+    end.
+
+start_bare_server(h3, Port, Config) ->
+    {ok, CertPem} = file:read_file(proplists:get_value(certfile, Config)),
+    [{_, CertDer, _} | _] = public_key:pem_decode(CertPem),
+    {ok, KeyPem} = file:read_file(proplists:get_value(keyfile, Config)),
+    [KeyEntry] = public_key:pem_decode(KeyPem),
+    Name = bare_h3_server,
+    {ok, _} = quic_h3:start_server(Name, Port, #{
+        cert => CertDer,
+        key => public_key:pem_entry_decode(KeyEntry),
+        settings => #{enable_connect_protocol => 1},
+        h3_datagram_enabled => true,
+        quic_opts => #{max_datagram_frame_size => 65535, reset_stream_at => true},
+        handler => fun(C, S, _, _, _) -> quic_h3:send_response(C, S, 200, []) end
+    }),
+    fun() -> quic_h3:stop_server(Name) end;
+start_bare_server(h2, Port, Config) ->
+    {ok, Ref} = h2:start_server(Port, #{
+        cert => proplists:get_value(certfile, Config),
+        key => proplists:get_value(keyfile, Config),
+        enable_connect_protocol => true,
+        settings => #{enable_connect_protocol => 1},
+        handler => fun(C, S, _, _, _) -> h2:send_response(C, S, 200, []) end
+    }),
+    fun() -> h2:stop_server(Ref) end.
+
+%% http2-16 §7: WebTransport over HTTP/2 needs TLS 1.3 here (OTP's ssl has
+%% no extended master secret for TLS 1.2). A client does not send a
+%% WebTransport request over TLS 1.2.
+client_refuses_tls12_server_test(Config) ->
+    process_flag(trap_exit, true),
+    Port = test_helpers:find_free_port(),
+    {ok, Ref} = h2:start_server(Port, #{
+        cert => proplists:get_value(certfile, Config),
+        key => proplists:get_value(keyfile, Config),
+        enable_connect_protocol => true,
+        ssl_opts => [{versions, ['tlsv1.2']}],
+        settings => #{enable_connect_protocol => 1, 16#2b67 => 1},
+        handler => fun(C, S, _, _, _) -> h2:send_response(C, S, 200, []) end
+    }),
+    try
+        timer:sleep(100),
+        ?assertEqual({error, {tls_version_not_allowed, 'tlsv1.2'}},
+                     webtransport:connect("localhost", Port, <<"/test">>,
+                                          #{transport => h2, verify => verify_none}))
+    after
+        h2:stop_server(Ref),
+        flush_exits(),
+        process_flag(trap_exit, false)
+    end.
+
+%% Our h2 listener only offers TLS 1.3.
+listener_refuses_tls12_client_test(Config) ->
+    Port = proplists:get_value(port, Config),
+    ?assertMatch({error, _},
+                 h2:connect("localhost", Port, #{
+                     ssl_opts => [{verify, verify_none}, {versions, ['tlsv1.2']},
+                                  {alpn_advertised_protocols, [<<"h2">>]}]
+                 })).
+
+%% accept/4 from an h2 server's request handler: h2 passes method and path
+%% as arguments, so the path is given as an option.
+h2_embedded_accept_round_trip_test(Config) ->
+    process_flag(trap_exit, true),
+    Port = test_helpers:find_free_port(),
+    Opts = maps:merge(webtransport:h2_settings(), #{
+        cert => proplists:get_value(certfile, Config),
+        key => proplists:get_value(keyfile, Config),
+        handler => fun(C, S, <<"CONNECT">>, Path, Headers) ->
+            {ok, _} = webtransport:accept(C, S, Headers, #{transport => h2,
+                                                           handler => wt_echo_handler,
+                                                           path => Path})
+        end
+    }),
+    {ok, Ref} = h2:start_server(Port, Opts),
+    try
+        timer:sleep(100),
+        {ok, Session} = webtransport:connect("localhost", Port, <<"/embedded">>,
+                                             #{transport => h2, verify => verify_none}),
+        assert_session_usable(Session),
+        webtransport:close_session(Session)
+    after
+        h2:stop_server(Ref),
+        flush_exits(),
+        process_flag(trap_exit, false)
+    end.
+
+%% A server embedding accept/4 on a TLS 1.2 connection treats the request
+%% as malformed: the CONNECT stream is reset with PROTOCOL_ERROR.
+accept_refuses_tls12_test(Config) ->
+    process_flag(trap_exit, true),
+    Port = test_helpers:find_free_port(),
+    Opts = maps:merge(webtransport:h2_settings(), #{
+        cert => proplists:get_value(certfile, Config),
+        key => proplists:get_value(keyfile, Config),
+        ssl_opts => [{versions, ['tlsv1.2']}],
+        handler => fun(C, S, _M, _P, Headers) ->
+            webtransport:accept(C, S, Headers, #{transport => h2, handler => wt_echo_handler})
+        end
+    }),
+    {ok, Ref} = h2:start_server(Port, Opts),
+    try
+        timer:sleep(100),
+        {ok, Conn} = h2:connect("localhost", Port, #{
+            ssl_opts => [{verify, verify_none}, {versions, ['tlsv1.2']},
+                         {alpn_advertised_protocols, [<<"h2">>]}]
+        }),
+        Headers = [{<<":protocol">>, <<"webtransport">>},
+                   {<<":scheme">>, <<"https">>},
+                   {<<":path">>, <<"/test">>},
+                   {<<"host">>, <<"localhost">>}],
+        {ok, Sid} = h2:request(Conn, <<"CONNECT">>, <<"/test">>, Headers),
+        receive
+            {h2, Conn, {stream_reset, Sid, Code}} -> ?assertEqual(protocol_error, Code)
+        after 5000 ->
+            error(no_reset)
+        end,
+        h2:close(Conn)
+    after
+        h2:stop_server(Ref),
+        flush_exits(),
+        process_flag(trap_exit, false)
+    end.
+
+%% http2-16 §4.3.2: a WebTransport-Init that does not hold valid values is
+%% rejected with a 4xx.
+invalid_webtransport_init_test(Config) ->
+    Port = proplists:get_value(port, Config),
+    {ok, Conn} = h2:connect("localhost", Port, #{
+        ssl_opts => [{verify, verify_none}, {alpn_advertised_protocols, [<<"h2">>]}]
+    }),
+    try
+        Headers = [{<<":protocol">>, <<"webtransport">>},
+                   {<<":scheme">>, <<"https">>},
+                   {<<":path">>, <<"/test">>},
+                   {<<"host">>, <<"localhost">>},
+                   {<<"webtransport-init">>, <<"u=abc">>}],
+        {ok, Sid} = h2:request(Conn, <<"CONNECT">>, <<"/test">>, Headers),
+        receive
+            {h2, Conn, {response, Sid, Status, _}} -> ?assertEqual(400, Status)
+        after 5000 ->
+            error(no_response)
+        end
+    after
+        h2:close(Conn)
     end.
 
 collect_stream_echo(Session, StreamId, Acc, Timeout) ->

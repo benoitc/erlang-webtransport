@@ -122,8 +122,26 @@ reset_stream_test() ->
     S = webtransport_stream:new(4, bidi, 100),
     {ok, _, S1} = webtransport_stream:send(S, <<"buffered data">>),
     S2 = webtransport_stream:reset(S1, 42),
-    ?assertEqual(closed, webtransport_stream:state(S2)),
+    %% Only our send side closes; the peer may still send on a bidi stream.
+    ?assertEqual(half_closed_local, webtransport_stream:state(S2)),
+    ?assertNot(webtransport_stream:is_writable(S2)),
+    ?assert(webtransport_stream:is_readable(S2)),
     ?assertEqual(<<>>, webtransport_stream:send_buffer(S2)).
+
+receive_reset_test_() ->
+    S = webtransport_stream:new(4, bidi, 100),
+    {ok, S1} = webtransport_stream:receive_reset(S, 7),
+    {ok, Fin} = webtransport_stream:receive_fin(S),
+    [
+        ?_assertEqual(half_closed_remote, webtransport_stream:state(S1)),
+        ?_assertNot(webtransport_stream:is_readable(S1)),
+        ?_assert(webtransport_stream:is_writable(S1)),
+        ?_assertEqual(7, webtransport_stream:remote_reset_code(S1)),
+        ?_assertEqual({error, invalid_state}, webtransport_stream:receive_reset(S1, 7)),
+        ?_assertEqual({error, invalid_state}, webtransport_stream:receive_reset(Fin, 7)),
+        ?_assertEqual(closed,
+                      webtransport_stream:state(webtransport_stream:reset(S1, 1)))
+    ].
 
 stop_sending_test() ->
     S = webtransport_stream:new(4, bidi, 100),

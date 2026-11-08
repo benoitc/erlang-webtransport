@@ -15,6 +15,7 @@
 
 -export([init/2, init/3, handle_stream/4, handle_stream_fin/4]).
 -export([handle_datagram/2, handle_stream_closed/3, terminate/2]).
+-export([handle_stream_credit/2]).
 
 -record(state, {
     owner :: pid(),
@@ -42,6 +43,10 @@ handle_datagram(Data, #state{owner = Owner, session = Session} = State) ->
 
 handle_stream_closed(StreamId, Reason, #state{owner = Owner, session = Session} = State) ->
     Owner ! {webtransport, Session, {stream_closed, StreamId, Reason}},
+    {ok, State}.
+
+handle_stream_credit(Type, #state{owner = Owner, session = Session} = State) ->
+    Owner ! {webtransport, Session, {stream_credit, Type}},
     {ok, State}.
 
 terminate(_Reason, #state{owner = Owner, session = Session}) ->

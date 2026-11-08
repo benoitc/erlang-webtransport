@@ -3,22 +3,24 @@
 %%
 %% @doc WebTransport Protocol Definitions
 %%
-%% draft-ietf-webtrans-overview-12 - Protocol Framework
-%% draft-ietf-webtrans-http2-14 - WebTransport over HTTP/2
-%% draft-ietf-webtrans-http3-15 - WebTransport over HTTP/3
+%% draft-ietf-webtrans-overview-14 - Protocol Framework
+%% draft-ietf-webtrans-http2-16 - WebTransport over HTTP/2
+%% draft-ietf-webtrans-http3-17 - WebTransport over HTTP/3
 
 -ifndef(WEBTRANSPORT_HRL).
 -define(WEBTRANSPORT_HRL, 1).
 
 %% ============================================================================
-%% HTTP/2 WebTransport Capsule Types (draft-ietf-webtrans-http2-14)
+%% HTTP/2 WebTransport Capsule Types (draft-ietf-webtrans-http2-16)
 %% ============================================================================
 
 -define(WT_PADDING,              16#190B4D38).
 -define(WT_RESET_STREAM,         16#190B4D39).
 -define(WT_STOP_SENDING,         16#190B4D3A).
--define(WT_STREAM,               16#190B4D3B).
--define(WT_STREAM_FIN,           16#190B4D3C).
+%% http2-16 §6.4: the low bit of the type is FIN, so 0x3C carries data
+%% and 0x3B ends the stream.
+-define(WT_STREAM,               16#190B4D3C).
+-define(WT_STREAM_FIN,           16#190B4D3B).
 -define(WT_MAX_DATA,             16#190B4D3D).
 -define(WT_MAX_STREAM_DATA,      16#190B4D3E).
 -define(WT_MAX_STREAMS_BIDI,     16#190B4D3F).
@@ -27,14 +29,12 @@
 -define(WT_STREAM_DATA_BLOCKED,  16#190B4D42).
 -define(WT_STREAMS_BLOCKED_BIDI, 16#190B4D43).
 -define(WT_STREAMS_BLOCKED_UNI,  16#190B4D44).
--define(WT_CLOSE_SESSION,        16#190B4D45).
--define(WT_DRAIN_SESSION,        16#190B4D46).
 
 %% HTTP Datagram capsule (RFC 9297)
 -define(DATAGRAM,                16#00).
 
 %% ============================================================================
-%% HTTP/3 WebTransport (draft-ietf-webtrans-http3-15)
+%% HTTP/3 WebTransport (draft-ietf-webtrans-http3-17)
 %% ============================================================================
 
 %% HTTP/3 Settings.
@@ -47,15 +47,26 @@
 %% upstream library:
 -define(SETTINGS_ENABLE_WEBTRANSPORT_DRAFT02, 16#2b603742).
 
+%% SETTINGS_WT_ENABLED. The codepoint selects the draft version (http3-17
+%% §7.1). quic maps the `wt_enabled' atom to one of the h3 values depending
+%% on its release, so these integer keys are what we send and look up.
+-define(SETTINGS_WT_ENABLED_H3,     16#20b8933b).  %% http3-17
+-define(SETTINGS_WT_ENABLED_H3_D15, 16#2c7cf000).  %% http3-15
+-define(SETTINGS_WT_ENABLED_H2,     16#2b67).      %% http2-16
+
 %% HTTP/3 Unidirectional Stream Type
 -define(WT_UNI_STREAM_TYPE, 16#54).
 
 %% HTTP/3 Bidirectional Stream Signal
 -define(WT_BIDI_SIGNAL, 16#41).
 
-%% HTTP/3 Capsule Types (session management)
--define(WT_CLOSE_SESSION_H3, 16#2843).
--define(WT_DRAIN_SESSION_H3, 16#78ae).
+%% Session management capsules. Defined in http3-17 §6 and §4.7, and used
+%% unchanged by http2-16 §6.12 and §6.13.
+-define(WT_CLOSE_SESSION, 16#2843).
+-define(WT_DRAIN_SESSION, 16#78ae).
+
+%% Longest WT_CLOSE_SESSION reason, in bytes (http3-17 §6).
+-define(WT_CLOSE_REASON_MAX, 1024).
 
 %% HTTP/3 Error Codes
 -define(WT_BUFFERED_STREAM_REJECTED, 16#3994bd84).
@@ -63,6 +74,18 @@
 -define(WT_FLOW_CONTROL_ERROR,       16#045d4487).
 -define(WT_ALPN_ERROR,               16#0817b3dd).
 -define(WT_REQUIREMENTS_NOT_MET,     16#212c0d48).
+
+%% HTTP/3 error codes used by WebTransport (RFC 9114 §8.1)
+-define(H3_ID_ERROR,          16#108).
+-define(H3_SETTINGS_ERROR,    16#109).
+-define(H3_REQUEST_REJECTED,  16#10b).
+-define(H3_MESSAGE_ERROR,     16#10e).
+
+%% HTTP/2 session error kinds (http2-16 §3.4). Their HTTP/2 error codes are
+%% not assigned yet (0xTBD), so these are internal names only; on the wire a
+%% session error is WT_CLOSE_SESSION followed by RST_STREAM(PROTOCOL_ERROR).
+-define(WT_ERROR_GENERIC, wt_error).
+-define(WT_STREAM_STATE_ERROR, wt_stream_state_error).
 
 %% Application error code base
 -define(WT_APP_ERROR_FIRST, 16#52e4a40fa8db).
