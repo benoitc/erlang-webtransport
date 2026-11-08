@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+- Requires quic 2.6.1.
+- When `open_stream` fails because the QUIC connection is out of streams,
+  the handler is now told through `handle_stream_credit/2` when it can try
+  again, as it already was for the session's own stream limit. Before, you
+  had to poll. This matters most for Chrome, Firefox and Safari 26
+  sessions, where the QUIC limit is the only one.
+- A client whose server does not allow a new stream yet now waits for one,
+  within `timeout`, instead of failing the connect at once. This applies to
+  HTTP/3 and HTTP/2.
+
 ## 0.5.2 - 2026-11-08
 
 - Accepts h2 0.15.0. 0.5.1 required h2 0.14, so a project that also needs

@@ -33,7 +33,7 @@
 
 %% Internal API (called by transport layers)
 -export([handle_capsule/2, handle_stream_data/4, handle_datagram_data/2]).
--export([established/1, established/2, goaway/2]).
+-export([established/1, established/2, goaway/2, transport_streams_available/2]).
 -export([handle_stream_opened/3, handle_stream_closed/3]).
 
 %% gen_statem callbacks
@@ -91,6 +91,9 @@
     %% Stream types we failed to open for lack of credit; the handler is told
     %% when credit comes back (overview-14 §4.3).
     blocked = #{} :: #{bidi | uni => true},
+    %% Types refused by the QUIC connection's stream limit (h3), waiting
+    %% for quic's streams_available notice.
+    transport_blocked = #{} :: #{bidi | uni => true},
     %% Flags
     is_server :: boolean(),
     close_info :: undefined | {non_neg_integer(), binary()}
@@ -185,6 +188,12 @@ established(Session) ->
 -spec established(session(), map()) -> ok.
 established(Session, Info) ->
     gen_statem:cast(Session, {established, Info}).
+
+%% @doc The QUIC connection can open a stream of this type again, after an
+%% open was refused with `stream_limit' (h3, sent by the router).
+-spec transport_streams_available(session(), bidi | uni) -> ok.
+transport_streams_available(Session, Type) ->
+    gen_statem:cast(Session, {streams_available, Type}).
 
 %% @doc The connection received GOAWAY: no new streams (http3-17 §4.7).
 -spec goaway(session(), non_neg_integer()) -> ok.
@@ -371,6 +380,9 @@ open({call, From}, {open_stream, Type}, #data{} = StateData) ->
             {keep_state, StateData1, [{reply, From, {ok, StreamId}}]};
         {error, stream_limit_reached = Reason} ->
             {keep_state, mark_blocked(Type, StateData), [{reply, From, {error, Reason}}]};
+        {error, stream_limit = Reason} ->
+            {keep_state, mark_transport_blocked(Type, StateData),
+             [{reply, From, {error, Reason}}]};
         {error, Reason} ->
             {keep_state, StateData, [{reply, From, {error, Reason}}]}
     end;
@@ -415,6 +427,8 @@ open(cast, {established, _}, StateData) ->
 open(cast, established, #data{pending_actions = Actions} = StateData) ->
     {StateData1, Transition} = handle_actions(Actions, StateData#data{pending_actions = []}),
     open_apply_transition(Transition, StateData1);
+open(cast, {streams_available, Type}, StateData) ->
+    transition_result(on_transport_streams_available(Type, StateData));
 open(cast, {goaway, Id}, StateData) ->
     %% http3-17 §4.7: GOAWAY asks every session to shut down; stop opening
     %% streams and let the handler know.
@@ -714,6 +728,24 @@ fail_session(Code, Reason, StateData) ->
 
 mark_blocked(Type, #data{blocked = Blocked} = StateData) ->
     StateData#data{blocked = Blocked#{Type => true}}.
+
+mark_transport_blocked(Type, #data{transport_blocked = Blocked} = StateData) ->
+    StateData#data{transport_blocked = Blocked#{Type => true}}.
+
+%% quic says a stream of this type can open again. Tell the handler if an
+%% open was refused for it, unless the session's own limit still holds; that
+%% one is told when the peer raises it.
+on_transport_streams_available(Type, #data{transport_blocked = Blocked} = StateData) ->
+    case maps:take(Type, Blocked) of
+        error ->
+            {StateData, continue};
+        {_, Blocked1} ->
+            StateData1 = StateData#data{transport_blocked = Blocked1},
+            case streams_available(Type, StateData1) > 0 of
+                true -> notify_stream_credit([Type], StateData1, continue);
+                false -> {mark_blocked(Type, StateData1), continue}
+            end
+    end.
 
 %% overview-14 §4.3: tell the handler when stream credit comes back for a
 %% type it failed to open, through the optional handle_stream_credit/2.
@@ -1745,6 +1777,8 @@ dispatch_action({open_stream, Type} = Action, StateData) ->
             {StateData1, continue};
         {error, stream_limit_reached = Reason} ->
             handle_action_failure(Action, Reason, mark_blocked(Type, StateData));
+        {error, stream_limit = Reason} ->
+            handle_action_failure(Action, Reason, mark_transport_blocked(Type, StateData));
         {error, Reason} ->
             handle_action_failure(Action, Reason, StateData)
     end;
@@ -1998,6 +2032,22 @@ test_data() ->
           local_max_streams_bidi = 3, local_max_streams_uni = 3,
           is_server = true, next_bidi_id = 1, next_uni_id = 3,
           request = #{}, handler = undefined, handler_state = undefined}.
+
+%% quic's streams_available clears a type refused by the QUIC limit; if
+%% the session's own limit is also used up, the type waits for that one.
+transport_streams_available_test_() ->
+    Blocked = (test_data())#data{transport = h3, transport_blocked = #{bidi => true}},
+    Exhausted = Blocked#data{opened_bidi = 10},
+    {Cleared, continue} = on_transport_streams_available(bidi, Blocked),
+    {Waiting, continue} = on_transport_streams_available(bidi, Exhausted),
+    [
+        ?_assertEqual(#{}, Cleared#data.transport_blocked),
+        ?_assertEqual(#{}, Cleared#data.blocked),
+        ?_assertEqual(#{}, Waiting#data.transport_blocked),
+        ?_assertEqual(#{bidi => true}, Waiting#data.blocked),
+        %% A type that was not refused is left alone.
+        ?_assertEqual({Blocked, continue}, on_transport_streams_available(uni, Blocked))
+    ].
 
 max_streams_rules_test_() ->
     Data = test_data(),

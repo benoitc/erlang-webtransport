@@ -179,9 +179,16 @@ Return a value that is in `Offered`; anything else fails the request with
 
 ### `handle_stream_credit/2` (optional)
 
-Called when the peer raises its stream limit after an `open_stream` of that
-type failed with `{error, stream_limit_reached}`. Opening a stream of `Type`
-will now succeed.
+Called when a stream of `Type` can be opened again after an `open_stream` of
+that type failed:
+
+- with `{error, stream_limit_reached}`: the peer raised the session's stream
+  limit;
+- with `{error, stream_limit}` (HTTP/3): the QUIC connection, whose stream
+  limit all sessions on it share, can open a stream again.
+
+Another session on the same connection may take the stream first, so the
+next `open_stream` can still fail; you are told again when it frees up.
 
 ```erlang
 handle_stream_credit(bidi | uni, State) ->

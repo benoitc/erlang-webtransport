@@ -228,6 +228,8 @@ h3_settings(Opts) ->
         stream_reset_final_size => true,
         %% http3-17 §7.1: hold requests until the client's SETTINGS are in.
         defer_requests_until_settings => true,
+        %% Tell us when a stream refused at the peer's limit can open.
+        notify_streams_available => true,
         quic_opts => #{
             max_datagram_frame_size => 65535,
             reset_stream_at => true
@@ -1151,6 +1153,8 @@ start_h3_listener(Name, Opts) ->
                 %% http3-17 §7.1: hold requests until the client's SETTINGS
                 %% are in, since they select the draft version.
                 defer_requests_until_settings => true,
+                %% Tell us when a stream refused at the peer's limit can open.
+                notify_streams_available => true,
                 %% `sni_callback' rides inside `quic_opts' so it reaches
                 %% `quic:start_server'; `quic_h3' only lifts cert/key from
                 %% the top level. quic selects the cert per ClientHello SNI.
@@ -1543,6 +1547,7 @@ build_h3_connect_opts(Opts) ->
         quic_opts => build_client_quic_opts(Opts),
         h3_datagram_enabled => true,
         stream_reset_final_size => true,
+        notify_streams_available => true,
         stream_type_handler => fun
             (uni,  _, 16#54) -> claim;
             (bidi, _, 16#41) -> claim;
@@ -1658,14 +1663,39 @@ h3_validate_and_request(H3Conn, Authority, Path, Opts, Handler, Router) ->
 
 
 h3_send_connect(H3Conn, Authority, Path, Opts, Handler, Router, CompatMode) ->
+    Deadline = erlang:monotonic_time(millisecond) + maps:get(timeout, Opts, 30000),
+    h3_send_connect(H3Conn, Authority, Path, Opts, Handler, Router, CompatMode, Deadline).
+
+h3_send_connect(H3Conn, Authority, Path, Opts, Handler, Router, CompatMode, Deadline) ->
     Headers = protocol_headers(Opts) ++ maps:get(headers, Opts, []),
     case wt_h3:request_session(H3Conn, Authority, Path, Headers, CompatMode) of
         {ok, SessionId} ->
             ok = webtransport_h3_router:expect_session(Router, SessionId),
             h3_await_response(H3Conn, SessionId, Authority, Path, Opts, Handler, Router);
+        {error, stream_limit} ->
+            %% The server allows no request stream yet: wait for quic_h3 to
+            %% say one can open, within the connect timeout.
+            case h3_await_stream(H3Conn, Deadline) of
+                ok ->
+                    h3_send_connect(H3Conn, Authority, Path, Opts, Handler, Router,
+                                    CompatMode, Deadline);
+                {error, Reason} ->
+                    quic_h3:close(H3Conn),
+                    {error, Reason}
+            end;
         {error, Reason} ->
             quic_h3:close(H3Conn),
             {error, Reason}
+    end.
+
+h3_await_stream(H3Conn, Deadline) ->
+    receive
+        {quic_h3, H3Conn, {streams_available, bidi}} -> ok;
+        {quic_h3, H3Conn, {goaway, _}} -> {error, goaway};
+        {quic_h3, H3Conn, {closed, _}} -> {error, connection_closed};
+        {quic_h3, H3Conn, closed} -> {error, connection_closed}
+    after max(0, Deadline - erlang:monotonic_time(millisecond)) ->
+        {error, timeout}
     end.
 
 h3_await_response(H3Conn, SessionId, Authority, Path, Opts, Handler, Router) ->
@@ -1881,6 +1911,26 @@ read_cacerts_file(CAFile) ->
 
 -ifdef(TEST).
 -include_lib("eunit/include/eunit.hrl").
+
+%% A CONNECT refused at the server's stream limit is sent again once
+%% quic_h3 says a stream can open, and fails at the timeout otherwise.
+h3_connect_waits_for_stream_test_() ->
+    Run = fun(Notice) ->
+        Owner = self(),
+        Conn = spawn(fun() ->
+            Reply = fun(R) -> receive {'$gen_call', From, _} -> gen:reply(From, R) end end,
+            Reply({error, stream_limit}),
+            [Owner ! {quic_h3, self(), {streams_available, bidi}} || Notice],
+            Reply({error, refused_again}),
+            receive _ -> ok after 500 -> ok end
+        end),
+        h3_send_connect(Conn, <<"localhost">>, <<"/wt">>, #{timeout => 300},
+                        undefined, undefined, latest)
+    end,
+    [
+        ?_assertEqual({error, refused_again}, Run(true)),
+        ?_assertEqual({error, timeout}, Run(false))
+    ].
 
 %% http3-17 §5.1: a second session on a connection without flow control is
 %% refused; with flow control declared by both sides it is accepted.
