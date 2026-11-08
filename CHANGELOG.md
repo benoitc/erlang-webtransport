@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.5.1 - 2026-11-08
 
 - Safari 26 can now open WebTransport sessions over HTTP/3. It speaks
   draft-07 and gave up on servers that did not advertise it, so it failed
