@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- quic bumped to 2.2.1. The version constraint is now `~> 2.2`.
+- h2 bumped to 0.12.5.
+
 ## 0.4.8 - 2026-10-03
 
 - Payloads larger than one HTTP/2 DATA frame are no longer truncated on h2.
