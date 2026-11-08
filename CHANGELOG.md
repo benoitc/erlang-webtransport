@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Requires h2 0.15.0. Nothing changes for WebTransport users.
+
 ## 0.5.1 - 2026-11-08
 
 - Safari 26 can now open WebTransport sessions over HTTP/3. It speaks
