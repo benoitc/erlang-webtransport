@@ -1,13 +1,14 @@
 ---
 name: spec-review
-description: Check a change, commit or pull request in erlang-webtransport against the WebTransport drafts and RFCs it claims to follow (draft-ietf-webtrans-http3, -http2, -overview, RFC 9297, 9220, 8441, 9114, 9651). Use when reviewing a PR, before merging a protocol fix, or when asked whether code complies with the spec. For a full audit of the library, use spec-compliance instead.
+description: Check a change, commit or pull request in erlang-webtransport for compliance, latest spec revision and safety against the WebTransport drafts and RFCs it claims to follow (draft-ietf-webtrans-http3, -http2, -overview, RFC 9297, 9220, 8441, 9114, 9651). Use when reviewing a PR, before merging a protocol fix, or when asked whether code complies with the spec. For a full audit of the library, use spec-compliance instead.
 ---
 
 # Spec review
 
 Use this to decide whether a change does what the spec says, no more and no
-less. It applies to one commit at a time; a PR with several commits gets one
-verdict per commit.
+less, and stays safe against a hostile peer. These are the three checks
+AGENTS.md requires: compliance, latest spec, safety. It applies to one
+commit at a time; a PR with several commits gets one verdict per commit.
 
 ## 1. Get the spec text
 
@@ -59,7 +60,23 @@ For each commit:
    draft says "MAY" or "SHOULD" breaks interop with peers that are allowed
    to do it.
 
-## 3. Check the test
+## 3. Check safety
+
+The peer is untrusted, on both the server and the client side. For every
+resource the change touches, find the bound:
+
+- streams or datagrams that arrive before their session (router parking);
+- capsules being reassembled, close reasons, header fields;
+- the number of streams, sessions and reservations per connection;
+- flow-control credit: a peer that never returns credit, or raises it
+  without limit, must not make us buffer without bound;
+- send buffers, on both transports (the h2 per-stream cap, quic's stream
+  buffers).
+
+An unbounded resource that the spec bounds is a spec bug (see AGENTS.md), not
+a security issue: fix it in public and cite the section.
+
+## 4. Check the test
 
 - The test fails on main without the fix and passes with it. Run it both
   ways.
@@ -69,7 +86,7 @@ For each commit:
   `scripts/interop_cross.sh` (docker), and a browser when browsers are
   affected (see CONTRIBUTING.md).
 
-## 4. Report
+## 5. Report
 
 One line per commit:
 
@@ -77,6 +94,7 @@ One line per commit:
 <sha> <subject>
   spec: draft-ietf-webtrans-http3-17 §6 MUST, quote verified | quote not found | paraphrased
   verdict: compliant | partial (<what is missing>) | wrong (<why>) | not a spec item (<what it is>)
+  safety: bounded | unbounded (<resource>) | not applicable
   test: fails before, passes after | does not discriminate | missing
 ```
 

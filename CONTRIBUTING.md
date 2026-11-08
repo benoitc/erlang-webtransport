@@ -5,6 +5,62 @@ library, start with [docs/getting-started.md](docs/getting-started.md).
 [docs/compliance.md](docs/compliance.md) lists what the library implements
 from each draft and the known gaps.
 
+## Write for the person who reads it
+
+Every issue, pull request and comment is read by a person. Make it easy for
+them.
+
+- Read what you send before you send it. You are responsible for every line,
+  whether you wrote it or a tool did.
+- Use plain English and short sentences. Say what happens, what you
+  expected, and how to reproduce it. Explain any term a reader may not know.
+- Don't inflate it. No buzzwords, no severity scores, CVSS or CWE labels, no
+  "critical" for a bug, no long generated write-ups. If it takes a page to
+  explain, cut it down until it doesn't.
+- A bug report gives: the library version, the transport (HTTP/3 or
+  HTTP/2), the peer (browser and version, or library), the options you set,
+  a minimal handler and the steps that show the problem, what you got and
+  what you expected.
+- A pull request says what was wrong and why it matters, the fix in a few
+  lines, and any breaking change. Link the issue. Don't walk through the diff
+  file by file; the reviewer reads the code.
+- A fix comes with a test that fails without it.
+
+AI tools are fine to use. Before you open anything, you must have read the
+change, run the tests, and be able to answer questions about it yourself.
+
+Maintainers read every issue and pull request before acting on it. We close
+without further review:
+
+- text we cannot understand after one request to clarify;
+- descriptions that don't match the code or the reproduction;
+- reports that cannot be reproduced;
+- submissions opened by an automated agent that no person has read.
+
+## Security issues and specification bugs
+
+The library implements WebTransport over HTTP/3 and HTTP/2 and the specs
+they build on. The list is in [AGENTS.md](https://github.com/benoitc/erlang-webtransport/blob/main/AGENTS.md#specifications).
+
+When the fix is to make the library do what one of these specifications
+says, it is a bug, not a security issue. That includes reports described as
+denial of service, resource exhaustion or desync, when they come from:
+
+- input accepted, rejected or framed differently from the specification;
+- the HTTP/3 and HTTP/2 paths disagreeing on the same rule;
+- a session or stream state change the specification does not allow;
+- a missing bound that the specification or an option defines.
+
+Report these as a normal bug, in public. Cite the specification section.
+The fix goes in a public pull request and in the CHANGELOG. We don't publish
+advisories or request CVEs for them, and advisories filed for them are
+closed with a link to the fix.
+
+Only problems that are not a specification deviation go through
+[SECURITY.md](SECURITY.md): code execution, file access, one session's data
+reaching another session or peer, or the library weakening TLS or
+certificate checks.
+
 ## Set up
 
 You need Erlang/OTP 27 or later and rebar3. rebar3 fetches the two
