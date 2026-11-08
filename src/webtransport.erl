@@ -120,10 +120,11 @@
     %% an `ssl' `sni_fun'. When the callback returns `{error, _}' (or raises)
     %% the static cert is used for h2; for h3 the handshake fails.
     sni_callback => sni_callback(),
-    %% `compat_mode' selects which WebTransport HTTP/3 draft the listener
-    %% accepts. Default `auto' accepts draft-15 and draft-02 and picks the
-    %% matching code path per CONNECT. Pin to `latest' to refuse draft-02
-    %% clients or to `legacy_browser_compat' to refuse draft-15 clients.
+    %% `compat_mode' selects which WebTransport HTTP/3 drafts the listener
+    %% accepts. Default `auto' accepts http3-17 and -15 (`latest') and the
+    %% legacy drafts, draft-02 and http3-07, and picks the matching code
+    %% path per CONNECT. Pin to `latest' to refuse legacy clients or to
+    %% `legacy_browser_compat' to accept only legacy ones.
     compat_mode => latest | legacy_browser_compat | auto
 }.
 
@@ -151,11 +152,11 @@
     %% (`{webtransport, session_ticket, Ticket}'). Opaque term, passed back to
     %% the QUIC layer as-is. h3 only.
     session_ticket => term(),
-    %% Clients pick an explicit compat mode. Default `latest' sends
-    %% draft-15 SETTINGS and `:protocol = webtransport-h3'. Use
-    %% `legacy_browser_compat' only when talking to a known draft-02 peer
-    %% (Chrome / Firefox / quic-go v0.9).
-    compat_mode => latest | legacy_browser_compat
+    %% Clients pick an explicit compat mode. Default `latest' speaks
+    %% http3-17. Use `legacy_browser_compat' only when talking to a known
+    %% draft-02 peer (quic-go v0.9 and older), `draft07' for an http3-07
+    %% one.
+    compat_mode => latest | legacy_browser_compat | draft07
 }.
 
 -export_type([session/0, stream/0, request/0]).
@@ -434,8 +435,17 @@ check_peer(h3, Conn, _Headers, #{compat_mode := latest} = Ctx) ->
                     {reset, ?H3_MESSAGE_ERROR, Reason}
             end
     end;
-check_peer(h3, _Conn, _Headers, Ctx) ->
-    {ok, Ctx#{wt_draft => draft02}};
+%% Legacy: draft-02 or http3-07, told apart by the client's SETTINGS and
+%% the draft-02 header. The listener holds requests until the SETTINGS
+%% arrive (http3-07 §3.1); a request an embedder passes on before them is
+%% taken as draft-02, as before.
+check_peer(h3, Conn, Headers, Ctx) ->
+    Settings = case quic_h3:get_peer_settings(Conn) of
+        undefined -> #{};
+        S -> S
+    end,
+    {ok, Ctx#{wt_draft => wt_h3:legacy_draft(Headers, Settings),
+              peer_settings => Settings}};
 %% h2: http2-16 §4.3.2: a WebTransport-Init field that does not parse, or
 %% that has an invalid value for a defined key, rejects the request.
 check_peer(h2, Conn, Headers, Ctx) ->
@@ -470,6 +480,8 @@ check_h2_init(Conn, Headers, Ctx) ->
 %% http3-17 §5.1: without flow control a connection carries one session; a
 %% server resets further CONNECT streams with H3_REQUEST_REJECTED. Flow
 %% control is in force when both sides sent a non-zero initial limit.
+%% http3-07 §3.4: we advertise one session per connection and reset the
+%% CONNECT streams above it the same way.
 %% Every h3 session holds a slot in the router from here until it registers,
 %% so concurrent requests are counted too.
 check_session_limit(h3, Router, StreamId, Opts, Ctx) when is_pid(Router) ->
@@ -491,6 +503,8 @@ alone_required(Opts, #{compat_mode := latest} = Ctx) ->
     WeDeclare = lists:any(fun(K) -> maps:get(K, Opts, 1) > 0 end,
                           [max_data, max_streams_bidi, max_streams_uni]),
     not (PeerDeclares andalso WeDeclare);
+alone_required(_Opts, #{wt_draft := draft07}) ->
+    true;
 alone_required(_Opts, _Ctx) ->
     false.
 
@@ -561,6 +575,9 @@ start_accepted(Transport, Conn, StreamId, Headers, Handler, HandlerOpts, Opts, R
         max_stream_data => maps:get(max_stream_data, Opts, ?DEFAULT_MAX_STREAM_DATA),
         max_streams_bidi => maps:get(max_streams_bidi, Opts, ?DEFAULT_MAX_STREAMS_BIDI),
         max_streams_uni => maps:get(max_streams_uni, Opts, ?DEFAULT_MAX_STREAMS_UNI),
+        %% A listener pinned to legacy mode sends no flow-control SETTINGS.
+        declared_flow_control =>
+            maps:get(compat_mode, Opts, auto) =/= legacy_browser_compat,
         peer_settings => maps:get(peer_settings, Ctx, #{}),
         peer_stream_data => maps:get(peer_stream_data, Ctx, #{}),
         webtransport_init => maps:get(webtransport_init, Ctx, #{})
@@ -1516,10 +1533,7 @@ build_h3_connect_opts(Opts) ->
     %% Client picks a compat_mode explicitly; default `latest' (http3-17).
     %% Clients must not auto-probe the server, so the default is a single
     %% disjoint handshake shape.
-    CompatMode = case maps:get(compat_mode, Opts, latest) of
-        legacy_browser_compat -> legacy_browser_compat;
-        _ -> latest
-    end,
+    CompatMode = client_compat_mode(Opts),
     WTSettings = wt_h3:client_settings(CompatMode, Opts),
     BaseOpts = #{
         settings => WTSettings,
@@ -1606,8 +1620,27 @@ authority(Host, Port) when is_binary(Host) ->
 is_ipv6_literal(<<"[", _/binary>>) -> false;
 is_ipv6_literal(Host) -> binary:match(Host, <<":">>) =/= nomatch.
 
+%% The draft a client speaks: http3-17 unless told otherwise.
+client_compat_mode(Opts) ->
+    case maps:get(compat_mode, Opts, latest) of
+        legacy_browser_compat -> legacy_browser_compat;
+        draft07 -> draft07;
+        _ -> latest
+    end.
+
+%% Only an http3-17 client sends the flow-control SETTINGS.
+client_declares_flow_control(Opts) ->
+    client_compat_mode(Opts) =:= latest.
+
+client_draft(Opts) ->
+    case client_compat_mode(Opts) of
+        latest -> h3_17;
+        legacy_browser_compat -> draft02;
+        draft07 -> draft07
+    end.
+
 h3_validate_and_request(H3Conn, Authority, Path, Opts, Handler, Router) ->
-    CompatMode = maps:get(compat_mode, Opts, latest),
+    CompatMode = client_compat_mode(Opts),
     QuicConn = quic_h3:get_quic_conn(H3Conn),
     case wt_h3:validate_wt_support(H3Conn, QuicConn, CompatMode) of
         ok ->
@@ -1675,7 +1708,7 @@ h3_start_session(H3Conn, SessionId, Authority, Path, Headers, Opts, Handler, Rou
         undefined -> webtransport_client_handler;
         _ -> Handler
     end,
-    Request = client_request(Path, Authority, Headers, Protocol, h3_17),
+    Request = client_request(Path, Authority, Headers, Protocol, client_draft(Opts)),
     SessionOpts = client_session_opts(Request, Opts),
     case webtransport_session:start_link(h3, TransportState, ActualHandler, SessionOpts) of
         {ok, Session} ->
@@ -1737,7 +1770,8 @@ client_session_opts(Request, Opts) ->
         max_data => maps:get(max_data, Opts, ?DEFAULT_MAX_DATA),
         max_stream_data => maps:get(max_stream_data, Opts, ?DEFAULT_MAX_STREAM_DATA),
         max_streams_bidi => maps:get(max_streams_bidi, Opts, ?DEFAULT_MAX_STREAMS_BIDI),
-        max_streams_uni => maps:get(max_streams_uni, Opts, ?DEFAULT_MAX_STREAMS_UNI)
+        max_streams_uni => maps:get(max_streams_uni, Opts, ?DEFAULT_MAX_STREAMS_UNI),
+        declared_flow_control => client_declares_flow_control(Opts)
     }.
 
 %% ============================================================================
@@ -1862,6 +1896,9 @@ session_limit_test_() ->
     R3 = check_session_limit(h3, Router, 8, #{}, WithFc),
     %% Draft-02 has no such rule.
     R4 = check_session_limit(h3, Router, 12, #{}, NoFc#{compat_mode => legacy_browser_compat}),
+    %% http3-07: we advertise one session per connection.
+    R6 = check_session_limit(h3, Router, 20, #{}, #{compat_mode => legacy_browser_compat,
+                                                     wt_draft => draft07}),
     %% A refused or failed session frees its slot.
     [ok = webtransport_h3_router:session_gone(Router, Id) || Id <- [0, 8, 12]],
     R5 = check_session_limit(h3, Router, 16, #{}, NoFc),
@@ -1871,7 +1908,8 @@ session_limit_test_() ->
         ?_assertMatch({reset, ?H3_REQUEST_REJECTED, _}, R2),
         ?_assertMatch({ok, _}, R3),
         ?_assertMatch({ok, _}, R4),
-        ?_assertMatch({ok, _}, R5)
+        ?_assertMatch({ok, _}, R5),
+        ?_assertMatch({reset, ?H3_REQUEST_REJECTED, _}, R6)
     ].
 
 -endif.

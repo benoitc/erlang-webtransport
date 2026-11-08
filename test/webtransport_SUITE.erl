@@ -27,6 +27,7 @@
     bidi_echo_test/1,
     bidi_large_data_test/1,
     bidi_1mb_echo_test/1,
+    large_window_echo_test/1,
     multi_stream_test/1,
     close_stream_test/1,
 
@@ -86,7 +87,11 @@
     start_listener_invalid_certfile_test/1,
     start_listener_invalid_keyfile_test/1,
     start_listener_bad_pem_test/1,
-    sni_callback_round_trip_test/1
+    sni_callback_round_trip_test/1,
+
+    %% Legacy drafts (draft-02, http3-07) against the default listener
+    legacy_draft02_round_trip_test/1,
+    legacy_draft07_round_trip_test/1
 ]).
 
 %% ============================================================================
@@ -96,7 +101,8 @@
 all() ->
     [
         {group, h3_tests},
-        {group, h2_tests}
+        {group, h2_tests},
+        {group, h3_legacy_tests}
     ].
 
 groups() ->
@@ -122,6 +128,7 @@ groups() ->
         bidi_echo_test,
         bidi_large_data_test,
         bidi_1mb_echo_test,
+        large_window_echo_test,
         multi_stream_test,
         close_stream_test,
         datagram_echo_test,
@@ -157,7 +164,9 @@ groups() ->
               listener_refuses_tls12_client_test, accept_refuses_tls12_test],
     [
         {h3_tests, [sequence], Cases ++ H3Only},
-        {h2_tests, [sequence], Cases ++ H2Only}
+        {h2_tests, [sequence], Cases ++ H2Only},
+        {h3_legacy_tests, [sequence], [legacy_draft02_round_trip_test,
+                                       legacy_draft07_round_trip_test]}
     ].
 
 init_per_suite(Config) ->
@@ -183,6 +192,8 @@ init_per_group(h3_tests, Config) ->
     start_listener_group(h3, test_h3_listener, Config);
 init_per_group(h2_tests, Config) ->
     start_listener_group(h2, test_h2_listener, Config);
+init_per_group(h3_legacy_tests, Config) ->
+    start_listener_group(h3, test_h3_legacy_listener, Config);
 init_per_group(_Group, Config) ->
     Config.
 
@@ -191,6 +202,9 @@ end_per_group(h3_tests, _Config) ->
     ok;
 end_per_group(h2_tests, _Config) ->
     webtransport:stop_listener(test_h2_listener),
+    ok;
+end_per_group(h3_legacy_tests, _Config) ->
+    webtransport:stop_listener(test_h3_legacy_listener),
     ok;
 end_per_group(_Group, _Config) ->
     ok.
@@ -357,6 +371,27 @@ bidi_1mb_echo_test(Config) ->
     PrefixLen = byte_size(Echoed) - Size,
     ?assertEqual(Payload, binary:part(Echoed, PrefixLen, Size)),
     ?assertEqual(binary:part(Payload, 0, PrefixLen), binary:part(Echoed, 0, PrefixLen)),
+    webtransport:close_session(Session).
+
+%% A peer granting large windows (Safari grants 8 MiB) lets the server
+%% write a 2 MiB echo in one send; on h2 that is more than the HTTP/2
+%% per-stream send buffer and must still arrive whole.
+large_window_echo_test(Config) ->
+    Port = proplists:get_value(port, Config),
+    Big = 8 * 1024 * 1024,
+    {ok, Session} = webtransport:connect("localhost", Port, <<"/test">>, #{
+        transport => proplists:get_value(transport, Config),
+        verify => verify_none,
+        max_data => Big,
+        max_stream_data => Big
+    }),
+    {ok, StreamId} = webtransport:open_stream(Session, bidi),
+    Payload = test_helpers:random_data(2 * 1024 * 1024),
+    ok = webtransport:send(Session, StreamId, Payload, fin),
+    Echoed = collect_stream_echo(Session, StreamId, <<>>, 10000),
+    Size = byte_size(Payload),
+    ?assert(byte_size(Echoed) >= Size),
+    ?assertEqual(Payload, binary:part(Echoed, byte_size(Echoed) - Size, Size)),
     webtransport:close_session(Session).
 
 multi_stream_test(Config) ->
@@ -1630,3 +1665,44 @@ load_cert_key(CertFile, KeyFile) ->
 
 listener_name_for(h3) -> test_h3_listener;
 listener_name_for(h2) -> test_h2_listener.
+
+%% ============================================================================
+%% Legacy drafts
+%% ============================================================================
+
+%% The default listener (`compat_mode => auto') serves draft-02 clients
+%% (quic-go v0.9 and older) and http3-07 ones (Safari 26) next to the
+%% latest drafts, without WebTransport flow control.
+legacy_draft02_round_trip_test(Config) ->
+    legacy_round_trip(Config, legacy_browser_compat, draft02).
+
+legacy_draft07_round_trip_test(Config) ->
+    legacy_round_trip(Config, draft07, draft07).
+
+legacy_round_trip(Config, Mode, Draft) ->
+    Port = proplists:get_value(port, Config),
+    {ok, Session} = webtransport:connect("localhost", Port, <<"/test">>, #{
+        transport => h3,
+        compat_mode => Mode,
+        verify => verify_none,
+        handler_opts => #{owner => self()}
+    }),
+    {ok, Info} = webtransport:session_info(Session),
+    ?assertEqual(Draft, maps:get(wt_draft, Info)),
+    %% The server picked the same draft.
+    ok = webtransport:send_datagram(Session, <<"wt_draft?">>),
+    DraftBin = atom_to_binary(Draft),
+    receive
+        {webtransport, Session, {datagram, DraftBin}} -> ok
+    after 2000 ->
+        error(no_server_draft)
+    end,
+    %% More than the default session limit (1 MiB) in each direction: with
+    %% flow control wrongly on, one side would wait for credit.
+    {ok, StreamId} = webtransport:open_stream(Session, bidi),
+    Payload = test_helpers:random_data(2 * 1024 * 1024),
+    ok = webtransport:send(Session, StreamId, Payload, fin),
+    Echoed = collect_stream_echo(Session, StreamId, <<>>, 10000),
+    Size = byte_size(Payload),
+    ?assertEqual(Payload, binary:part(Echoed, byte_size(Echoed) - Size, Size)),
+    ok = webtransport:close_session(Session).

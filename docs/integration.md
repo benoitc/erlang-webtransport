@@ -22,7 +22,7 @@ H3Opts = maps:merge(webtransport:h3_settings(), #{
 
 | Key | Value |
 |-----|-------|
-| `settings` | H3 SETTINGS (SETTINGS_WT_ENABLED for draft-17 and draft-15, flow-control limits, draft-02 compat) |
+| `settings` | H3 SETTINGS (SETTINGS_WT_ENABLED for draft-17 and draft-15, flow-control limits, draft-02 and draft-07 compat) |
 | `stream_type_handler` | Claims WT extension streams (0x41 bidi, 0x54 uni) |
 | `h3_datagram_enabled` | `true` |
 | `defer_requests_until_settings` | `true`; requests wait for the client's SETTINGS, which select the draft. Without it a request that arrives ahead of them is refused |

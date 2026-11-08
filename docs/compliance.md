@@ -16,9 +16,9 @@ re-run the audit, use the `spec-compliance` Claude Code skill in
 | RFC 9297 | | Capsules, HTTP datagrams. |
 | RFC 9220 / RFC 8441 | | Extended CONNECT over h3 / h2. |
 
-Draft-02 (`compat_mode => legacy_browser_compat`) is kept on a separate path
-for Chrome, Firefox and webtransport-go. It never mixes with the latest
-drafts in one handshake.
+Draft-02 and draft-07 (`compat_mode => legacy_browser_compat`) are kept on a
+separate path for Chrome, Firefox, Safari 26 and webtransport-go. They never
+mix with the latest drafts in one handshake.
 
 Audited 2026-11-08 against quic 2.5.0 and h2 0.13.0.
 

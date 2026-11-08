@@ -286,10 +286,15 @@ init_limits(Transport, TransportState, Opts, Data) ->
     MaxBidi = maps:get(max_streams_bidi, Opts, ?DEFAULT_MAX_STREAMS_BIDI),
     MaxUni = maps:get(max_streams_uni, Opts, ?DEFAULT_MAX_STREAMS_UNI),
     Peer = peer_limits(Transport, TransportState, Opts),
+    %% http3-17 §5.1: flow control is on when both sides sent a non-zero
+    %% initial limit in SETTINGS, whatever the draft: Safari 26 negotiates
+    %% http3-07 and still enforces the limits. Legacy clients and a listener
+    %% pinned to legacy mode send none (`declared_flow_control => false').
+    WeDeclare = maps:get(declared_flow_control, Opts, true) andalso
+                lists:any(fun(V) -> V > 0 end, [MaxData, MaxBidi, MaxUni]),
     FlowControl = case Transport of
         h2 -> true;
-        h3 -> lists:any(fun(V) -> V > 0 end, maps:values(Peer)) andalso
-              lists:any(fun(V) -> V > 0 end, [MaxData, MaxBidi, MaxUni])
+        h3 -> WeDeclare andalso lists:any(fun(V) -> V > 0 end, maps:values(Peer))
     end,
     Remote = fun(Key) ->
         case FlowControl of
@@ -2013,6 +2018,21 @@ flow_control_off_test_() ->
     [
         ?_assertEqual(Data, handle_incoming_capsule({max_data, 0}, Data)),
         ?_assertEqual(Data, handle_incoming_capsule({max_streams_bidi, 1 bsl 61}, Data))
+    ].
+
+%% Flow control on h3 needs limits sent by both sides, whatever the
+%% draft: Safari 26 speaks http3-07 and sends them.
+flow_control_declared_test_() ->
+    Peer = #{16#2b61 => 8388608, 16#2b64 => 100, 16#2b65 => 100},
+    Fc = fun(Opts) ->
+        (init_limits(h3, undefined, Opts#{peer_settings => Peer}, #data{}))#data.flow_control
+    end,
+    [
+        ?_assert(Fc(#{request => #{wt_draft => draft07}})),
+        ?_assertNot(Fc(#{declared_flow_control => false})),
+        ?_assertNot(Fc(#{max_data => 0, max_streams_bidi => 0, max_streams_uni => 0})),
+        ?_assertNot((init_limits(h3, undefined, #{peer_settings => #{16#33 => 1}},
+                                 #data{}))#data.flow_control)
     ].
 
 %% http2-16 §6.7: a stream id opens every lower id of its kind, so the

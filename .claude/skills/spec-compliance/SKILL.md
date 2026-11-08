@@ -21,10 +21,12 @@ that goes on the wire.
 | RFC 9220 / RFC 8441 | extended CONNECT over h3 / h2 |
 | RFC 9114, RFC 9000 | h3 SETTINGS rules, GOAWAY, stream and error-code rules |
 
-Draft-02 (`compat_mode => legacy_browser_compat`) is out of scope for gap
-finding. Only check that it never leaks into the `latest` path: no draft-02
-SETTINGS, `:protocol` value or `Sec-Webtransport-Http3-Draft02` header in a
-latest-mode handshake.
+Draft-02 and draft-07 (`compat_mode => legacy_browser_compat`) are out of
+scope for gap finding. Only check that they never leak into the `latest`
+path: no draft-02 or draft-07 SETTINGS (0x2b603742, 0xc671706a), `:protocol`
+value or `Sec-Webtransport-Http3-Draft02` header in a latest-mode handshake.
+Browser behaviour is checked live: Safari through the iOS simulators
+(`xcrun simctl`), Chrome and Safari on the Mac.
 
 ## Step 1: find the current revisions
 

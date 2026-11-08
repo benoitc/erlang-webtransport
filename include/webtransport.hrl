@@ -47,6 +47,10 @@
 %% upstream library:
 -define(SETTINGS_ENABLE_WEBTRANSPORT_DRAFT02, 16#2b603742).
 
+%% SETTINGS_WEBTRANSPORT_MAX_SESSIONS of http3-07, what Safari 26 looks for.
+%% Like draft-02 it is only sent in legacy compat mode.
+-define(SETTINGS_WT_MAX_SESSIONS_D07, 16#c671706a).
+
 %% SETTINGS_WT_ENABLED. The codepoint selects the draft version (http3-17
 %% §7.1). quic maps the `wt_enabled' atom to one of the h3 values depending
 %% on its release, so these integer keys are what we send and look up.

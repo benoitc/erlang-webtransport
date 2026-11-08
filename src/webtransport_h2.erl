@@ -35,6 +35,9 @@
 
 -include("webtransport.hrl").
 
+%% How long a stream send waits for the peer's HTTP/2 window.
+-define(H2_SEND_TIMEOUT, 30000).
+
 -record(state, {
     h2_conn :: pid(),
     connect_stream_id :: non_neg_integer(),
@@ -320,7 +323,12 @@ send(#state{h2_conn = H2Conn, connect_stream_id = ConnectStreamId}, StreamId, Da
         true -> wt_h2_capsule:wt_stream_fin(StreamId, DataBin);
         false -> wt_h2_capsule:wt_stream(StreamId, DataBin)
     end,
-    h2:send_data(H2Conn, ConnectStreamId, wt_h2_capsule:encode(Capsule), false).
+    %% Wait for the peer's HTTP/2 window instead of failing: h2 refuses a
+    %% plain send that would put more than 1 MiB in the stream's buffer,
+    %% and the peer's WebTransport limits allow larger sends (Safari grants
+    %% 8 MiB). A waiter is released when the stream or connection closes.
+    h2:send_data(H2Conn, ConnectStreamId, wt_h2_capsule:encode(Capsule), false,
+                 #{block => ?H2_SEND_TIMEOUT}).
 
 %% @doc Send an unreliable datagram via the DATAGRAM capsule type.
 -spec send_datagram(state(), binary()) -> ok | {error, term()}.

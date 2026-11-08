@@ -14,7 +14,7 @@
 -export([request_session/4, request_session/5]).
 -export([response_status/1, is_success_response/1]).
 -export([validate_wt_support/2, validate_wt_support/3]).
--export([validate_client/2, select_draft/1]).
+-export([validate_client/2, select_draft/1, legacy_draft/2]).
 -export([detect_compat_mode/1]).
 -export([send_capsule/3, close_session/4, drain_session/2]).
 
@@ -25,8 +25,11 @@
 
 -type headers() :: [{binary(), binary()}].
 -type compat_mode() :: latest | legacy_browser_compat.
+%% What a client speaks: `legacy_browser_compat' is draft-02, `draft07' is
+%% http3-07.
+-type client_mode() :: compat_mode() | draft07.
 
--export_type([headers/0, compat_mode/0]).
+-export_type([headers/0, compat_mode/0, client_mode/0]).
 
 %% ============================================================================
 %% Settings
@@ -64,11 +67,15 @@ server_settings(latest, Opts) ->
         ?SETTINGS_WT_ENABLED_H3_D15  => 1
     };
 server_settings(legacy_browser_compat, _Opts) ->
-    %% draft-02 (Chrome / Firefox / quic-go v0.9). Never mix these
-    %% with the latest-spec settings in one handshake.
+    %% draft-02 (Chrome / Firefox / quic-go v0.9) and http3-07 (Safari 26).
+    %% Both use `:protocol webtransport' and the same wire format; the
+    %% client's SETTINGS and draft-02 header tell them apart. We accept one
+    %% http3-07 session per connection, as these sessions have no
+    %% WebTransport flow control.
     #{
         enable_connect_protocol              => 1,
-        ?SETTINGS_ENABLE_WEBTRANSPORT_DRAFT02 => 1
+        ?SETTINGS_ENABLE_WEBTRANSPORT_DRAFT02 => 1,
+        ?SETTINGS_WT_MAX_SESSIONS_D07         => 1
     }.
 
 %% @doc H3 SETTINGS a WebTransport client sends.
@@ -77,7 +84,7 @@ server_settings(legacy_browser_compat, _Opts) ->
 %% SETTINGS_WT_ENABLED for the draft version it speaks, so the server can
 %% pick it. We speak http3-17 only. The initial flow-control limits declare
 %% that we use flow control (http3-17 §5.1).
--spec client_settings(compat_mode(), map()) -> map().
+-spec client_settings(client_mode(), map()) -> map().
 client_settings(latest, Opts) ->
     %% quic validates an outgoing extended CONNECT against our own
     %% enable_connect_protocol, so the client sends it too.
@@ -86,7 +93,10 @@ client_settings(latest, Opts) ->
         ?SETTINGS_WT_ENABLED_H3 => 1
     };
 client_settings(legacy_browser_compat, _Opts) ->
-    server_settings(legacy_browser_compat, #{}).
+    #{enable_connect_protocol => 1, ?SETTINGS_ENABLE_WEBTRANSPORT_DRAFT02 => 1};
+client_settings(draft07, _Opts) ->
+    %% http3-07 §3.1: the value only has to be above 0 for a client.
+    #{enable_connect_protocol => 1, ?SETTINGS_WT_MAX_SESSIONS_D07 => 1}.
 
 flow_control_settings(Opts) ->
     #{
@@ -136,7 +146,7 @@ request_headers(Authority, Path, ExtraHeaders) ->
     request_headers(Authority, Path, ExtraHeaders, latest).
 
 %% @doc Build WebTransport CONNECT request headers for the specified compat mode.
--spec request_headers(binary(), binary(), headers(), compat_mode()) -> headers().
+-spec request_headers(binary(), binary(), headers(), client_mode()) -> headers().
 request_headers(Authority, Path, ExtraHeaders, latest) ->
     %% draft-15 §3.2: `:protocol' MUST be `webtransport-h3'. No draft-02
     %% Sec- header on this path.
@@ -159,6 +169,16 @@ request_headers(Authority, Path, ExtraHeaders, legacy_browser_compat) ->
         {<<":path">>, Path},
         {<<"sec-webtransport-http3-draft02">>, <<"1">>}
     ],
+    BaseHeaders ++ strip_reserved_headers(ExtraHeaders);
+request_headers(Authority, Path, ExtraHeaders, draft07) ->
+    %% http3-07: `:protocol' = webtransport, no draft-02 header.
+    BaseHeaders = [
+        {<<":method">>, <<"CONNECT">>},
+        {<<":protocol">>, <<"webtransport">>},
+        {<<":scheme">>, <<"https">>},
+        {<<":authority">>, Authority},
+        {<<":path">>, Path}
+    ],
     BaseHeaders ++ strip_reserved_headers(ExtraHeaders).
 
 %% @doc Send a WebTransport CONNECT request on the H3 connection, returning the stream ID.
@@ -168,7 +188,7 @@ request_session(H3Conn, Authority, Path, ExtraHeaders) ->
     request_session(H3Conn, Authority, Path, ExtraHeaders, latest).
 
 %% @doc Send a WebTransport CONNECT request using the given compat mode.
--spec request_session(pid(), binary(), binary(), headers(), compat_mode()) ->
+-spec request_session(pid(), binary(), binary(), headers(), client_mode()) ->
     {ok, non_neg_integer()} | {error, term()}.
 request_session(H3Conn, Authority, Path, ExtraHeaders, CompatMode) ->
     Headers = request_headers(Authority, Path, ExtraHeaders, CompatMode),
@@ -210,7 +230,7 @@ validate_wt_support(H3Conn, QuicConn) ->
 %% HTTP/3 datagrams, and its transport parameters enable QUIC datagrams and
 %% RESET_STREAM_AT. Draft-02 servers (legacy mode) predate RESET_STREAM_AT
 %% and are not held to it.
--spec validate_wt_support(pid(), pid(), compat_mode()) -> ok | {error, term()}.
+-spec validate_wt_support(pid(), pid(), client_mode()) -> ok | {error, term()}.
 validate_wt_support(H3Conn, QuicConn, CompatMode) ->
     case quic_h3:get_peer_settings(H3Conn) of
         undefined ->
@@ -251,8 +271,9 @@ validate_transport_params(QuicConn, CompatMode) ->
                   maps:get(reset_stream_at, TP, false), CompatMode} of
                 {0, _, _} -> {error, datagrams_not_enabled};
                 {_, true, _} -> ok;
-                {_, _, legacy_browser_compat} -> ok;
-                {_, _, latest} -> {error, reset_stream_at_not_enabled}
+                {_, _, latest} -> {error, reset_stream_at_not_enabled};
+                %% draft-02 and http3-07 predate RESET_STREAM_AT.
+                {_, _, _} -> ok
             end;
         {error, Reason} ->
             {error, {transport_params_unavailable, Reason}}
@@ -279,6 +300,27 @@ check_wt_setting(PeerSettings, legacy_browser_compat) ->
     case maps:find(?SETTINGS_ENABLE_WEBTRANSPORT_DRAFT02, PeerSettings) of
         {ok, V} when V =/= 0 -> ok;
         _ -> {error, wt_not_enabled}
+    end;
+check_wt_setting(PeerSettings, draft07) ->
+    %% http3-07 §3.1: SETTINGS_WEBTRANSPORT_MAX_SESSIONS above 0 and
+    %% HTTP/3 datagrams.
+    case {peer_setting(PeerSettings, ?SETTINGS_WT_MAX_SESSIONS_D07),
+          peer_setting(PeerSettings, ?H3_SETTING_DATAGRAM)} of
+        {N, 1} when is_integer(N), N > 0 -> ok;
+        {N, _} when is_integer(N), N > 0 -> {error, h3_datagram_not_enabled};
+        _ -> {error, wt_not_enabled}
+    end.
+
+%% @doc Tell a draft-02 request from an http3-07 one. Both send
+%% `:protocol webtransport'; a draft-02 client may add the
+%% `Sec-Webtransport-Http3-Draft02' header, an http3-07 client sends
+%% SETTINGS_WEBTRANSPORT_MAX_SESSIONS above 0 and no such header.
+-spec legacy_draft(headers(), map()) -> draft02 | draft07.
+legacy_draft(Headers, PeerSettings) ->
+    case {header_value(<<"sec-webtransport-http3-draft02">>, Headers),
+          peer_setting(PeerSettings, ?SETTINGS_WT_MAX_SESSIONS_D07)} of
+        {undefined, N} when is_integer(N), N > 0 -> draft07;
+        _ -> draft02
     end.
 
 setting_enabled(Settings, Key) ->
@@ -389,6 +431,45 @@ wt_enabled_codepoints_test_() ->
         ?_assertEqual(1, maps:get(16#20b8933b, Client)),
         ?_assertNot(maps:is_key(16#2c7cf000, Client)),
         ?_assertEqual(10, maps:get(wt_initial_max_data, Client))
+    ].
+
+request_headers_draft07_test() ->
+    Headers = request_headers(<<"example.com">>, <<"/wt">>, [], draft07),
+    ?assert(lists:member({<<":protocol">>, <<"webtransport">>}, Headers)),
+    ?assertNot(lists:keymember(<<"sec-webtransport-http3-draft02">>, 1, Headers)).
+
+%% The server's legacy settings carry both legacy drafts; each client only
+%% the one it speaks.
+legacy_settings_test_() ->
+    Server = server_settings(legacy_browser_compat, #{}),
+    D02 = client_settings(legacy_browser_compat, #{}),
+    D07 = client_settings(draft07, #{}),
+    [
+        ?_assertEqual(1, maps:get(?SETTINGS_WT_MAX_SESSIONS_D07, Server)),
+        ?_assertEqual(1, maps:get(?SETTINGS_ENABLE_WEBTRANSPORT_DRAFT02, Server)),
+        ?_assertNot(maps:is_key(?SETTINGS_WT_MAX_SESSIONS_D07, D02)),
+        ?_assertNot(maps:is_key(?SETTINGS_ENABLE_WEBTRANSPORT_DRAFT02, D07)),
+        ?_assertEqual(1, maps:get(?SETTINGS_WT_MAX_SESSIONS_D07, D07)),
+        ?_assertNot(maps:is_key(?SETTINGS_WT_MAX_SESSIONS_D07, server_settings(latest, #{})))
+    ].
+
+legacy_draft_test_() ->
+    D07 = #{?SETTINGS_WT_MAX_SESSIONS_D07 => 1},
+    Marker = [{<<"sec-webtransport-http3-draft02">>, <<"1">>}],
+    [
+        ?_assertEqual(draft07, legacy_draft([], D07)),
+        ?_assertEqual(draft02, legacy_draft(Marker, D07)),
+        ?_assertEqual(draft02, legacy_draft([], #{?SETTINGS_ENABLE_WEBTRANSPORT_DRAFT02 => 1})),
+        ?_assertEqual(draft02, legacy_draft([], D07#{?SETTINGS_WT_MAX_SESSIONS_D07 => 0}))
+    ].
+
+check_wt_setting_draft07_test_() ->
+    [
+        ?_assertEqual(ok, check_wt_setting(#{16#c671706a => 4, h3_datagram => 1}, draft07)),
+        ?_assertEqual({error, h3_datagram_not_enabled},
+                      check_wt_setting(#{16#c671706a => 1}, draft07)),
+        ?_assertEqual({error, wt_not_enabled},
+                      check_wt_setting(#{16#c671706a => 0, h3_datagram => 1}, draft07))
     ].
 
 select_draft_test_() ->

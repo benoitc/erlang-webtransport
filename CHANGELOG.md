@@ -1,5 +1,27 @@
 # Changelog
 
+## Unreleased
+
+- Safari 26 can now open WebTransport sessions over HTTP/3. It speaks
+  draft-07 and gave up on servers that did not advertise it, so it failed
+  against 0.5.0. Listeners in the default `auto` mode and in
+  `legacy_browser_compat` now advertise draft-07 and accept one draft-07
+  session per connection. The 0.5.0 notes were wrong to say Safari 26 uses
+  draft-15. Clients can speak draft-07 with `compat_mode => draft07`.
+- Flow control on HTTP/3 now depends only on whether both sides announced
+  limits, whatever the draft. Safari 26 announces them and waits for more
+  credit. Clients in `legacy_browser_compat` mode announce none, and no
+  longer stall after the server's first megabyte waiting for credit the
+  server never sends. Their `session_info/1` now reports `draft02` instead
+  of `h3_17`.
+- A single stream write of more than 1 MiB over HTTP/2 no longer fails.
+  When the peer granted large limits (Safari grants 8 MiB), the HTTP/2
+  layer refused the write and the data was lost. The write now waits for
+  the peer to accept it.
+- Resetting a stream you opened now works with draft-02 and draft-07
+  peers. The reset was silently not sent when the peer did not support
+  partial resets, which those drafts predate.
+
 ## 0.5.0 - 2026-11-08
 
 This release moves to the current WebTransport drafts: HTTP/3 draft-17,
