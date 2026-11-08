@@ -114,7 +114,9 @@ connect(Host, Port, Path, Opts) ->
         settings => maps:get(settings, Opts, #{}),
         %% http2-16 §3.1: SETTINGS_WT_ENABLED can change later; the session's
         %% data loop watches it once it owns the connection.
-        notify_peer_settings => true
+        notify_peer_settings => true,
+        %% A CONNECT refused at the server's stream limit waits for a slot.
+        notify_stream_available => true
     },
     case h2:connect(H2Host, Port, H2Opts) of
         {ok, H2Conn} ->
@@ -165,6 +167,10 @@ check_wt_enabled(PeerSettings) ->
     end.
 
 send_connect(H2Conn, Host, Port, Path, Opts, _PeerSettings0) ->
+    Deadline = erlang:monotonic_time(millisecond) + maps:get(timeout, Opts, 30000),
+    send_connect_by(H2Conn, Host, Port, Path, Opts, Deadline).
+
+send_connect_by(H2Conn, Host, Port, Path, Opts, Deadline) ->
     Authority = authority(Host, Port),
     Headers = request_headers(Authority, Path, maps:get(headers, Opts, []), Opts),
     %% http2-16 §4.3.1: the session uses the server SETTINGS in effect when
@@ -196,9 +202,29 @@ send_connect(H2Conn, Host, Port, Path, Opts, _PeerSettings0) ->
                     h2:close(H2Conn),
                     {error, timeout}
             end;
+        {error, max_streams_exceeded} ->
+            %% The server allows no stream yet: wait for h2 to say one fits,
+            %% within the connect timeout.
+            case await_stream(H2Conn, Deadline) of
+                ok ->
+                    send_connect_by(H2Conn, Host, Port, Path, Opts, Deadline);
+                {error, Reason} ->
+                    h2:close(H2Conn),
+                    {error, Reason}
+            end;
         {error, Reason} ->
             h2:close(H2Conn),
             {error, Reason}
+    end.
+
+await_stream(H2Conn, Deadline) ->
+    receive
+        {h2, H2Conn, stream_available} -> ok;
+        {h2, H2Conn, {goaway, _, _}} -> {error, goaway};
+        {h2, H2Conn, {closed, _}} -> {error, connection_closed};
+        {h2, H2Conn, closed} -> {error, connection_closed}
+    after max(0, Deadline - erlang:monotonic_time(millisecond)) ->
+        {error, timeout}
     end.
 
 %% request/3 takes the full header block: `:method' first and `:authority'
@@ -439,6 +465,24 @@ strip_reserved_headers(Headers) ->
 
 -ifdef(TEST).
 -include_lib("eunit/include/eunit.hrl").
+
+%% A CONNECT refused at the server's stream limit is sent again once h2
+%% says a stream fits.
+connect_waits_for_stream_test() ->
+    Owner = self(),
+    Conn = spawn_link(fun() ->
+        reply_next({error, max_streams_exceeded}),
+        Owner ! {h2, self(), stream_available},
+        reply_next({ok, 1, #{}}),
+        Owner ! {h2, self(), {response, 1, 200, []}},
+        receive stop -> ok end
+    end),
+    ?assertMatch({ok, #state{connect_stream_id = 1}},
+                 send_connect(Conn, <<"localhost">>, 443, <<"/wt">>, #{timeout => 2000}, #{})),
+    Conn ! stop.
+
+reply_next(Reply) ->
+    receive {'$gen_call', From, _} -> gen:reply(From, Reply) end.
 
 request_headers_test() ->
     Headers = request_headers(<<"example.com:443">>, <<"/wt">>),
