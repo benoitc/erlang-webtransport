@@ -1,8 +1,10 @@
 # Changelog
 
-## Unreleased
+## 0.5.2 - 2026-11-08
 
-- Requires h2 0.15.0. Nothing changes for WebTransport users.
+- Accepts h2 0.15.0. 0.5.1 required h2 0.14, so a project that also needs
+  h2 0.15, such as hackney, could not resolve its dependencies. Nothing else
+  changes.
 
 ## 0.5.1 - 2026-11-08
 
