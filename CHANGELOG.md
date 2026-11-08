@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Requires quic 2.6.0. Nothing changes for WebTransport users.
+
 ## 0.5.2 - 2026-11-08
 
 - Accepts h2 0.15.0. 0.5.1 required h2 0.14, so a project that also needs
