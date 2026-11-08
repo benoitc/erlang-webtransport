@@ -12,13 +12,14 @@
 
 -record(state, {
     session :: pid(),
+    wt_draft :: atom(),
     streams = #{} :: #{non_neg_integer() => binary()}
 }).
 
 %% @doc Initialize the handler. `Opts' is ignored — the echo handler
 %% does not need an owner pid.
-init(Session, _Request, _Opts) ->
-    {ok, #state{session = Session}}.
+init(Session, Request, _Opts) ->
+    {ok, #state{session = Session, wt_draft = maps:get(wt_draft, Request, undefined)}}.
 
 %% @doc Handle data on a stream - buffer until FIN.
 handle_stream(StreamId, Type, Data, #state{streams = Streams} = State) ->
@@ -44,7 +45,10 @@ handle_stream_fin(StreamId, Type, Data, #state{streams = Streams} = State) ->
             {ok, State1}
     end.
 
-%% @doc Handle datagram - echo it back.
+%% @doc Handle datagram - echo it back. The datagram `wt_draft?' is
+%% answered with the draft the server picked for the session.
+handle_datagram(<<"wt_draft?">>, #state{wt_draft = Draft} = State) ->
+    {ok, State, [{send_datagram, atom_to_binary(Draft)}]};
 handle_datagram(Data, State) ->
     {ok, State, [{send_datagram, Data}]}.
 

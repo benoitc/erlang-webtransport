@@ -136,13 +136,13 @@ data) is not supported through the current synchronous connect path.
 ## Compatibility Mode
 
 The HTTP/3 WebTransport spec has evolved through multiple drafts. The IETF is
-on draft-17 while Chrome and Firefox still use draft-02. This library keeps
-the two paths separate:
+on draft-17 while Chrome and Firefox still use draft-02 and Safari 26 uses
+draft-07. This library keeps the latest and the legacy paths separate:
 
 | Mode | `:protocol` | SETTINGS | Use when |
 |------|-------------|----------|----------|
 | `latest` | `webtransport-h3` | `SETTINGS_WT_ENABLED=1` + initial flow-control | Draft-17 and draft-15 peers |
-| `legacy_browser_compat` | `webtransport` | `SETTINGS_ENABLE_WEBTRANSPORT_DRAFT02=1` | Draft-02 peers (Chrome, Firefox, quic-go v0.9) |
+| `legacy_browser_compat` | `webtransport` | `SETTINGS_ENABLE_WEBTRANSPORT_DRAFT02=1`, `SETTINGS_WEBTRANSPORT_MAX_SESSIONS=1` (server) | Draft-02 peers (Chrome, Firefox, quic-go v0.9) and draft-07 peers (Safari 26) |
 | `auto` (server only) | accepts both | advertises both | Accept either draft per request |
 
 ### Server detection
@@ -150,7 +150,10 @@ the two paths separate:
 In `auto` mode, the server inspects each CONNECT request:
 
 - `:protocol = webtransport-h3` with no draft-02 header -> latest
-- `:protocol = webtransport` -> legacy_browser_compat
+- `:protocol = webtransport` -> legacy_browser_compat: draft-07 when the
+  client sent `SETTINGS_WEBTRANSPORT_MAX_SESSIONS` and no draft-02 header,
+  draft-02 otherwise. A connection carries one draft-07 session; further
+  CONNECT requests are reset.
 - Conflicting signals (e.g. `webtransport-h3` plus the draft-02 header) -> 400
 
 In `latest` mode the server advertises SETTINGS_WT_ENABLED under the
@@ -183,7 +186,11 @@ Clients must choose explicitly. Default is `latest`:
 }).
 ```
 
-HTTP/2 has no draft-02 variant; `compat_mode` applies only to HTTP/3.
+`legacy_browser_compat` speaks draft-02; use `compat_mode => draft07` for a
+draft-07 server.
+
+HTTP/2 has no draft-02 or draft-07 variant; `compat_mode` applies only to
+HTTP/3.
 
 ## Flow Control
 

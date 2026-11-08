@@ -2,7 +2,7 @@
 
 An Erlang implementation of the [WebTransport](https://www.w3.org/TR/webtransport/) protocol over:
 
-- **HTTP/3** ([draft-ietf-webtrans-http3-17](https://datatracker.ietf.org/doc/html/draft-ietf-webtrans-http3-17)) using native QUIC streams; draft-15 clients are accepted too
+- **HTTP/3** ([draft-ietf-webtrans-http3-17](https://datatracker.ietf.org/doc/html/draft-ietf-webtrans-http3-17)) using native QUIC streams; draft-15 clients are accepted too, and so are draft-07 (Safari 26) and draft-02 (Chrome, Firefox) clients in the default `auto` mode
 - **HTTP/2** ([draft-ietf-webtrans-http2-16](https://datatracker.ietf.org/doc/html/draft-ietf-webtrans-http2-16)) using [RFC 9297](https://www.rfc-editor.org/rfc/rfc9297) capsules, over TLS 1.3 only
 
 [docs/compliance.md](docs/compliance.md) lists what is implemented and the known gaps.
@@ -472,15 +472,15 @@ ok = webtransport:close_session(Session, ErrorCode, Reason).
 
 ## Compatibility mode
 
-The HTTP/3 WebTransport spec has evolved through multiple drafts. The IETF is on draft-17; Chrome and Firefox still use draft-02. This library keeps the two paths disjoint:
+The HTTP/3 WebTransport spec has evolved through multiple drafts. The IETF is on draft-17; Chrome and Firefox still use draft-02 and Safari 26 uses draft-07. This library keeps the latest and the legacy paths disjoint:
 
 | Mode | `:protocol` | SETTINGS | Use when |
 |------|-------------|----------|----------|
 | `latest` | `webtransport-h3` | `SETTINGS_WT_ENABLED=1` + initial flow-control | Talking to draft-17 or draft-15 peers |
-| `legacy_browser_compat` | `webtransport` | `SETTINGS_ENABLE_WEBTRANSPORT_DRAFT02=1` | Talking to draft-02 peers (Chrome, Firefox, quic-go v0.9) |
+| `legacy_browser_compat` | `webtransport` | `SETTINGS_ENABLE_WEBTRANSPORT_DRAFT02=1`, `SETTINGS_WEBTRANSPORT_MAX_SESSIONS=1` (server) | Talking to draft-02 peers (Chrome, Firefox, quic-go v0.9) or draft-07 peers (Safari 26) |
 | `auto` (server only) | accepts both | advertises both | Let the server accept either draft based on the client's request |
 
-**Server default:** `auto` -- the server inspects `:protocol` and the `Sec-Webtransport-Http3-Draft02` header on each CONNECT request and dispatches to the matching code path. In `latest` mode the server advertises SETTINGS_WT_ENABLED under both the draft-17 and the draft-15 codepoints and picks the version from the client's SETTINGS (draft-17 section 7.1); the client sends the draft-17 codepoint only. Pin to `latest` or `legacy_browser_compat` to refuse the other:
+**Server default:** `auto` -- the server inspects `:protocol` and the `Sec-Webtransport-Http3-Draft02` header on each CONNECT request and dispatches to the matching code path. A `webtransport` request is draft-07 when the client sent `SETTINGS_WEBTRANSPORT_MAX_SESSIONS` and no draft-02 header, draft-02 otherwise; a connection carries one draft-07 session. In `latest` mode the server advertises SETTINGS_WT_ENABLED under both the draft-17 and the draft-15 codepoints and picks the version from the client's SETTINGS (draft-17 section 7.1); the client sends the draft-17 codepoint only. Pin to `latest` or `legacy_browser_compat` to refuse the other:
 
 ```erlang
 %% Accept only draft-17 and draft-15 clients
@@ -503,6 +503,8 @@ webtransport:start_listener(strict, #{
     verify => verify_none
 }).
 ```
+
+Use `compat_mode => draft07` for a draft-07 server.
 
 HTTP/2 WebTransport (`transport => h2`) has no draft-02 variant; `compat_mode` applies only to HTTP/3.
 
