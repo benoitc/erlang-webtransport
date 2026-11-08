@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.5.0 - 2026-11-08
 
 This release moves to the current WebTransport drafts: HTTP/3 draft-17,
 HTTP/2 draft-16 and the protocol framework draft-14. It changes what goes on
