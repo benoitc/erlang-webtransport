@@ -670,6 +670,11 @@ cd interop && docker compose up --abort-on-container-exit --build
 - [RFC 8441](https://www.rfc-editor.org/rfc/rfc8441) -- Bootstrapping WebSockets with HTTP/2 (Extended CONNECT)
 - [W3C WebTransport API](https://www.w3.org/TR/webtransport/) -- Browser API specification
 
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md). Report security issues privately as
+described in [SECURITY.md](SECURITY.md).
+
 ## Sponsors
 
 <a href="https://enki-multimedia.eu"><img src="docs/images/enki-multimedia.svg" alt="Enki Multimedia" height="50" /></a>
