@@ -79,6 +79,7 @@
 
     %% Embedding (accept/4 from a non-connection process)
     embedded_accept_round_trip_test/1,
+    quic_stream_limit_credit_test/1,
 
     %% Listener lifecycle
     stop_listener_does_not_kill_caller_test/1,
@@ -157,7 +158,7 @@ groups() ->
         sni_callback_round_trip_test
     ],
     %% Embedding via h3_settings/0 + accept/4 is HTTP/3-only.
-    H3Only = [embedded_accept_round_trip_test],
+    H3Only = [embedded_accept_round_trip_test, quic_stream_limit_credit_test],
     %% WebTransport-Init is an HTTP/2 header.
     H2Only = [invalid_webtransport_init_test, client_refuses_tls12_server_test,
               h2_embedded_accept_round_trip_test,
@@ -1409,6 +1410,53 @@ collect_stream_echo(Session, StreamId, Acc, Timeout) ->
 %% (which receives the claimed extension streams) and the router accept/4
 %% registers the session in must be the same one, so a connected client can
 %% round-trip both stream data and datagrams through the echo handler.
+%% The QUIC connection runs out of bidi streams before the session's own
+%% limit: open_stream fails with stream_limit, and once a stream finishes
+%% the handler is told it can open one again.
+quic_stream_limit_credit_test(Config) ->
+    CertFile = proplists:get_value(certfile, Config),
+    KeyFile = proplists:get_value(keyfile, Config),
+    {ok, CertDer, PrivateKey} = read_cert_key_der(CertFile, KeyFile),
+    Port = test_helpers:find_free_port(),
+    Name = quic_stream_limit_server,
+    Dispatch = fun(Conn, StreamId, <<"CONNECT">>, _Path, Headers) ->
+                       _ = spawn(fun() ->
+                               {ok, _} = webtransport:accept(
+                                   Conn, StreamId, Headers,
+                                   #{transport => h3, handler => wt_echo_handler})
+                           end),
+                       ok
+               end,
+    Settings = webtransport:h3_settings(),
+    %% Three client bidi streams: the CONNECT stream and two more.
+    QuicOpts = (maps:get(quic_opts, Settings))#{max_streams_bidi => 3},
+    {ok, _} = quic_h3:start_server(Name, Port, Settings#{
+        cert => CertDer, key => PrivateKey, handler => Dispatch,
+        quic_opts => QuicOpts
+    }),
+    try
+        timer:sleep(100),
+        {ok, Session} = webtransport:connect("localhost", Port, <<"/wt">>, #{
+            transport => h3,
+            verify => verify_none,
+            handler_opts => #{owner => self()}
+        }),
+        {ok, S1} = webtransport:open_stream(Session, bidi),
+        {ok, _S2} = webtransport:open_stream(Session, bidi),
+        ?assertEqual({error, stream_limit}, webtransport:open_stream(Session, bidi)),
+        ok = webtransport:send(Session, S1, <<"done">>, fin),
+        <<"done">> = collect_stream_echo(Session, S1, <<>>, 3000),
+        receive
+            {webtransport, Session, {stream_credit, bidi}} -> ok
+        after 5000 ->
+            error(no_stream_credit)
+        end,
+        ?assertMatch({ok, _}, webtransport:open_stream(Session, bidi)),
+        ok = webtransport:close_session(Session)
+    after
+        quic_h3:stop_server(Name)
+    end.
+
 embedded_accept_round_trip_test(Config) ->
     CertFile = proplists:get_value(certfile, Config),
     KeyFile = proplists:get_value(keyfile, Config),

@@ -315,6 +315,16 @@ handle_quic_h3({quic_h3, _Conn, {goaway, Id}} = Msg, #state{sessions = Sessions}
     maps:foreach(fun(_Sid, Pid) -> webtransport_session:goaway(Pid, Id) end, Sessions),
     notify_passthrough(Msg, State),
     {noreply, State};
+%% quic_h3 can open a stream again after one was refused at the peer's
+%% limit: every session that was refused gets to retry. The client's
+%% connect may be waiting on it for its CONNECT.
+handle_quic_h3({quic_h3, _Conn, {streams_available, Type}} = Msg,
+               #state{sessions = Sessions} = State) ->
+    maps:foreach(fun(_Sid, Pid) ->
+        webtransport_session:transport_streams_available(Pid, Type)
+    end, Sessions),
+    notify_passthrough(Msg, State),
+    {noreply, State};
 handle_quic_h3({quic_h3, _Conn, {session_ticket, Ticket}}, State) ->
     %% Connection-scoped 0-RTT resumption ticket. Surface it to the connecting
     %% process (the passthrough on the client side); it can store the ticket

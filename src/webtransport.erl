@@ -228,6 +228,8 @@ h3_settings(Opts) ->
         stream_reset_final_size => true,
         %% http3-17 §7.1: hold requests until the client's SETTINGS are in.
         defer_requests_until_settings => true,
+        %% Tell us when a stream refused at the peer's limit can open.
+        notify_streams_available => true,
         quic_opts => #{
             max_datagram_frame_size => 65535,
             reset_stream_at => true
@@ -1151,6 +1153,8 @@ start_h3_listener(Name, Opts) ->
                 %% http3-17 §7.1: hold requests until the client's SETTINGS
                 %% are in, since they select the draft version.
                 defer_requests_until_settings => true,
+                %% Tell us when a stream refused at the peer's limit can open.
+                notify_streams_available => true,
                 %% `sni_callback' rides inside `quic_opts' so it reaches
                 %% `quic:start_server'; `quic_h3' only lifts cert/key from
                 %% the top level. quic selects the cert per ClientHello SNI.
@@ -1543,6 +1547,7 @@ build_h3_connect_opts(Opts) ->
         quic_opts => build_client_quic_opts(Opts),
         h3_datagram_enabled => true,
         stream_reset_final_size => true,
+        notify_streams_available => true,
         stream_type_handler => fun
             (uni,  _, 16#54) -> claim;
             (bidi, _, 16#41) -> claim;

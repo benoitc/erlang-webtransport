@@ -161,6 +161,20 @@ goaway_forwarded_test() ->
     Session ! stop,
     gen_server:stop(Router).
 
+%% quic_h3's streams_available notice reaches every session and the
+%% connecting process.
+streams_available_forwarded_test() ->
+    {ok, Router} = webtransport_h3_router:start_link(),
+    Session = start_fake_session(self()),
+    ok = webtransport_h3_router:register_session(Router, 0, Session),
+    ok = webtransport_h3_router:set_passthrough(Router, self()),
+    Msg = {quic_h3, self(), {streams_available, bidi}},
+    Router ! Msg,
+    Got = lists:sort([recv(200), recv(200)]),
+    ?assertEqual(lists:sort([{streams_available, bidi}, Msg]), Got),
+    Session ! stop,
+    gen_server:stop(Router).
+
 %% http3-17 §6: data on a CONNECT stream after the peer's WT_CLOSE_SESSION
 %% resets it with H3_MESSAGE_ERROR.
 data_after_peer_close_test() ->
