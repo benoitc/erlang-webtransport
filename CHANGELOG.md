@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.5.5 - 2026-11-10
+
+- Requires h2 0.15.1. Over HTTP/2, a session now learns at once that the
+  peer closed the connection, instead of about five seconds later.
+
 ## 0.5.4 - 2026-11-10
 
 - New client option `socket_opts`: a list of gen_tcp/inet options for the
