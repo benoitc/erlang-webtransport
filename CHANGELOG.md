@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+- New client option `socket_opts`: a list of gen_tcp/inet options for the
+  client socket, such as the source address to bind or buffer sizes. Before,
+  socket options passed to `connect` were lost. On HTTP/3 only the options
+  that apply to UDP are used and TCP-only ones are ignored; on HTTP/2 they
+  are set on the TCP socket. Without the option nothing changes.
+
 ## 0.5.3 - 2026-11-08
 
 - Requires quic 2.6.1.

@@ -89,10 +89,35 @@ webtransport:connect(Host, Port, Path, Opts).
 | `happy_eyeballs` | `true` | RFC 8305 v6/v4 racing for multi-address hosts (h3 only) |
 | `connection_attempt_delay` | 250 | Happy Eyeballs stagger between attempts, ms (h3 only) |
 | `session_ticket` | -- | Stored 0-RTT resumption ticket (h3 only; see below) |
+| `socket_opts` | `[]` | gen_tcp/inet options for the client socket (see below) |
 | `protocols` | `[]` | Subprotocols to offer, in preference order |
 | `require_protocol` | `false` | Fail with `{error, {alpn_error, _}}` when the server picks none |
 | `max_data`, `max_stream_data`, `max_streams_bidi`, `max_streams_uni` | as for listeners | Limits we grant the server |
 | `compat_mode` | `latest` | HTTP/3 draft selection (see below) |
+
+### Client socket options
+
+`socket_opts` sets options on the client's socket: the source address to
+bind, buffer sizes, TOS and so on. You need it when the client must leave
+through a given interface or address, or when you pass the same option list
+you use for plain TCP connections.
+
+```erlang
+{ok, Session} = webtransport:connect("example.com", 443, <<"/wt">>, #{
+    transport => h3,
+    socket_opts => [{ip, {192, 168, 1, 10}}, {recbuf, 262144}]
+}).
+```
+
+- On h3 the options that apply to UDP are set on the QUIC socket. TCP-only
+  options (`nodelay`, `keepalive`, `linger`, `send_timeout`,
+  `send_timeout_close`, `packet`, `delay_send`, ...) are ignored, so one list
+  works on both transports.
+- On h2 the options are set on the TCP socket under TLS and win over the
+  library's defaults.
+- Options the library controls (`active`, `mode`, `packet`, `header`,
+  `binary`, `inet`, `inet6`) and TLS options such as `verify` are ignored on
+  both. Use `family` to pick the address family.
 
 ## Subprotocols
 
