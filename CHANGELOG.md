@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.5.4 - 2026-11-10
 
 - New client option `socket_opts`: a list of gen_tcp/inet options for the
   client socket, such as the source address to bind or buffer sizes. Before,
