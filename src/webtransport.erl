@@ -152,6 +152,12 @@
     %% (`{webtransport, session_ticket, Ticket}'). Opaque term, passed back to
     %% the QUIC layer as-is. h3 only.
     session_ticket => term(),
+    %% Socket options for the client socket, as gen_tcp/inet options. On h3
+    %% the options that apply to UDP are set on the QUIC socket and TCP-only
+    %% ones are ignored; on h2 they are set on the TCP socket under TLS.
+    %% Options the library needs to control (`active', `mode', `packet',
+    %% `header', the family) and TLS options are ignored.
+    socket_opts => [gen_tcp:connect_option()],
     %% Clients pick an explicit compat mode. Default `latest' speaks
     %% http3-17. Use `legacy_browser_compat' only when talking to a known
     %% draft-02 peer (quic-go v0.9 and older), `draft07' for an http3-07
@@ -823,6 +829,13 @@ listener_sockname(Name) ->
 %% - `verify' - Optional. `verify_none' or `verify_peer' (default: verify_peer)
 %% - `headers' - Optional. Extra headers to send in CONNECT request
 %% - `timeout' - Optional. Connection timeout in ms (default: 30000)
+%% - `socket_opts' - Optional. gen_tcp/inet options for the client socket,
+%%   for example `[{ip, {192,168,1,10}}, {recbuf, 262144}]'. On h3 the
+%%   options that apply to UDP are used and TCP-only ones (`nodelay',
+%%   `keepalive', `linger', `send_timeout', ...) are ignored. On h2 they are
+%%   set on the TCP socket and win over the library's defaults. Options the
+%%   library controls (`active', `mode', `packet', `header', `inet',
+%%   `inet6') and TLS options are ignored on both.
 %%
 -spec connect(Host, Port, Path, Opts) -> {ok, session()} | {error, term()} when
     Host :: string() | binary() | inet:ip_address(),
@@ -1505,7 +1518,10 @@ connect_h3(Host, Port, Path, Opts0, Handler) ->
     end.
 
 build_h2_ssl_opts(Opts) ->
-    Base = maps:get(ssl_opts, Opts, []),
+    %% Caller socket options go last so the TLS options built here, and an
+    %% explicit `ssl_opts', still apply; h2 merges them over its defaults.
+    Base = maps:get(ssl_opts, Opts, [])
+        ++ client_tcp_socket_opts(maps:get(socket_opts, Opts, [])),
     WithVerify =
         case maps:get(verify, Opts, verify_peer) of
             verify_none -> [{verify, verify_none} | Base];
@@ -1600,12 +1616,60 @@ build_client_quic_opts(Opts) ->
         reset_stream_at => true
     },
     PassThrough = [family, happy_eyeballs, connection_attempt_delay, session_ticket],
-    lists:foldl(fun(Key, Acc) ->
+    WithPass = lists:foldl(fun(Key, Acc) ->
         case maps:find(Key, Opts) of
             {ok, Value} -> Acc#{Key => Value};
             error -> Acc
         end
-    end, Base, PassThrough).
+    end, Base, PassThrough),
+    case maps:find(socket_opts, Opts) of
+        {ok, SocketOpts} -> add_client_udp_socket_opts(SocketOpts, WithPass);
+        error -> WithPass
+    end.
+
+%% quic appends `extra_socket_opts' to gen_udp:open/2, which rejects TCP-only
+%% options, and its socket backend reads only `{ip, _}' from that list and
+%% the buffer sizes from the opts map. So keep the UDP options, and also set
+%% `recbuf'/`sndbuf' as quic opts so both backends apply them.
+add_client_udp_socket_opts(SocketOpts, QuicOpts) ->
+    Udp = client_udp_socket_opts(SocketOpts),
+    WithBufs = lists:foldl(fun
+        ({recbuf, N}, Acc) -> Acc#{recbuf => N};
+        ({sndbuf, N}, Acc) -> Acc#{sndbuf => N};
+        (_, Acc) -> Acc
+    end, QuicOpts, Udp),
+    case Udp of
+        [] -> WithBufs;
+        _ -> WithBufs#{extra_socket_opts => Udp}
+    end.
+
+%% The UDP options from a gen_tcp/inet option list (OTP inet:udp_options/0
+%% plus the bind address and port). Keys quic sets itself are left out.
+client_udp_socket_opts(SocketOpts) ->
+    Allowed = [ip, ifaddr, port, tos, tclass, priority, reuseaddr, reuseport,
+               reuseport_lb, exclusiveaddruse, sndbuf, recbuf, buffer,
+               recvtos, recvtclass, ttl, recvttl, ipv6_v6only, broadcast,
+               dontroute, multicast_if, multicast_ttl, multicast_loop,
+               add_membership, drop_membership, read_packets, raw,
+               high_msgq_watermark, low_msgq_watermark, bind_to_device],
+    [Opt || Opt <- SocketOpts, is_tuple(Opt), tuple_size(Opt) >= 2,
+            lists:member(element(1, Opt), Allowed)].
+
+%% The TCP options from a gen_tcp/inet option list. Bare atoms (`inet6',
+%% `binary') would break h2's option merge and the family comes from the
+%% resolved host; `active', `mode', `packet' and `header' belong to h2;
+%% anything else, TLS options included, is not a socket option here.
+client_tcp_socket_opts(SocketOpts) ->
+    Allowed = [ip, ifaddr, port, tos, tclass, priority, reuseaddr, reuseport,
+               reuseport_lb, exclusiveaddruse, keepalive, linger, nodelay,
+               sndbuf, recbuf, recvtos, recvtclass, ttl, recvttl,
+               packet_size, buffer, exit_on_close, high_watermark,
+               low_watermark, high_msgq_watermark, low_msgq_watermark,
+               send_timeout, send_timeout_close, delay_send, raw,
+               show_econnreset, bind_to_device, read_ahead, keepcnt,
+               keepidle, keepintvl, user_timeout],
+    [Opt || Opt <- SocketOpts, is_tuple(Opt), tuple_size(Opt) >= 2,
+            lists:member(element(1, Opt), Allowed)].
 
 %% Format an HTTP `:authority' from a host (string/binary/IP tuple) and port.
 %% IPv6 literals and 8-tuple addresses are bracketed per RFC 3986.
@@ -1911,6 +1975,37 @@ read_cacerts_file(CAFile) ->
 
 -ifdef(TEST).
 -include_lib("eunit/include/eunit.hrl").
+
+%% Without socket_opts the client opts are the same as before the option.
+client_opts_without_socket_opts_test() ->
+    ?assertEqual(#{max_datagram_frame_size => 65535, reset_stream_at => true},
+                 build_client_quic_opts(#{})),
+    ?assertEqual([{verify, verify_peer}], build_h2_ssl_opts(#{})).
+
+%% h3: UDP options reach quic, TCP-only and quic-owned ones are dropped.
+client_udp_socket_opts_test() ->
+    In = [{ip, {127, 0, 0, 1}}, {nodelay, true}, {keepalive, true},
+          {linger, {true, 1}}, {send_timeout, 1000}, {send_timeout_close, true},
+          {packet, raw}, {delay_send, true}, {active, true}, {mode, list},
+          binary, inet6, {recbuf, 4096}, {tos, 16}],
+    Q = build_client_quic_opts(#{socket_opts => In}),
+    ?assertEqual([{ip, {127, 0, 0, 1}}, {recbuf, 4096}, {tos, 16}],
+                 maps:get(extra_socket_opts, Q)),
+    ?assertEqual(4096, maps:get(recbuf, Q)),
+    ?assertNot(maps:is_key(sndbuf, Q)),
+    %% Only TCP-only options: nothing to pass to quic.
+    ?assertEqual(build_client_quic_opts(#{}),
+                 build_client_quic_opts(#{socket_opts => [{nodelay, true}]})).
+
+%% h2: TCP options join the TLS opts; h2-owned keys, atoms and TLS options
+%% are dropped so they cannot change framing or weaken verification.
+client_tcp_socket_opts_test() ->
+    In = [{recbuf, 4096}, {nodelay, true}, {active, true}, {mode, list},
+          {packet, line}, {header, 2}, inet6, binary, {verify, verify_none},
+          {cacerts, []}, {ip, {127, 0, 0, 1}}],
+    Ssl = build_h2_ssl_opts(#{socket_opts => In}),
+    ?assertEqual([{verify, verify_peer}, {recbuf, 4096}, {nodelay, true},
+                  {ip, {127, 0, 0, 1}}], Ssl).
 
 %% A CONNECT refused at the server's stream limit is sent again once
 %% quic_h3 says a stream can open, and fails at the timeout otherwise.

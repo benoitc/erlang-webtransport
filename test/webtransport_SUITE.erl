@@ -17,6 +17,11 @@
 
 %% Test cases
 -export([
+    %% Client socket options
+    client_socket_opts_bind_ip_test/1,
+    client_socket_opts_tcp_only_ignored_test/1,
+    client_socket_opts_h2_test/1,
+
     %% Basic tests
     connect_disconnect_test/1,
     session_info_test/1,
@@ -160,11 +165,14 @@ groups() ->
     ],
     %% Embedding via h3_settings/0 + accept/4 is HTTP/3-only.
     H3Only = [embedded_accept_round_trip_test, quic_stream_limit_credit_test,
-              quic_uni_stream_limit_credit_test],
+              quic_uni_stream_limit_credit_test,
+              client_socket_opts_bind_ip_test,
+              client_socket_opts_tcp_only_ignored_test],
     %% WebTransport-Init is an HTTP/2 header.
     H2Only = [invalid_webtransport_init_test, client_refuses_tls12_server_test,
               h2_embedded_accept_round_trip_test,
-              listener_refuses_tls12_client_test, accept_refuses_tls12_test],
+              listener_refuses_tls12_client_test, accept_refuses_tls12_test,
+              client_socket_opts_h2_test],
     [
         {h3_tests, [sequence], Cases ++ H3Only},
         {h2_tests, [sequence], Cases ++ H2Only},
@@ -1779,3 +1787,77 @@ legacy_round_trip(Config, Mode, Draft) ->
     Size = byte_size(Payload),
     ?assertEqual(Payload, binary:part(Echoed, byte_size(Echoed) - Size, Size)),
     ok = webtransport:close_session(Session).
+
+%% ============================================================================
+%% Client socket options
+%% ============================================================================
+
+%% h3: `{ip, _}' binds the client's QUIC socket to that address. Without it
+%% the socket is on the wildcard address.
+client_socket_opts_bind_ip_test(Config) ->
+    Port = proplists:get_value(port, Config),
+    {ok, Session} = webtransport:connect({127, 0, 0, 1}, Port, <<"/test">>, #{
+        transport => h3,
+        verify => verify_none,
+        socket_opts => [{ip, {127, 0, 0, 1}}]
+    }),
+    try
+        ?assertMatch({ok, {{127, 0, 0, 1}, _}}, h3_client_sockname(Session))
+    after
+        webtransport:close_session(Session)
+    end.
+
+%% h3: TCP-only options are accepted and ignored; the session works.
+client_socket_opts_tcp_only_ignored_test(Config) ->
+    Port = proplists:get_value(port, Config),
+    {ok, Session} = webtransport:connect("localhost", Port, <<"/test">>, #{
+        transport => h3,
+        verify => verify_none,
+        socket_opts => [{nodelay, true}, {keepalive, true}, {linger, {true, 1}},
+                        {send_timeout, 5000}, {send_timeout_close, true},
+                        {packet, raw}, {delay_send, true}]
+    }),
+    try
+        {ok, StreamId} = webtransport:open_stream(Session, bidi),
+        ok = webtransport:send(Session, StreamId, <<"ping">>, fin)
+    after
+        webtransport:close_session(Session)
+    end.
+
+%% h2: socket options reach the TCP socket under TLS. `keepalive' is off by
+%% default and the OS does not change it, so reading it back shows the option
+%% was applied (macOS auto-tunes `recbuf', so its value proves nothing).
+client_socket_opts_h2_test(Config) ->
+    Port = proplists:get_value(port, Config),
+    {ok, Session} = webtransport:connect("localhost", Port, <<"/test">>, #{
+        transport => h2,
+        verify => verify_none,
+        socket_opts => [{recbuf, 262144}, {keepalive, true}]
+    }),
+    try
+        ?assertEqual({ok, [{keepalive, true}]},
+                     ssl:getopts(h2_client_socket(Session), [keepalive]))
+    after
+        webtransport:close_session(Session)
+    end.
+
+session_transport_state(Session) ->
+    {_StateName, Data} = sys:get_state(Session),
+    element(3, Data).
+
+h3_client_sockname(Session) ->
+    H3Conn = webtransport_h3:h3_conn(session_transport_state(Session)),
+    quic:sockname(quic_h3:get_quic_conn(H3Conn)).
+
+h2_client_socket(Session) ->
+    H2Conn = webtransport_h2:h2_conn(session_transport_state(Session)),
+    find_sslsocket(sys:get_state(H2Conn)).
+
+find_sslsocket(T) when is_tuple(T), element(1, T) =:= sslsocket -> T;
+find_sslsocket(T) when is_tuple(T) -> find_sslsocket(tuple_to_list(T));
+find_sslsocket([H | Rest]) ->
+    case find_sslsocket(H) of
+        undefined -> find_sslsocket(Rest);
+        S -> S
+    end;
+find_sslsocket(_) -> undefined.
