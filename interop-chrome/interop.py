@@ -23,21 +23,14 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 
+TEST_COUNT = 4
+
 
 def get_chrome_options(headless: bool = False) -> Options:
     """Configure Chrome options for WebTransport testing."""
     options = Options()
 
-    # Required flags for WebTransport testing
-    options.add_argument("--enable-features=WebTransportDeveloperMode")
-    options.add_argument("--enable-quic")
-    options.add_argument("--quic-version=h3")
-
-    # Ignore certificate errors for self-signed certs
-    options.add_argument("--ignore-certificate-errors")
-    options.add_argument("--allow-insecure-localhost")
-
-    # Additional flags
+    # The page pins the server certificate with serverCertificateHashes.
     options.add_argument("--disable-gpu")
     options.add_argument("--no-sandbox")
 
@@ -48,13 +41,13 @@ def get_chrome_options(headless: bool = False) -> Options:
 
 
 def wait_for_server(url: str, timeout: int = 30) -> bool:
-    """Wait for the server to be ready."""
+    """Wait for the page's TCP port; the server opens it once WebTransport is up."""
     import socket
     from urllib.parse import urlparse
 
     parsed = urlparse(url)
     host = parsed.hostname or "localhost"
-    port = parsed.port or 443
+    port = parsed.port or 80
 
     start_time = time.time()
     while time.time() - start_time < timeout:
@@ -73,8 +66,8 @@ def wait_for_server(url: str, timeout: int = 30) -> bool:
 
 
 def run_tests(
-    server_url: str = "https://localhost:4433/test",
-    page_url: str = "http://localhost:8080/index.html",
+    server_url: str = "https://127.0.0.1:4433/test",
+    page_url: str = "http://127.0.0.1:8080/index.html",
     headless: bool = False,
 ) -> dict:
     """Run all WebTransport interop tests."""
@@ -109,8 +102,11 @@ def run_tests(
         run_all_btn = driver.find_element(By.XPATH, "//button[text()='Run All Tests']")
         run_all_btn.click()
 
-        # Wait for tests to complete
-        time.sleep(10)
+        # Wait for every test to finish
+        WebDriverWait(driver, 60).until(
+            lambda d: len(d.find_elements(By.CSS_SELECTOR, ".test-result.pass, .test-result.fail"))
+            == TEST_COUNT
+        )
 
         # Collect results
         results_div = driver.find_element(By.ID, "results")
@@ -156,12 +152,12 @@ def main():
     parser = argparse.ArgumentParser(description="WebTransport Chrome Interop Tests")
     parser.add_argument(
         "--server-url",
-        default="https://localhost:4433/test",
+        default="https://127.0.0.1:4433/test",
         help="WebTransport server URL",
     )
     parser.add_argument(
         "--page-url",
-        default="http://localhost:8080/index.html",
+        default="http://127.0.0.1:8080/index.html",
         help="Test page URL",
     )
     parser.add_argument("--headless", action="store_true", help="Run in headless mode")
@@ -174,7 +170,7 @@ def main():
 
     if args.wait_for_server:
         print("Waiting for server...")
-        if not wait_for_server(args.server_url):
+        if not wait_for_server(args.page_url):
             print("Server not ready, exiting")
             sys.exit(1)
         print("Server is ready")

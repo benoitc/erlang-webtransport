@@ -122,7 +122,8 @@ interfere. `scripts/interop_cross.sh` starts them all at once.
 
 When browsers are affected, check them too:
 
-- Chrome: `interop-chrome/run.sh` starts a server and drives Chrome.
+- Chrome: `interop-chrome/run.sh --headless` starts a server and drives
+  Chrome. Use `--wt-port` and `--http-port` when 4433 or 8080 are taken.
 - Safari: Docker cannot run it. Use the iOS simulators that come with Xcode
   (`xcrun simctl list runtimes`). Boot one, then open your test page with
   `xcrun simctl openurl <device> <url>`. Safari 26.2 has no WebTransport;

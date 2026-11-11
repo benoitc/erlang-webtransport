@@ -4,7 +4,7 @@
 
 -export([init/2, handle_stream/4, handle_stream_fin/4,
          handle_datagram/2, handle_stream_closed/3,
-         terminate/2]).
+         terminate/2, origin_check/2]).
 
 -record(state, {
     session :: pid(),
@@ -14,6 +14,13 @@
 %% ============================================================================
 %% Handler Callbacks
 %% ============================================================================
+
+%% Accept only the test page's origin; the library rejects browsers otherwise.
+origin_check(Headers, #{origins := Origins}) ->
+    case lists:member(proplists:get_value(<<"origin">>, Headers), Origins) of
+        true -> accept;
+        false -> {reject, 403, <<"origin not allowed">>}
+    end.
 
 init(Session, Request) ->
     io:format("Chrome client connected: ~p~n", [maps:get(path, Request, <<"/">>)]),
