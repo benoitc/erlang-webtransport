@@ -81,7 +81,7 @@
         <h3>Server Configuration</h3>
         <label>
             Server URL:
-            <input type="text" id="serverUrl" value="https://localhost:4433/test">
+            <input type="text" id="serverUrl" value="https://127.0.0.1:4433/test">
         </label>
     </div>
 
@@ -127,6 +127,16 @@
 
         const getServerUrl = () => document.getElementById('serverUrl').value;
 
+        // Pin the server's self-signed certificate by the hash it publishes.
+        const connect = async (url) => {
+            const resp = await fetch('cert-hash.txt', {cache: 'no-store'});
+            const hex = (await resp.text()).trim();
+            const value = new Uint8Array(hex.match(/../g).map(b => parseInt(b, 16)));
+            return new WebTransport(url, {
+                serverCertificateHashes: [{algorithm: 'sha-256', value}]
+            });
+        };
+
         async function runTest(testName) {
             setResult(testName, 'running', 'Running...');
             log(`Starting test: ${testName}`);
@@ -153,7 +163,7 @@
                 const url = getServerUrl();
                 log(`Connecting to ${url}...`);
 
-                const transport = new WebTransport(url);
+                const transport = await connect(url);
                 await transport.ready;
 
                 log('Connection established');
@@ -167,7 +177,7 @@
 
             bidiStream: async () => {
                 const url = getServerUrl();
-                const transport = new WebTransport(url);
+                const transport = await connect(url);
                 await transport.ready;
 
                 log('Opening bidirectional stream...');
@@ -202,7 +212,7 @@
 
             uniStream: async () => {
                 const url = getServerUrl();
-                const transport = new WebTransport(url);
+                const transport = await connect(url);
                 await transport.ready;
 
                 log('Opening unidirectional stream...');
@@ -226,7 +236,7 @@
 
             datagram: async () => {
                 const url = getServerUrl();
-                const transport = new WebTransport(url);
+                const transport = await connect(url);
                 await transport.ready;
 
                 if (!transport.datagrams) {

@@ -1,14 +1,15 @@
 %% @doc WebTransport Chrome interoperability test server.
 %%
-%% This server provides both an HTTP server for the test page and
-%% a WebTransport endpoint for browser testing.
-%%
+%% Serves the test page over HTTP and runs a WebTransport listener for it.
+%% The certificate is a short-lived ECDSA P-256 one, so the page can pin it
+%% with `serverCertificateHashes'; its SHA-256 is served as `cert-hash.txt'.
 -module(main).
 
 -export([start/0, start/1]).
 
 -define(HTTP_PORT, 8080).
 -define(WT_PORT, 4433).
+-define(HOST, {127, 0, 0, 1}).
 
 %% ============================================================================
 %% Entry Points
@@ -16,125 +17,97 @@
 
 %% @doc Start the test server with default ports.
 start() ->
-    start(#{http_port => ?HTTP_PORT, wt_port => ?WT_PORT}).
+    start(#{}).
 
-%% @doc Start the test server with custom configuration.
--spec start(Config :: map()) -> ok | {error, term()}.
+%% @doc Start the test server. Keys: `http_port', `wt_port', `work_dir'
+%% (writable, holds the cert and the served files) and `page_dir' (holds
+%% `index.html'). Halts the node when a server cannot start.
+-spec start(Config :: map()) -> no_return().
 start(Config) ->
     HttpPort = maps:get(http_port, Config, ?HTTP_PORT),
     WtPort = maps:get(wt_port, Config, ?WT_PORT),
+    PageDir = maps:get(page_dir, Config, filename:dirname(code:which(?MODULE))),
+    WorkDir = maps:get(work_dir, Config,
+                       filename:basedir(user_cache, "webtransport-chrome-interop")),
 
     io:format("Starting Chrome interop test server~n"),
-    io:format("  HTTP server: http://localhost:~p~n", [HttpPort]),
-    io:format("  WebTransport: https://localhost:~p~n", [WtPort]),
-
-    %% Generate certificates
-    case generate_certs() of
-        {ok, CertFile, KeyFile} ->
-            %% Start the HTTP server for test page
-            start_http_server(HttpPort, CertFile),
-
-            %% Start the WebTransport server
-            start_wt_server(WtPort, CertFile, KeyFile),
-
-            io:format("~nServers started successfully~n"),
-            io:format("Open http://localhost:~p in Chrome to run tests~n", [HttpPort]),
-            io:format("~nMake sure Chrome is started with:~n"),
-            io:format("  --enable-features=WebTransportDeveloperMode~n"),
-            io:format("  --ignore-certificate-errors-spki-list=<spki>~n"),
-            io:format("~n"),
-
-            %% Keep running
-            receive
-                stop -> ok
-            end;
-        {error, Reason} ->
-            io:format("Failed to generate certificates: ~p~n", [Reason]),
-            {error, Reason}
+    try
+        ok = filelib:ensure_path(WorkDir),
+        {ok, _} = application:ensure_all_started([webtransport, inets]),
+        {CertFile, KeyFile} = generate_cert(WorkDir),
+        {ok, _} = file:copy(filename:join(PageDir, "index.html"),
+                            filename:join(WorkDir, "index.html")),
+        Origins = [iolist_to_binary(io_lib:format("http://~s:~b", [H, HttpPort]))
+                   || H <- ["127.0.0.1", "localhost"]],
+        %% WebTransport first: the page port being up means both are ready.
+        ok = start_wt_server(WtPort, CertFile, KeyFile, Origins),
+        ok = start_http_server(HttpPort, WorkDir)
+    of
+        ok ->
+            io:format("  WebTransport: https://127.0.0.1:~b/test~n", [WtPort]),
+            io:format("  Test page:    http://127.0.0.1:~b/index.html~n", [HttpPort]),
+            receive stop -> erlang:halt(0) end
+    catch
+        Class:Reason ->
+            io:format("Server failed to start: ~p:~p~n", [Class, Reason]),
+            erlang:halt(1)
     end.
 
 %% ============================================================================
 %% Certificate Generation
 %% ============================================================================
 
-generate_certs() ->
-    PrivDir = filename:join([code:priv_dir(webtransport), "interop-chrome"]),
-    filelib:ensure_dir(filename:join(PrivDir, "placeholder")),
-
-    CertFile = filename:join(PrivDir, "cert.pem"),
-    KeyFile = filename:join(PrivDir, "key.pem"),
-
-    %% Generate if not exists
-    case filelib:is_file(CertFile) of
-        true ->
-            {ok, CertFile, KeyFile};
-        false ->
-            KeyCmd = io_lib:format(
-                "openssl genrsa -out ~s 2048 2>/dev/null",
-                [KeyFile]
-            ),
-            case os:cmd(lists:flatten(KeyCmd)) of
-                "" ->
-                    CertCmd = io_lib:format(
-                        "openssl req -new -x509 -key ~s -out ~s -days 30 "
-                        "-subj \"/CN=localhost\" 2>/dev/null",
-                        [KeyFile, CertFile]
-                    ),
-                    case os:cmd(lists:flatten(CertCmd)) of
-                        "" -> {ok, CertFile, KeyFile};
-                        Err2 -> {error, {cert_failed, Err2}}
-                    end;
-                Err1 ->
-                    {error, {key_failed, Err1}}
-            end
-    end.
+%% serverCertificateHashes needs ECDSA and a validity of at most 14 days.
+generate_cert(Dir) ->
+    CertFile = filename:join(Dir, "cert.pem"),
+    KeyFile = filename:join(Dir, "key.pem"),
+    Cmd = io_lib:format(
+        "openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 "
+        "-nodes -days 10 -subj /CN=localhost "
+        "-addext subjectAltName=DNS:localhost,IP:127.0.0.1 "
+        "-keyout '~s' -out '~s' 2>&1",
+        [KeyFile, CertFile]),
+    _ = os:cmd(lists:flatten(Cmd)),
+    {ok, Pem} = file:read_file(CertFile),
+    [{'Certificate', Der, not_encrypted} | _] = public_key:pem_decode(Pem),
+    Hash = binary:encode_hex(crypto:hash(sha256, Der), lowercase),
+    ok = file:write_file(filename:join(Dir, "cert-hash.txt"), Hash),
+    {CertFile, KeyFile}.
 
 %% ============================================================================
 %% HTTP Server (for test page)
 %% ============================================================================
 
-start_http_server(Port, CertFile) ->
-    %% Simple HTTP server using inets
-    inets:start(),
-    ServerRoot = filename:dirname(CertFile),
-    DocRoot = filename:dirname(code:which(?MODULE)),
-
-    %% Create mime.types if needed
-    MimeTypes = filename:join(ServerRoot, "mime.types"),
-    file:write_file(MimeTypes, "text/html html\napplication/javascript js\ntext/css css\n"),
-
+start_http_server(Port, Dir) ->
     Options = [
         {port, Port},
+        {bind_address, ?HOST},
         {server_name, "webtransport-test"},
-        {server_root, ServerRoot},
-        {document_root, DocRoot},
-        {mime_types, [{"html", "text/html"}, {"js", "application/javascript"}]},
+        {server_root, Dir},
+        {document_root, Dir},
+        {mime_types, [{"html", "text/html"}, {"txt", "text/plain"}]},
         {modules, [mod_get]}
     ],
-
     case inets:start(httpd, Options) of
-        {ok, _Pid} ->
-            io:format("  HTTP server started on port ~p~n", [Port]);
-        {error, Reason} ->
-            io:format("  HTTP server failed: ~p~n", [Reason])
+        {ok, _Pid} -> ok;
+        {error, Reason} -> error({http_server, Reason})
     end.
 
 %% ============================================================================
 %% WebTransport Server
 %% ============================================================================
 
-start_wt_server(Port, CertFile, KeyFile) ->
+start_wt_server(Port, CertFile, KeyFile, Origins) ->
     ListenerOpts = #{
         transport => h3,
+        ip => ?HOST,
         port => Port,
         certfile => CertFile,
         keyfile => KeyFile,
-        handler => chrome_test_handler
+        handler => chrome_test_handler,
+        handler_opts => #{origins => Origins}
     },
-
     case webtransport:start_listener(chrome_interop, ListenerOpts) of
-        {ok, _Pid} ->
-            io:format("  WebTransport server started on port ~p~n", [Port]);
-        {error, Reason} ->
-            io:format("  WebTransport server failed: ~p~n", [Reason])
+        {ok, _Pid} -> ok;
+        {error, Reason} -> error({wt_server, Reason})
     end.
