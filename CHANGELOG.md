@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.5.6 - 2026-11-13
 
 - Requires quic 2.7.0 and h2 0.17.0. Over HTTP/3, a client now rejects a
   server certificate whose names do not match the host under RFC 9525
