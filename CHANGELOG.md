@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.5.7 - 2026-11-13
 
 - Over HTTP/3, a session now ends when its connection closes, as
   draft-ietf-webtrans-http3-17 §6 requires. Before, server and client
