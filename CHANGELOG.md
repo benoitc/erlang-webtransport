@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.5.6 - 2026-11-13
+
+- Requires quic 2.7.0 and h2 0.17.0. Over HTTP/3, a client now rejects a
+  server certificate whose names do not match the host under RFC 9525
+  (partial wildcards, certificates matched only by common name, and IP
+  addresses not listed in the certificate). quic now pulls in idna.
+
 ## 0.5.5 - 2026-11-10
 
 - Requires h2 0.15.1. Over HTTP/2, a session now learns at once that the
