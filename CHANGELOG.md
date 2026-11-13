@@ -18,6 +18,11 @@
   send that cannot go out at once returns `{error, send_buffer_full}`.
   Before, a peer that never granted credit made the queue grow without
   limit, and each credit update copied the whole queue.
+- A client `cacertfile` that could not be read, or held no certificate,
+  was skipped, and over HTTP/3 the server was then checked against the
+  system trust store instead of the CAs you chose. `connect` now fails with
+  `{error, {cacertfile, File, Reason}}`. Over HTTP/3 an unusable client
+  `certfile` or `keyfile` fails the same way.
 
 ## 0.5.7 - 2026-11-13
 

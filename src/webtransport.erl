@@ -1453,7 +1453,13 @@ dispatch_h2_capsule(Session, Capsule) ->
 %% Internal Functions - Client Connection
 %% ============================================================================
 
-connect_h2(Host, Port, Path, Opts, Handler) ->
+connect_h2(Host, Port, Path, Opts0, Handler) ->
+    case load_client_tls_files(h2, Opts0) of
+        {ok, Opts} -> connect_h2_loaded(Host, Port, Path, Opts, Handler);
+        {error, _} = Err -> Err
+    end.
+
+connect_h2_loaded(Host, Port, Path, Opts, Handler) ->
     Caller = self(),
     UserHandlerOpts = maps:get(handler_opts, Opts, #{}),
     HandlerOpts = maps:merge(#{owner => Caller}, UserHandlerOpts),
@@ -1520,6 +1526,12 @@ h2_start_session(TransportState, Path, Authority, RespHeaders, Protocol, Opts, H
     end.
 
 connect_h3(Host, Port, Path, Opts0, Handler) ->
+    case load_client_tls_files(h3, Opts0) of
+        {ok, Opts} -> connect_h3_loaded(Host, Port, Path, Opts, Handler);
+        {error, _} = Err -> Err
+    end.
+
+connect_h3_loaded(Host, Port, Path, Opts0, Handler) ->
     Caller = self(),
     UserHandlerOpts = maps:get(handler_opts, Opts0, #{}),
     HandlerOpts = maps:merge(#{owner => Caller}, UserHandlerOpts),
@@ -1978,11 +1990,39 @@ read_key_file(KeyFile) ->
             {error, {key_read_failed, Reason}}
     end.
 
+%% Read the client's certificate files before connecting, so a file that
+%% cannot be used fails the connect instead of being skipped. A skipped
+%% `cacertfile' would leave the default trust store in place of the CAs the
+%% caller asked for. Over HTTP/3 the client certificate and key are read
+%% here too; over HTTP/2 ssl reads and checks them.
+load_client_tls_files(Transport, Opts) ->
+    Files = case Transport of
+        h3 -> [{cacertfile, cacerts, fun read_cacerts_file/1},
+               {certfile, cert, fun read_cert_file/1},
+               {keyfile, key, fun read_key_file/1}];
+        h2 -> [{cacertfile, cacerts, fun read_cacerts_file/1}]
+    end,
+    load_tls_files(Files, Opts).
+
+load_tls_files([], Opts) ->
+    {ok, Opts};
+load_tls_files([{FileKey, Key, Read} | Rest], Opts) ->
+    case maps:take(FileKey, Opts) of
+        error ->
+            load_tls_files(Rest, Opts);
+        {File, Opts1} ->
+            case Read(File) of
+                {ok, Value} -> load_tls_files(Rest, Opts1#{Key => Value});
+                {error, Reason} -> {error, {FileKey, File, Reason}}
+            end
+    end.
+
 %% @private Read CA certificates from a PEM file.
 read_cacerts_file(CAFile) ->
     case file:read_file(CAFile) of
         {ok, PemData} ->
-            Certs = [Der || {_, Der, _} <- public_key:pem_decode(PemData)],
+            Certs = [Der || {'Certificate', Der, not_encrypted}
+                                <- public_key:pem_decode(PemData)],
             case Certs of
                 [] -> {error, no_certificates};
                 _ -> {ok, Certs}
@@ -1997,6 +2037,34 @@ read_cacerts_file(CAFile) ->
 
 -ifdef(TEST).
 -include_lib("eunit/include/eunit.hrl").
+
+%% A client CA, certificate or key file that cannot be used fails the
+%% connect; it is never skipped in favour of the default trust store.
+load_client_tls_files_test_() ->
+    Dir = filename:join(["/tmp", "wt_tls_files_" ++ integer_to_list(erlang:unique_integer([positive]))]),
+    ok = filelib:ensure_dir(filename:join(Dir, "x")),
+    NoCerts = filename:join(Dir, "nocerts.pem"),
+    ok = file:write_file(NoCerts, <<"not a pem file\n">>),
+    Missing = filename:join(Dir, "missing.pem"),
+    [
+        ?_assertMatch({error, {cacertfile, Missing, _}},
+                      load_client_tls_files(h3, #{cacertfile => Missing})),
+        ?_assertMatch({error, {cacertfile, Missing, _}},
+                      load_client_tls_files(h2, #{cacertfile => Missing})),
+        ?_assertEqual({error, {cacertfile, NoCerts, no_certificates}},
+                      load_client_tls_files(h3, #{cacertfile => NoCerts})),
+        ?_assertEqual({error, {cacertfile, NoCerts, no_certificates}},
+                      load_client_tls_files(h2, #{cacertfile => NoCerts})),
+        ?_assertMatch({error, {certfile, Missing, _}},
+                      load_client_tls_files(h3, #{certfile => Missing})),
+        ?_assertMatch({error, {keyfile, Missing, _}},
+                      load_client_tls_files(h3, #{keyfile => Missing})),
+        %% Over HTTP/2 ssl reads the client certificate and key itself.
+        ?_assertEqual({ok, #{certfile => Missing}},
+                      load_client_tls_files(h2, #{certfile => Missing})),
+        ?_assertEqual({ok, #{verify => verify_none}},
+                      load_client_tls_files(h3, #{verify => verify_none}))
+    ].
 
 %% Without socket_opts the client opts are the same as before the option.
 client_opts_without_socket_opts_test() ->

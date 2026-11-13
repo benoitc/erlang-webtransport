@@ -80,7 +80,7 @@ webtransport:connect(Host, Port, Path, Opts).
 |--------|---------|-------------|
 | `transport` | `h3` | `h2` or `h3` |
 | `verify` | `verify_peer` | `verify_peer` or `verify_none` |
-| `cacertfile` | -- | Path to CA certificate bundle |
+| `cacertfile` | -- | Path to CA certificate bundle. A file that cannot be read or holds no certificate fails the connect with `{error, {cacertfile, File, Reason}}` |
 | `certfile` | -- | Client certificate (mutual TLS) |
 | `keyfile` | -- | Client private key (mutual TLS) |
 | `headers` | `[]` | Extra headers on the CONNECT request |
