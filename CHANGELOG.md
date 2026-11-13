@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.5.8 - 2026-11-13
 
 - Over HTTP/2, a client session that ended (for example after a drain)
   could kill the process that called `connect` with
