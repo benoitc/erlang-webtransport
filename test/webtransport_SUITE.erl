@@ -75,6 +75,8 @@
     close_stream_with_queue_test/1,
     server_drain_reaches_client_test/1,
     stream_credit_replenish_test/1,
+    connection_close_ends_session_test/1,
+    connection_close_stops_router_test/1,
     server_without_wt_enabled_test/1,
     invalid_webtransport_init_test/1,
     client_refuses_tls12_server_test/1,
@@ -128,6 +130,7 @@ groups() ->
         close_stream_with_queue_test,
         server_drain_reaches_client_test,
         stream_credit_replenish_test,
+        connection_close_ends_session_test,
         connect_disconnect_test,
         session_info_test,
         open_bidi_stream_test,
@@ -165,6 +168,7 @@ groups() ->
     ],
     %% Embedding via h3_settings/0 + accept/4 is HTTP/3-only.
     H3Only = [embedded_accept_round_trip_test, quic_stream_limit_credit_test,
+              connection_close_stops_router_test,
               quic_uni_stream_limit_credit_test,
               client_socket_opts_bind_ip_test,
               client_socket_opts_tcp_only_ignored_test],
@@ -840,6 +844,90 @@ server_initiated_bidi_test(Config) ->
 
 flush_exits() ->
     receive {'EXIT', _, _} -> flush_exits() after 0 -> ok end.
+
+%% http3-17 §6, http2-16 §3.4: the connection closing ends every session on
+%% it. Only the client's connection is closed, so the server session can
+%% learn it from the connection alone.
+connection_close_ends_session_test(Config) ->
+    process_flag(trap_exit, true),
+    Transport = proplists:get_value(transport, Config),
+    Port = test_helpers:find_free_port(),
+    Name = list_to_atom(lists:concat(["conn_close_", Transport])),
+    {ok, _} = webtransport:start_listener(Name, #{
+        transport => Transport,
+        port => Port,
+        certfile => proplists:get_value(certfile, Config),
+        keyfile => proplists:get_value(keyfile, Config),
+        handler => wt_close_observer_handler,
+        handler_opts => #{owner => self()}
+    }),
+    try
+        timer:sleep(100),
+        {ok, Session} = webtransport:connect("localhost", Port, <<"/test">>, #{
+            transport => Transport,
+            verify => verify_none
+        }),
+        %% The server session started before the 2xx that `connect' waited
+        %% for.
+        Ref = erlang:monitor(process, Session),
+        ok = close_client_connection(Transport, Session),
+        receive
+            {terminated, _Server, {closed, 0, <<"connection closed">>}} -> ok
+        after 5000 ->
+            error(server_session_not_closed)
+        end,
+        receive
+            {'DOWN', Ref, process, Session, _} -> ok
+        after 5000 ->
+            error(client_session_not_closed)
+        end
+    after
+        webtransport:stop_listener(Name),
+        timer:sleep(100),
+        flush_exits(),
+        process_flag(trap_exit, false)
+    end.
+
+%% The listener's per-connection router stops when the connection closes,
+%% also for a connection that never opened a WebTransport stream.
+connection_close_stops_router_test(Config) ->
+    Port = proplists:get_value(port, Config),
+    Before = count_routers(),
+    {ok, Conn} = quic_h3:connect("localhost", Port, #{verify => verify_none, sync => true}),
+    {ok, StreamId} = quic_h3:request(Conn, [{<<":method">>, <<"GET">>},
+                                            {<<":scheme">>, <<"https">>},
+                                            {<<":authority">>, <<"localhost">>},
+                                            {<<":path">>, <<"/">>}]),
+    receive
+        {quic_h3, Conn, {response, StreamId, _Status, _}} -> ok
+    after 5000 ->
+        error(no_response)
+    end,
+    quic_h3:close(Conn),
+    ok = wait_until(fun() -> count_routers() =< Before end, 5000).
+
+count_routers() ->
+    length([P || P <- erlang:processes(),
+                 proc_lib:translate_initial_call(P) =:= {webtransport_h3_router, init, 1}]).
+
+wait_until(Fun, Timeout) when Timeout =< 0 ->
+    case Fun() of true -> ok; false -> {error, timeout} end;
+wait_until(Fun, Timeout) ->
+    case Fun() of
+        true -> ok;
+        false -> timer:sleep(100), wait_until(Fun, Timeout - 100)
+    end.
+
+%% Close the client's connection under a session, without closing the
+%% session first.
+close_client_connection(Transport, Session) ->
+    {_StateName, Data} = sys:get_state(Session),
+    TransportState = element(3, Data),
+    case Transport of
+        h3 -> quic_h3:close(webtransport_h3:h3_conn(TransportState));
+        h2 -> h2:close(webtransport_h2:h2_conn(TransportState))
+    end,
+    ok.
 
 %% Accumulate bytes per stream id until we see a FIN on a stream that is
 %% not the one the client opened; assert that it carries the expected

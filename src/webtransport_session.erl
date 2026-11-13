@@ -94,6 +94,8 @@
     %% Types refused by the QUIC connection's stream limit (h3), waiting
     %% for quic's streams_available notice.
     transport_blocked = #{} :: #{bidi | uni => true},
+    %% h3: monitor on the H3 connection. Its end ends the session.
+    conn_monitor :: undefined | reference(),
     %% Flags
     is_server :: boolean(),
     close_info :: undefined | {non_neg_integer(), binary()}
@@ -249,7 +251,8 @@ init({Transport, TransportState, Handler, Opts}) ->
         request = Request,
         is_server = IsServer,
         next_bidi_id = NextBidi,
-        next_uni_id = NextUni
+        next_uni_id = NextUni,
+        conn_monitor = monitor_connection(Transport, TransportState)
     }),
 
     %% Initialize handler. `code:ensure_loaded/1' is required because
@@ -283,6 +286,13 @@ init({Transport, TransportState, Handler, Opts}) ->
         {error, Reason} ->
             {stop, Reason}
     end.
+
+%% h3: watch the H3 connection, so the session ends with it (http3-17 §6).
+%% On h2 the CONNECT stream's data loop watches the connection.
+monitor_connection(h3, TransportState) ->
+    erlang:monitor(process, webtransport_h3:h3_conn(TransportState));
+monitor_connection(h2, _TransportState) ->
+    undefined.
 
 %% Flow-control limits at session start.
 %%
@@ -481,6 +491,10 @@ open(info, {quic_h3, _Conn, {stream_reset, StreamId, _Code}},
         StreamId -> connect_stream_gone(<<"CONNECT stream reset">>, StateData);
         _ -> {keep_state, StateData}
     end;
+%% http3-17 §6: the connection closing ends the CONNECT stream, and so the
+%% session. Nothing can be sent any more.
+open(info, {'DOWN', Ref, process, _, _}, #data{conn_monitor = Ref} = StateData) ->
+    {stop, normal, StateData#data{close_info = {0, <<"connection closed">>}}};
 
 open(info, Msg, #data{handler = Handler, handler_state = HState} = StateData) ->
     case erlang:function_exported(Handler, handle_info, 2) of

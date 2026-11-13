@@ -1146,8 +1146,9 @@ start_h3_listener(Name, Opts) ->
         {ok, CertDer, PrivateKey} ->
             Claim = wt_stream_type_handler(),
 
-            ConnectionHandler = fun(_QuicConnPid) ->
-                {ok, Router} = webtransport_h3_router:start(undefined),
+            %% The router stops when the QUIC connection ends.
+            ConnectionHandler = fun(QuicConnPid) ->
+                {ok, Router} = webtransport_h3_router:start(undefined, QuicConnPid),
                 #{
                     owner => Router,
                     handler => make_h3_handler(Handler, HandlerOpts, Opts, Router),

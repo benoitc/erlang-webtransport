@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+- Over HTTP/3, a session now ends when its connection closes, as
+  draft-ietf-webtrans-http3-17 §6 requires. Before, server and client
+  sessions kept running after their connection was gone.
+- The HTTP/3 listener now stops its per-connection state when a connection
+  closes. Before, it was kept for connections that never opened a
+  WebTransport stream, and memory grew with every such connection.
+
 ## 0.5.6 - 2026-11-13
 
 - Requires quic 2.7.0 and h2 0.17.0. Over HTTP/3, a client now rejects a
