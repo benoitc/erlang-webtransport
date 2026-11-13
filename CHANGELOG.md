@@ -8,6 +8,13 @@
 - The HTTP/3 listener now stops its per-connection state when a connection
   closes. Before, it was kept for connections that never opened a
   WebTransport stream, and memory grew with every such connection.
+- A peer can no longer make a session hold a large unfinished capsule on
+  the CONNECT stream. Padding and unknown capsules are skipped as they
+  arrive (RFC 9297 §3.2), oversized datagrams are discarded (RFC 9297
+  §3.5), and over HTTP/2 a stream capsule larger than the flow-control
+  window ends the session with a flow-control error
+  (draft-ietf-webtrans-http2-16 §6.6). Before, each session could hold up
+  to 64 MiB.
 
 ## 0.5.6 - 2026-11-13
 

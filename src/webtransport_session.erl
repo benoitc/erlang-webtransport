@@ -18,7 +18,6 @@
 %% on h3, where QUIC does them.
 -define(UNLIMITED, 1 bsl 62).
 %% Largest capsule we buffer on the h3 CONNECT stream.
--define(CONNECT_BUFFER_MAX, 64 * 1024 * 1024).
 %% Largest Maximum Streams value (http3-17 §5.6.2, http2-16 §6.7).
 -define(MAX_STREAMS, 1 bsl 60).
 
@@ -86,8 +85,9 @@
     %% established: after the 2xx on a server, after registration on a
     %% client. Before that nothing may go out on the CONNECT stream.
     pending_actions = [] :: [webtransport_handler:action()],
-    %% h3: CONNECT stream bytes that do not end on a capsule boundary yet.
-    connect_buf = <<>> :: binary(),
+    %% h3: reads the capsules on the CONNECT stream and holds what arrived
+    %% of one that is not whole yet.
+    connect_reader = wt_capsule_reader:new(wt_h3_capsule, #{}) :: wt_capsule_reader:reader(),
     %% Stream types we failed to open for lack of credit; the handler is told
     %% when credit comes back (overview-14 §4.3).
     blocked = #{} :: #{bidi | uni => true},
@@ -517,20 +517,19 @@ open(info, Msg, #data{handler = Handler, handler_state = HState} = StateData) ->
 %% A malformed capsule, a bad WT_CLOSE_SESSION reason, or anything after
 %% WT_CLOSE_SESSION resets the stream with H3_MESSAGE_ERROR (http3-17 §6).
 %% The stream ending without WT_CLOSE_SESSION ends the session too.
-handle_connect_data(Data, Fin, #data{connect_buf = Buf} = StateData) ->
-    case wt_h3_capsule:decode_all(<<Buf/binary, Data/binary>>) of
-        {ok, _Capsules, Rest} when byte_size(Rest) > ?CONNECT_BUFFER_MAX ->
-            connect_message_error(<<"capsule too large">>, StateData);
-        {ok, Capsules, Rest} ->
+handle_connect_data(Data, Fin, #data{connect_reader = Reader} = StateData) ->
+    case wt_capsule_reader:feed(Data, Reader) of
+        {ok, Capsules, Reader1} ->
+            Pending = wt_capsule_reader:pending(Reader1),
             case lists:splitwith(fun(C) -> element(1, C) =/= close_session end, Capsules) of
                 {_, [_Close, _ | _]} ->
                     connect_message_error(<<"data after WT_CLOSE_SESSION">>, StateData);
-                {_, [_Close]} when Rest =/= <<>> ->
+                {_, [_Close]} when Pending ->
                     connect_message_error(<<"data after WT_CLOSE_SESSION">>, StateData);
-                _ when Fin, Rest =/= <<>> ->
+                _ when Fin, Pending ->
                     connect_message_error(<<"CONNECT stream ended inside a capsule">>, StateData);
                 _ ->
-                    Result = apply_capsule_list(Capsules, StateData#data{connect_buf = Rest}),
+                    Result = apply_capsule_list(Capsules, StateData#data{connect_reader = Reader1}),
                     case {Fin, Result} of
                         {true, {keep_state, SD}} ->
                             connect_stream_gone(<<"peer closed CONNECT">>, SD);
@@ -542,7 +541,9 @@ handle_connect_data(Data, Fin, #data{connect_buf = Buf} = StateData) ->
                             Result
                     end
             end;
-        {error, Reason} ->
+        {error, {_Kind, Reason}} when is_binary(Reason) ->
+            connect_message_error(Reason, StateData);
+        {error, {_Kind, Reason}} ->
             logger:warning("h3 CONNECT capsule decode error: ~p", [Reason]),
             connect_message_error(<<"malformed capsule">>, StateData)
     end.
@@ -584,6 +585,10 @@ apply_capsule(connect_fin, StateData) ->
 apply_capsule({malformed, Reason}, StateData) ->
     %% RFC 9297 §3.3: a malformed capsule stream is a session error.
     stop_with_session_error(?WT_ERROR_GENERIC, Reason, StateData);
+%% h2: a WT_STREAM capsule carries more than the stream's window allows
+%% (http2-16 §6.6).
+apply_capsule({flow_control_error, Reason}, StateData) ->
+    stop_with_session_error(?WT_FLOW_CONTROL_ERROR, Reason, StateData);
 %% The connection failed under the session (h2 SETTINGS error): nothing can
 %% be sent any more.
 apply_capsule({connection_error, Reason}, StateData) ->
@@ -1418,6 +1423,9 @@ handle_incoming_capsule({close_session, ErrorCode, Reason}, #data{} = StateData)
     StateData#data{close_info = {ErrorCode, Reason}, peer_closed = true};
 handle_incoming_capsule({drain_session}, #data{} = StateData) ->
     StateData;
+%% A capsule the reader skipped without holding it (RFC 9297 §3.2, §3.5).
+handle_incoming_capsule({dropped, _Type}, StateData) ->
+    StateData;
 handle_incoming_capsule({unknown, Type, _Payload}, StateData) ->
     %% RFC 9297 §3.2: an unknown capsule type MUST be silently dropped.
     logger:debug("webtransport: dropping unknown capsule type ~p", [Type]),
@@ -2149,11 +2157,36 @@ connect_capsule_split_test() ->
     Wire = wt_h3_capsule:encode({max_data, 4096}),
     <<A:3/binary, B/binary>> = Wire,
     {keep_state, D1} = handle_connect_data(A, false, Data),
-    ?assertEqual(A, D1#data.connect_buf),
+    ?assert(wt_capsule_reader:pending(D1#data.connect_reader)),
     ?assertEqual(0, D1#data.remote_max_data),
     {keep_state, D2} = handle_connect_data(B, false, D1),
-    ?assertEqual(<<>>, D2#data.connect_buf),
+    ?assertNot(wt_capsule_reader:pending(D2#data.connect_reader)),
     ?assertEqual(4096, D2#data.remote_max_data).
+
+%% RFC 9297 §3.2: a capsule type the h3 CONNECT stream does not use is
+%% skipped as it arrives, however long it says it is: nothing is held.
+connect_unknown_capsule_skipped_test() ->
+    Data = (test_data())#data{transport = h3},
+    Header = <<(h2_varint:encode(16#21))/binary, (h2_varint:encode(1 bsl 30))/binary>>,
+    {keep_state, D1} = handle_connect_data(<<Header/binary, 0:8192>>, false, Data),
+    {keep_state, D2} = handle_connect_data(<<0:1048576>>, false, D1),
+    ?assert(wt_capsule_reader:pending(D2#data.connect_reader)),
+    ?assert(erts_debug:flat_size(D2#data.connect_reader) < 64).
+
+%% http3-17 §6: a WT_CLOSE_SESSION longer than a 1024-byte reason allows
+%% resets the CONNECT stream with H3_MESSAGE_ERROR from its header.
+connect_oversize_close_test() ->
+    %% A transport whose connection is gone: the reset is attempted and
+    %% fails quietly.
+    Parent = self(),
+    Pid = spawn(fun() -> Parent ! {state, webtransport_h3:new_for_test(0)} end),
+    State = receive {state, S} -> S end,
+    Ref = erlang:monitor(process, Pid),
+    receive {'DOWN', Ref, _, _, _} -> ok end,
+    Data = (test_data())#data{transport = h3, transport_state = State},
+    Header = <<(h2_varint:encode(?WT_CLOSE_SESSION))/binary, (h2_varint:encode(2000))/binary>>,
+    ?assertMatch({stop, {shutdown, {session_error, ?H3_MESSAGE_ERROR}}, _},
+                 handle_connect_data(Header, false, Data)).
 
 %% Finished streams leave the map; a finished peer stream returns credit.
 retire_stream_test() ->

@@ -170,11 +170,6 @@
 
 -include("webtransport.hrl").
 
-%% Largest partial capsule the h2 CONNECT-stream reader buffers before
-%% treating the peer as misbehaving (a WT_STREAM capsule is one send/4
-%% payload, so this bounds the biggest single send a peer may make).
--define(H2_CAPSULE_BUFFER_MAX, 64 * 1024 * 1024).
-
 %% ============================================================================
 %% Integration API
 %% ============================================================================
@@ -629,7 +624,10 @@ start_accepted(h2, Conn, StreamId, Handler, SessionOpts, RespHeaders, _Router) -
                 _ -> h2:get_peer_settings(Conn)
             end,
             %% h2 buffers server stream events until a handler registers.
-            LoopPid = spawn(fun() -> h2_data_loop(Conn, StreamId, Session) end),
+            StreamWindow = maps:get(max_stream_data, SessionOpts, ?DEFAULT_MAX_STREAM_DATA),
+            LoopPid = spawn(fun() ->
+                h2_data_loop(Conn, StreamId, Session, [], StreamWindow)
+            end),
             _ = h2:set_stream_handler(Conn, StreamId, LoopPid),
             ok = webtransport_session:established(Session, #{peer_settings => PeerSettings}),
             {ok, Session};
@@ -1290,20 +1288,24 @@ allowed_by_listener(_, _) -> false.
 %% Internal Functions - Data Loops
 %% ============================================================================
 
+-ifdef(TEST).
 h2_data_loop(Conn, StreamId, Session) ->
-    h2_data_loop(Conn, StreamId, Session, []).
+    h2_data_loop(Conn, StreamId, Session, [], ?DEFAULT_MAX_STREAM_DATA).
+-endif.
 
 %% `Prefix' are events for the CONNECT stream that reached another process
 %% before this loop became the stream's handler; they are handled first, so
-%% the order is kept.
-h2_data_loop(Conn, StreamId, Session, Prefix) ->
+%% the order is kept. `StreamWindow' is the session's per-stream receive
+%% window (`max_stream_data'): no WT_STREAM capsule may carry more.
+h2_data_loop(Conn, StreamId, Session, Prefix, StreamWindow) ->
     %% Monitor both ends so the loop can never orphan: if the h2 connection
     %% dies without a `closed' message, or the session goes away, we exit
     %% instead of blocking in `receive' forever.
     ConnRef = erlang:monitor(process, Conn),
     SessionRef = erlang:monitor(process, Session),
     Loop = {Conn, StreamId, Session, ConnRef, SessionRef},
-    case h2_data_events(Prefix, Loop, <<>>) of
+    Reader = wt_capsule_reader:new(wt_h2_capsule, #{max_stream_data => StreamWindow}),
+    case h2_data_events(Prefix, Loop, Reader) of
         {continue, Buf} -> h2_data_loop_receive(Loop, Buf);
         stop -> ok
     end.
@@ -1325,41 +1327,42 @@ h2_data_loop_receive(Loop, Buf) ->
             end
     end.
 
-%% `Buf' holds the tail of the previous DATA frame that did not end on a
-%% capsule boundary. A WT_STREAM capsule carries a whole send/4 payload, and
-%% h2 splits it into DATA frames of at most SETTINGS_MAX_FRAME_SIZE (16 KiB
-%% by default), so most capsules over that size arrive in pieces.
+%% `Buf' is the capsule reader: it holds what arrived of a capsule that is
+%% not whole yet. h2 splits capsules into DATA frames of at most
+%% SETTINGS_MAX_FRAME_SIZE (16 KiB by default), so most capsules over that
+%% size arrive in pieces.
 h2_data_event({h2, Conn, {data, StreamId, Data, IsFin}},
               {Conn, StreamId, Session, ConnRef, SessionRef}, Buf) ->
-    case webtransport_h2:decode_capsules(<<Buf/binary, Data/binary>>) of
-        {ok, Capsules, Rest} when byte_size(Rest) =< ?H2_CAPSULE_BUFFER_MAX ->
-            lists:foreach(fun(Capsule) -> dispatch_h2_capsule(Session, Capsule) end,
+    case wt_capsule_reader:feed(Data, Buf) of
+        {ok, Capsules, Buf1} ->
+            lists:foreach(fun({dropped, _}) -> ok;
+                             (Capsule) -> dispatch_h2_capsule(Session, Capsule)
+                          end,
                           Capsules),
-            case IsFin of
-                true when Rest =/= <<>> ->
+            case {IsFin, wt_capsule_reader:pending(Buf1)} of
+                {true, true} ->
                     %% RFC 9297 §3.3: the stream ended inside a capsule.
                     cleanup_data_loop(ConnRef, SessionRef),
                     webtransport_session:handle_capsule(Session, {malformed, <<"truncated capsule">>}),
                     stop;
-                true ->
+                {true, false} ->
                     %% http2-16 §3.4: the peer closing the stream ends the
                     %% session.
                     cleanup_data_loop(ConnRef, SessionRef),
                     webtransport_session:handle_capsule(Session, connect_fin),
                     stop;
-                false ->
-                    {continue, Rest}
+                {false, _} ->
+                    {continue, Buf1}
             end;
-        {ok, _Capsules, _Rest} ->
-            %% A single capsule larger than we are willing to hold.
-            logger:warning("h2 capsule exceeds ~p bytes", [?H2_CAPSULE_BUFFER_MAX]),
+        {error, {flow_control, Reason}} ->
+            %% http2-16 §6.6: more stream data than the window allows.
             cleanup_data_loop(ConnRef, SessionRef),
-            webtransport_session:handle_capsule(Session, {malformed, <<"capsule too large">>}),
+            webtransport_session:handle_capsule(Session, {flow_control_error, Reason}),
             stop;
-        {error, Reason} ->
+        {error, {malformed, Reason}} ->
             logger:warning("h2 capsule decode error: ~p", [Reason]),
             cleanup_data_loop(ConnRef, SessionRef),
-            webtransport_session:handle_capsule(Session, {malformed, <<"malformed capsule">>}),
+            webtransport_session:handle_capsule(Session, {malformed, malformed_reason(Reason)}),
             stop
     end;
 %% Client: the server changed its SETTINGS (notify_peer_settings). http2-16
@@ -1400,6 +1403,9 @@ h2_data_event({'DOWN', SessionRef, process, _, _}, {_, _, _, ConnRef, SessionRef
     stop;
 h2_data_event(_Msg, _Loop, Buf) ->
     {continue, Buf}.
+
+malformed_reason(Reason) when is_binary(Reason) -> Reason;
+malformed_reason(_) -> <<"malformed capsule">>.
 
 %% Client side: events for the CONNECT stream that reached the connecting
 %% process between the 2xx and the data loop taking over the stream.
@@ -1483,9 +1489,11 @@ h2_start_session(TransportState, Path, Authority, RespHeaders, Protocol, Opts, H
             StreamId = webtransport_h2:connect_stream_id(TransportState),
             %% Data the server sent right after the 2xx went to us. The loop
             %% waits for it before reading its own mailbox.
+            StreamWindow = maps:get(max_stream_data, SessionOpts, ?DEFAULT_MAX_STREAM_DATA),
             LoopPid = spawn(fun() ->
                 receive
-                    {prefix, Prefix} -> h2_data_loop(H2Conn, StreamId, Session, Prefix)
+                    {prefix, Prefix} ->
+                        h2_data_loop(H2Conn, StreamId, Session, Prefix, StreamWindow)
                 end
             end),
             _ = h2:set_stream_handler(H2Conn, StreamId, LoopPid),
