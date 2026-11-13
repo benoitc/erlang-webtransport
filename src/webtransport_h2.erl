@@ -47,8 +47,7 @@
     %% keys (u, bl, br): its SETTINGS and WebTransport-Init combined.
     peer_stream_data = #{} :: wt_h2_init:init_params(),
     %% Client only: headers of the 2xx response.
-    response_headers = [] :: [{binary(), binary()}],
-    recv_buffer = <<>> :: binary()
+    response_headers = [] :: [{binary(), binary()}]
 }).
 
 -opaque state() :: #state{}.

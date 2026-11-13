@@ -15,6 +15,12 @@
   window ends the session with a flow-control error
   (draft-ietf-webtrans-http2-16 §6.6). Before, each session could hold up
   to 64 MiB.
+- An open stream no longer keeps a copy of everything received on it. The
+  data was already handed to the handler, and memory grew for as long as the
+  stream stayed open.
+- Breaking: `webtransport_stream:recv_buffer/1` and
+  `webtransport_stream:flush_recv_buffer/1` are removed. They returned that
+  copy, which the library never read.
 
 ## 0.5.6 - 2026-11-13
 

@@ -25,7 +25,7 @@
 -export([is_open/1, is_writable/1, is_readable/1]).
 -export([send_window/1, recv_window/1]).
 -export([bytes_sent/1, bytes_received/1]).
--export([send_buffer/1, recv_buffer/1]).
+-export([send_buffer/1]).
 
 %% State transitions
 -export([send/2, receive_data/2, receive_fin/1]).
@@ -36,7 +36,7 @@
 -export([update_send_window/2, update_recv_window/2]).
 
 %% Buffer management
--export([flush_send_buffer/1, flush_recv_buffer/1]).
+-export([flush_send_buffer/1]).
 -export([buffer_send/2]).
 -export([fin_pending/1, set_fin_pending/1, clear_fin_pending/1]).
 
@@ -56,7 +56,6 @@
     bytes_received = 0 :: non_neg_integer(),
     %% Buffers
     send_buffer = <<>> :: binary(),
-    recv_buffer = <<>> :: binary(),
     %% Flags
     local_fin = false :: boolean(),
     %% FIN requested by the application while bytes were still waiting for
@@ -168,10 +167,6 @@ bytes_received(#stream{bytes_received = B}) -> B.
 -spec send_buffer(stream()) -> binary().
 send_buffer(#stream{send_buffer = B}) -> B.
 
-%% @doc Return the pending receive buffer contents.
--spec recv_buffer(stream()) -> binary().
-recv_buffer(#stream{recv_buffer = B}) -> B.
-
 %% ============================================================================
 %% State Transitions
 %% ============================================================================
@@ -206,7 +201,8 @@ send(#stream{send_window = Window, bytes_sent = Sent} = Stream, Data) ->
             {ok, <<>>, NewStream}
     end.
 
-%% @doc Record received data, updating flow control counters and the recv buffer.
+%% @doc Count received data against the stream's receive window. The data
+%% itself goes to the handler and is not kept here.
 -spec receive_data(stream(), binary()) -> {ok, stream()} | {error, term()}.
 receive_data(#stream{state = closed}, _Data) ->
     {error, stream_closed};
@@ -221,11 +217,7 @@ receive_data(#stream{recv_window = Window, bytes_received = Received} = Stream, 
         true ->
             {error, flow_control_error};
         false ->
-            NewStream = Stream#stream{
-                bytes_received = NewReceived,
-                recv_buffer = <<(Stream#stream.recv_buffer)/binary, Data/binary>>
-            },
-            {ok, NewStream}
+            {ok, Stream#stream{bytes_received = NewReceived}}
     end.
 
 %% @doc Record that the remote side sent FIN, transitioning the stream state.
@@ -285,8 +277,7 @@ receive_reset(#stream{remote_reset_code = C}, _ErrorCode) when C =/= undefined -
 receive_reset(#stream{state = State} = Stream, ErrorCode)
   when State =:= open; State =:= half_closed_local ->
     {ok, Stream#stream{state = close_direction(remote, State),
-                       remote_reset_code = ErrorCode,
-                       recv_buffer = <<>>}};
+                       remote_reset_code = ErrorCode}};
 receive_reset(_Stream, _ErrorCode) ->
     {error, invalid_state}.
 
@@ -328,11 +319,6 @@ update_recv_window(Stream, NewWindow) ->
 -spec flush_send_buffer(stream()) -> {binary(), stream()}.
 flush_send_buffer(#stream{send_buffer = Buffer} = Stream) ->
     {Buffer, Stream#stream{send_buffer = <<>>}}.
-
-%% @doc Return and clear the receive buffer.
--spec flush_recv_buffer(stream()) -> {binary(), stream()}.
-flush_recv_buffer(#stream{recv_buffer = Buffer} = Stream) ->
-    {Buffer, Stream#stream{recv_buffer = <<>>}}.
 
 %% @doc Append data to the send buffer without actually sending.
 -spec fin_pending(stream()) -> boolean().
