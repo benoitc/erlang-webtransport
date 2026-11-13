@@ -136,6 +136,15 @@ parse_rejects_test_() ->
         ?_assertMatch({error, _}, parse(<<"u=1,">>))
     ].
 
+%% RFC 9651 §3.3.1: at most 15 digits. A value of 200,000 digits is refused
+%% without being turned into an integer.
+parse_integer_limit_test_() ->
+    [
+        ?_assertEqual({ok, #{u => 999999999999999}}, parse(<<"u=999999999999999">>)),
+        ?_assertEqual({error, {invalid_webtransport_init, integer_too_long}},
+                      parse(<<"u=", (binary:copy(<<"9">>, 200000))/binary>>))
+    ].
+
 from_settings_test() ->
     Settings = #{wt_initial_max_stream_data_uni => 1,
                  wt_initial_max_stream_data_bidi_local => 2,

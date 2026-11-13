@@ -21,6 +21,9 @@
 - Breaking: `webtransport_stream:recv_buffer/1` and
   `webtransport_stream:flush_recv_buffer/1` are removed. They returned that
   copy, which the library never read.
+- Structured Field numbers (WebTransport-Init, WT-Available-Protocols,
+  WT-Protocol) are refused as soon as they pass the length RFC 9651 §4.2.4
+  allows, instead of after the whole number was read.
 
 ## 0.5.6 - 2026-11-13
 

@@ -152,12 +152,13 @@ number(Bin) ->
         <<$-, R/binary>> -> {-1, R};
         _ -> {1, Bin}
     end,
-    {Int, Rest} = digits(Digits0, <<>>),
+    %% RFC 9651 §4.2.4: more than 15 characters fail at once (step 7.5).
+    {Int, Rest} = digits(Digits0, <<>>, 15, integer_too_long),
     case {byte_size(Int), Rest} of
         {0, _} ->
             throw({sf_error, bad_number});
         {N, <<$., Frac0/binary>>} when N =< 12 ->
-            {Frac, Rest1} = digits(Frac0, <<>>),
+            {Frac, Rest1} = digits(Frac0, <<>>, 3, bad_decimal),
             case byte_size(Frac) of
                 F when F >= 1, F =< 3 ->
                     S = case Sign of -1 -> <<"-">>; 1 -> <<>> end,
@@ -171,9 +172,14 @@ number(Bin) ->
             throw({sf_error, integer_too_long})
     end.
 
-digits(<<C, Rest/binary>>, Acc) when C >= $0, C =< $9 ->
-    digits(Rest, <<Acc/binary, C>>);
-digits(Rest, Acc) ->
+%% Read at most `Max' digits; one more fails with `Error' without reading
+%% the rest.
+digits(<<C, _/binary>>, Acc, Max, Error)
+  when C >= $0, C =< $9, byte_size(Acc) >= Max ->
+    throw({sf_error, Error});
+digits(<<C, Rest/binary>>, Acc, Max, Error) when C >= $0, C =< $9 ->
+    digits(Rest, <<Acc/binary, C>>, Max, Error);
+digits(Rest, Acc, _Max, _Error) ->
     {Acc, Rest}.
 
 string(<<$\\, C, Rest/binary>>, Acc) when C =:= $"; C =:= $\\ ->
@@ -259,6 +265,22 @@ item_test_() ->
         ?_assertEqual({ok, {decimal, <<"1.5">>}}, parse_item(<<"1.5">>)),
         ?_assertEqual({ok, true}, parse_item(<<"?1">>)),
         ?_assertMatch({error, _}, parse_item(<<"\"a\" \"b\"">>))
+    ].
+
+%% RFC 9651 §4.2.4: integers of at most 15 digits, decimals of at most 12
+%% digits before the point and 3 after. A longer number fails as soon as
+%% the limit is passed.
+number_limits_test_() ->
+    Long = binary:copy(<<"9">>, 200000),
+    [
+        ?_assertEqual({ok, 999999999999999}, parse_item(<<"999999999999999">>)),
+        ?_assertEqual({ok, -999999999999999}, parse_item(<<"-999999999999999">>)),
+        ?_assertEqual({error, integer_too_long}, parse_item(<<"9999999999999999">>)),
+        ?_assertEqual({error, integer_too_long}, parse_item(Long)),
+        ?_assertEqual({ok, {decimal, <<"999999999999.999">>}},
+                      parse_item(<<"999999999999.999">>)),
+        ?_assertMatch({error, _}, parse_item(<<"9999999999999.9">>)),
+        ?_assertEqual({error, bad_decimal}, parse_item(<<"1.1234">>))
     ].
 
 serialize_test_() ->
