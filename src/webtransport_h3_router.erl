@@ -12,7 +12,7 @@
 
 -include("webtransport.hrl").
 
--export([start_link/0, start_link/1, start/1]).
+-export([start_link/0, start_link/1, start/1, start/2]).
 -export([register_session/3, unregister_session/2, expect_session/2]).
 -export([session_count/2, reserve_session/3, session_gone/2, session_ended/3]).
 -export([client_connect/4]).
@@ -67,7 +67,10 @@
     expected = #{} :: #{non_neg_integer() => [term()]},
     passthrough :: undefined | pid(),
     h3_conn :: undefined | pid(),
-    h3_monitor :: undefined | reference()
+    h3_monitor :: undefined | reference(),
+    %% Server: monitor on the QUIC connection this router serves. Its end
+    %% stops the router.
+    conn_monitor :: undefined | reference()
 }).
 
 %% ============================================================================
@@ -82,12 +85,18 @@ start_link() ->
 %% @doc Start a linked router, forwarding unhandled H3 events to Passthrough.
 -spec start_link(undefined | pid()) -> {ok, pid()}.
 start_link(Passthrough) ->
-    gen_server:start_link(?MODULE, [Passthrough], []).
+    gen_server:start_link(?MODULE, [Passthrough, undefined], []).
 
 %% @doc Start an unlinked router with the given passthrough target.
 -spec start(undefined | pid()) -> {ok, pid()}.
 start(Passthrough) ->
-    gen_server:start(?MODULE, [Passthrough], []).
+    start(Passthrough, undefined).
+
+%% @doc Start an unlinked router that stops when `Conn', the QUIC
+%% connection it serves, ends.
+-spec start(undefined | pid(), undefined | pid()) -> {ok, pid()}.
+start(Passthrough, Conn) ->
+    gen_server:start(?MODULE, [Passthrough, Conn], []).
 
 %% @doc Set or clear the passthrough pid for unhandled H3 events.
 -spec set_passthrough(pid(), undefined | pid()) -> ok.
@@ -169,9 +178,13 @@ get_h3_conn(Router) ->
 %% gen_server callbacks
 %% ============================================================================
 
-init([Passthrough]) ->
+init([Passthrough, Conn]) ->
     process_flag(trap_exit, true),
-    {ok, #state{passthrough = Passthrough}}.
+    ConnMonitor = case Conn of
+        undefined -> undefined;
+        _ -> erlang:monitor(process, Conn)
+    end,
+    {ok, #state{passthrough = Passthrough, conn_monitor = ConnMonitor}}.
 
 handle_call({register, SessionId, SessionPid}, _From, State) ->
     Ref = erlang:monitor(process, SessionPid),
@@ -228,6 +241,8 @@ handle_cast(_Msg, State) ->
 handle_info({quic_h3, _, _} = Msg, State) ->
     handle_quic_h3(Msg, State);
 handle_info({'DOWN', Ref, process, _Pid, _Reason}, #state{h3_monitor = Ref} = State) ->
+    {stop, normal, State};
+handle_info({'DOWN', Ref, process, _Pid, _Reason}, #state{conn_monitor = Ref} = State) ->
     {stop, normal, State};
 handle_info({'DOWN', Ref, process, _Pid, _Reason}, #state{monitors = Monitors} = State) ->
     case maps:take(Ref, Monitors) of

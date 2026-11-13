@@ -1,5 +1,30 @@
 # Changelog
 
+## Unreleased
+
+- Over HTTP/3, a session now ends when its connection closes, as
+  draft-ietf-webtrans-http3-17 §6 requires. Before, server and client
+  sessions kept running after their connection was gone.
+- The HTTP/3 listener now stops its per-connection state when a connection
+  closes. Before, it was kept for connections that never opened a
+  WebTransport stream, and memory grew with every such connection.
+- A peer can no longer make a session hold a large unfinished capsule on
+  the CONNECT stream. Padding and unknown capsules are skipped as they
+  arrive (RFC 9297 §3.2), oversized datagrams are discarded (RFC 9297
+  §3.5), and over HTTP/2 a stream capsule larger than the flow-control
+  window ends the session with a flow-control error
+  (draft-ietf-webtrans-http2-16 §6.6). Before, each session could hold up
+  to 64 MiB.
+- An open stream no longer keeps a copy of everything received on it. The
+  data was already handed to the handler, and memory grew for as long as the
+  stream stayed open.
+- Breaking: `webtransport_stream:recv_buffer/1` and
+  `webtransport_stream:flush_recv_buffer/1` are removed. They returned that
+  copy, which the library never read.
+- Structured Field numbers (WebTransport-Init, WT-Available-Protocols,
+  WT-Protocol) are refused as soon as they pass the length RFC 9651 §4.2.4
+  allows, instead of after the whole number was read.
+
 ## 0.5.6 - 2026-11-13
 
 - Requires quic 2.7.0 and h2 0.17.0. Over HTTP/3, a client now rejects a

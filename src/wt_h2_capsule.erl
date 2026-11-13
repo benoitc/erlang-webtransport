@@ -11,6 +11,7 @@
 
 -export([encode/1, decode/1, decode_all/1]).
 -export([type_name/1]).
+-export([buffer_rule/3]).
 
 %% Capsule constructors
 -export([padding/1]).
@@ -390,6 +391,40 @@ decode_all(Bin, Acc) ->
             {ok, lists:reverse(Acc), Bin};
         {error, _} = Err ->
             Err
+    end.
+
+%% @doc What the CONNECT stream reader may hold of an unfinished capsule of
+%% `Type' that declares `Length' bytes (see wt_capsule_reader).
+%%
+%% Padding and unknown types are skipped as they arrive (RFC 9297 §3.2,
+%% http2-16 §6.1). A DATAGRAM too large to use is discarded (RFC 9297 §3.5).
+%% WT_STREAM data beyond the stream's flow-control window is a flow-control
+%% error (http2-16 §6.6): the window is `max_stream_data', plus 8 bytes for
+%% the stream id.
+-spec buffer_rule(non_neg_integer(), non_neg_integer(), map()) ->
+    keep | drop | {error, flow_control | malformed, binary()}.
+buffer_rule(?WT_PADDING, _Length, _Opts) ->
+    drop;
+buffer_rule(Type, Length, Opts) when Type =:= ?WT_STREAM; Type =:= ?WT_STREAM_FIN ->
+    Window = maps:get(max_stream_data, Opts, ?DEFAULT_MAX_STREAM_DATA),
+    case Length =< Window + 8 of
+        true -> keep;
+        false -> {error, flow_control, <<"stream capsule exceeds flow-control window">>}
+    end;
+buffer_rule(?DATAGRAM, Length, _Opts) when Length > ?WT_DATAGRAM_CAPSULE_MAX ->
+    drop;
+buffer_rule(?DATAGRAM, _Length, _Opts) ->
+    keep;
+buffer_rule(?WT_CLOSE_SESSION, Length, _Opts) when Length > ?WT_CLOSE_CAPSULE_MAX ->
+    {error, malformed, <<"close reason too long">>};
+buffer_rule(?WT_CLOSE_SESSION, _Length, _Opts) ->
+    keep;
+buffer_rule(Type, Length, _Opts) ->
+    case type_name(Type) of
+        Type -> drop;  %% unknown type
+        _ when Length > ?WT_CONTROL_CAPSULE_MAX ->
+            {error, malformed, <<"control capsule too long">>};
+        _ -> keep
     end.
 
 %% @doc Get the human-readable name of a capsule type.

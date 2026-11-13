@@ -198,3 +198,11 @@ datagram_routed_test() ->
 
     Session ! stop,
     gen_server:stop(Router).
+
+%% A router started for a connection stops when that connection ends.
+stops_with_connection_test() ->
+    Conn = spawn(fun() -> receive stop -> ok end end),
+    {ok, Router} = webtransport_h3_router:start(undefined, Conn),
+    Ref = erlang:monitor(process, Router),
+    exit(Conn, kill),
+    ?assertMatch({'DOWN', Ref, process, Router, normal}, recv(1000)).

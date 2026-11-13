@@ -102,7 +102,8 @@ reassembles_capsule_split_across_frames_test() ->
     %% The session stand-in forwards every cast it receives to the test.
     Session = spawn(fun() -> relay(Self) end),
     Loop = spawn(fun() -> webtransport:h2_data_loop(Conn, 1, Session) end),
-    Payload = crypto:strong_rand_bytes(1024 * 1024),
+    %% 200 KiB: 13 frames, within the default 256 KiB stream window.
+    Payload = crypto:strong_rand_bytes(200 * 1024),
     Capsule = wt_h2_capsule:encode(wt_h2_capsule:wt_stream_fin(4, Payload)),
     %% Two capsules back to back, so a frame boundary also falls inside the
     %% second one and the loop must carry the tail between frames.
@@ -151,3 +152,59 @@ chunks(Bin, N) when byte_size(Bin) =< N -> [Bin];
 chunks(Bin, N) ->
     <<H:N/binary, T/binary>> = Bin,
     [H | chunks(T, N)].
+
+%% http2-16 §6.6: a WT_STREAM capsule that declares more data than the
+%% stream's flow-control window (256 KiB by default) is a flow-control
+%% error, known from its header. The loop does not wait for the body.
+oversize_stream_capsule_is_flow_control_error_test() ->
+    Conn = spawn_idle(),
+    Self = self(),
+    Session = spawn(fun() -> relay(Self) end),
+    Loop = spawn(fun() -> webtransport:h2_data_loop(Conn, 1, Session) end),
+    Capsule = wt_h2_capsule:encode(
+                wt_h2_capsule:wt_stream(4, binary:copy(<<0>>, 1024 * 1024))),
+    <<First:16384/binary, _/binary>> = Capsule,
+    Loop ! {h2, Conn, {data, 1, First, false}},
+    receive
+        {'$gen_cast', {capsule, {flow_control_error, _}}} -> ok
+    after 1000 ->
+        error(no_flow_control_error)
+    end,
+    exit(Loop, kill),
+    Conn ! stop,
+    Session ! stop.
+
+%% RFC 9297 §3.2, http2-16 §6.1: padding of any length is skipped as it
+%% arrives, not held until it ends.
+padding_is_not_buffered_test() ->
+    Conn = spawn_idle(),
+    Self = self(),
+    Session = spawn(fun() -> relay(Self) end),
+    Loop = spawn(fun() -> webtransport:h2_data_loop(Conn, 1, Session) end),
+    Body = binary:copy(<<0>>, 2 * 1024 * 1024),
+    Capsule = wt_h2_capsule:encode({padding, Body}),
+    Next = wt_h2_capsule:encode(wt_h2_capsule:wt_stream(4, <<"after">>)),
+    %% Everything but the last byte of the padding.
+    Partial = binary:part(Capsule, 0, byte_size(Capsule) - 1),
+    lists:foreach(fun(Chunk) -> Loop ! {h2, Conn, {data, 1, Chunk, false}} end,
+                  chunks(Partial, 16384)),
+    ok = wait_drained(Loop, 100),
+    true = erlang:garbage_collect(Loop),
+    {binary, Bins} = erlang:process_info(Loop, binary),
+    Held = lists:sum([Size || {_, Size, _} <- Bins]),
+    ?assert(Held < 65536),
+    Loop ! {h2, Conn, {data, 1, <<0, Next/binary>>, false}},
+    Casts = collect_casts([], 300),
+    ?assertEqual(<<"after">>,
+                 iolist_to_binary([D || {stream_data, 4, D, _} <- Casts])),
+    exit(Loop, kill),
+    Conn ! stop,
+    Session ! stop.
+
+wait_drained(_Pid, 0) ->
+    timeout;
+wait_drained(Pid, N) ->
+    case erlang:process_info(Pid, message_queue_len) of
+        {message_queue_len, 0} -> timer:sleep(50), ok;
+        _ -> timer:sleep(50), wait_drained(Pid, N - 1)
+    end.

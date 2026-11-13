@@ -12,6 +12,7 @@
 
 -export([encode/1, decode/1, decode_all/1]).
 -export([type_name/1]).
+-export([buffer_rule/3]).
 
 %% Capsule constructors
 -export([max_data/1, data_blocked/1]).
@@ -29,6 +30,13 @@
 -export([quarter_stream_id/1, session_id_from_quarter_stream_id/1]).
 
 -include("webtransport.hrl").
+
+%% Control capsules decode/1 knows on h3, including the two only decoded to
+%% be rejected (http3-17 §5.4).
+-define(H3_CONTROL_CAPSULES,
+        [?WT_MAX_DATA, ?WT_DATA_BLOCKED, ?WT_MAX_STREAMS_BIDI, ?WT_MAX_STREAMS_UNI,
+         ?WT_STREAMS_BLOCKED_BIDI, ?WT_STREAMS_BLOCKED_UNI, ?WT_DRAIN_SESSION,
+         ?WT_MAX_STREAM_DATA, ?WT_STREAM_DATA_BLOCKED]).
 
 -type capsule() ::
     {max_data, non_neg_integer()} |
@@ -315,6 +323,29 @@ decode_datagram(Bin) ->
 %% ============================================================================
 %% Helpers
 %% ============================================================================
+
+%% @doc What the CONNECT stream reader may hold of an unfinished capsule of
+%% `Type' that declares `Length' bytes (see wt_capsule_reader). On h3 the
+%% CONNECT stream carries no stream data: padding and unknown types are
+%% skipped as they arrive (RFC 9297 §3.2) and a DATAGRAM too large to use is
+%% discarded (RFC 9297 §3.5).
+-spec buffer_rule(non_neg_integer(), non_neg_integer(), map()) ->
+    keep | drop | {error, malformed, binary()}.
+buffer_rule(?DATAGRAM, Length, _Opts) when Length > ?WT_DATAGRAM_CAPSULE_MAX ->
+    drop;
+buffer_rule(?DATAGRAM, _Length, _Opts) ->
+    keep;
+buffer_rule(?WT_CLOSE_SESSION, Length, _Opts) when Length > ?WT_CLOSE_CAPSULE_MAX ->
+    {error, malformed, <<"close reason too long">>};
+buffer_rule(?WT_CLOSE_SESSION, _Length, _Opts) ->
+    keep;
+buffer_rule(Type, Length, _Opts) ->
+    case lists:member(Type, ?H3_CONTROL_CAPSULES) of
+        false -> drop;  %% unknown type
+        true when Length > ?WT_CONTROL_CAPSULE_MAX ->
+            {error, malformed, <<"control capsule too long">>};
+        true -> keep
+    end.
 
 %% @doc Return the human-readable atom for a capsule type code.
 -spec type_name(non_neg_integer()) -> atom() | non_neg_integer().

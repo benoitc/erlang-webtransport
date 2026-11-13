@@ -61,7 +61,18 @@ send_half_closed_local_test() ->
 receive_data_test() ->
     S = webtransport_stream:new(4, bidi, 100),
     {ok, S1} = webtransport_stream:receive_data(S, <<"hello">>),
-    ?assertEqual(<<"hello">>, webtransport_stream:recv_buffer(S1)).
+    ?assertEqual(5, webtransport_stream:bytes_received(S1)).
+
+%% Received data goes to the handler; the stream only counts it, so an open
+%% stream does not grow with what it receives.
+receive_data_does_not_keep_data_test() ->
+    S = webtransport_stream:new(4, bidi, 1024 * 1024),
+    S1 = lists:foldl(fun(_, Acc) ->
+                         {ok, Acc1} = webtransport_stream:receive_data(Acc, <<0:8192>>),
+                         Acc1
+                     end, S, lists:seq(1, 64)),
+    ?assertEqual(65536, webtransport_stream:bytes_received(S1)),
+    ?assert(erlang:external_size(S1) < 1024).
 
 receive_data_flow_control_error_test() ->
     S = webtransport_stream:new(4, bidi, 5),
@@ -172,13 +183,6 @@ flush_send_buffer_test() ->
     {Buffer, S2} = webtransport_stream:flush_send_buffer(S1),
     ?assertEqual(<<" world">>, Buffer),
     ?assertEqual(<<>>, webtransport_stream:send_buffer(S2)).
-
-flush_recv_buffer_test() ->
-    S = webtransport_stream:new(4, bidi, 100),
-    {ok, S1} = webtransport_stream:receive_data(S, <<"hello">>),
-    {Buffer, S2} = webtransport_stream:flush_recv_buffer(S1),
-    ?assertEqual(<<"hello">>, Buffer),
-    ?assertEqual(<<>>, webtransport_stream:recv_buffer(S2)).
 
 buffer_send_test() ->
     S = webtransport_stream:new(4, bidi, 100),

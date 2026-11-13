@@ -164,4 +164,17 @@
 %% 8 bytes for the worst-case varint encoding of the session id.
 -define(WT_H3_DATAGRAM_MAX, 65527).  %% 65535 - 8
 
+%% ============================================================================
+%% CONNECT stream reader bounds
+%% ============================================================================
+%%
+%% The largest capsule the CONNECT stream reader holds while it waits for
+%% the rest of it (wt_capsule_reader). A DATAGRAM capsule over this is
+%% discarded unread (RFC 9297 §3.5).
+-define(WT_DATAGRAM_CAPSULE_MAX, 65535).
+%% Flow-control, reset and drain capsules carry at most three varints.
+-define(WT_CONTROL_CAPSULE_MAX, 64).
+%% WT_CLOSE_SESSION: a 32-bit code and a reason of at most 1024 bytes.
+-define(WT_CLOSE_CAPSULE_MAX, (4 + ?WT_CLOSE_REASON_MAX)).
+
 -endif.

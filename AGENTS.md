@@ -163,7 +163,8 @@ datagrams to sessions, parks early ones, session slots), `wt_h3_capsule.erl`
 header).
 
 **Shared:** `wt_sf.erl` (RFC 9651 structured fields), `wt_error.erl` (error
-code mapping), `include/webtransport.hrl` (codepoints, limits, defaults).
+code mapping), `wt_capsule_reader.erl` (CONNECT stream capsule reader and
+what it may hold), `include/webtransport.hrl` (codepoints, limits, defaults).
 
 ### Compat modes
 
