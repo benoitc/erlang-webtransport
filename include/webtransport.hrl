@@ -177,4 +177,8 @@
 %% WT_CLOSE_SESSION: a 32-bit code and a reason of at most 1024 bytes.
 -define(WT_CLOSE_CAPSULE_MAX, (4 + ?WT_CLOSE_REASON_MAX)).
 
+%% Messages a session may have waiting before an incoming datagram is
+%% dropped instead of queued (overview-14 §4.2: bounded receive buffer).
+-define(WT_DATAGRAM_QUEUE_MAX, 1024).
+
 -endif.

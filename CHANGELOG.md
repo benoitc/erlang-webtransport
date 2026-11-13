@@ -6,6 +6,9 @@
   could kill the process that called `connect` with
   `{shutdown, {owner_exit, normal}}`. That process is no longer linked to
   the HTTP/2 connection, only to the session.
+- Incoming datagrams are dropped once a session has 1024 messages waiting,
+  instead of queueing without limit when the application falls behind
+  (draft-ietf-webtrans-overview-14 §4.2).
 
 ## 0.5.7 - 2026-11-13
 

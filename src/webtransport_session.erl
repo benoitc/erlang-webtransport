@@ -213,9 +213,16 @@ handle_stream_data(Session, StreamId, Data, Fin) ->
     gen_statem:cast(Session, {stream_data, StreamId, Data, Fin}).
 
 %% @doc Deliver an inbound datagram payload to the session.
+%%
+%% The receive buffer is bounded (overview-14 §4.2): when the session
+%% already has ?WT_DATAGRAM_QUEUE_MAX messages waiting, the datagram is
+%% dropped.
 -spec handle_datagram_data(session(), binary()) -> ok.
 handle_datagram_data(Session, Data) ->
-    gen_statem:cast(Session, {datagram_data, Data}).
+    case erlang:process_info(Session, message_queue_len) of
+        {message_queue_len, N} when N >= ?WT_DATAGRAM_QUEUE_MAX -> ok;
+        _ -> gen_statem:cast(Session, {datagram_data, Data})
+    end.
 
 %% @doc Notify the session that a peer-initiated stream was opened.
 -spec handle_stream_opened(session(), stream_ref(), bidi | uni) -> ok.
@@ -2187,6 +2194,16 @@ connect_oversize_close_test() ->
     Header = <<(h2_varint:encode(?WT_CLOSE_SESSION))/binary, (h2_varint:encode(2000))/binary>>,
     ?assertMatch({stop, {shutdown, {session_error, ?H3_MESSAGE_ERROR}}, _},
                  handle_connect_data(Header, false, Data)).
+
+%% overview-14 §4.2: the datagram receive buffer is bounded and a datagram
+%% that does not fit is dropped. A session that does not keep up does not
+%% collect every datagram in its mailbox.
+datagram_queue_bounded_test() ->
+    Session = spawn(fun() -> receive stop -> ok end end),
+    [handle_datagram_data(Session, <<"d">>) || _ <- lists:seq(1, 10000)],
+    {message_queue_len, N} = erlang:process_info(Session, message_queue_len),
+    ?assert(N =< ?WT_DATAGRAM_QUEUE_MAX),
+    exit(Session, kill).
 
 %% Finished streams leave the map; a finished peer stream returns credit.
 retire_stream_test() ->
