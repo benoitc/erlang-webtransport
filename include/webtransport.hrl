@@ -146,6 +146,7 @@
 -define(DEFAULT_MAX_STREAMS_BIDI, 100).
 -define(DEFAULT_MAX_STREAMS_UNI, 100).
 -define(DEFAULT_MAX_SESSIONS, 100).
+-define(DEFAULT_MAX_SEND_BUFFER, 4194304).  %% 4 MiB queued per session
 
 %% ============================================================================
 %% Datagram size ceilings

@@ -104,6 +104,7 @@
     max_data => non_neg_integer(),
     max_streams_bidi => non_neg_integer(),
     max_streams_uni => non_neg_integer(),
+    max_send_buffer => non_neg_integer(),
     %% Bind address / family. `ip' binds the listener socket to a specific
     %% address (IPv4 4-tuple or IPv6 8-tuple); `family' forces `inet' or
     %% `inet6' when no `ip' is given (e.g. the IPv6 wildcard). `socket_opts'
@@ -578,6 +579,7 @@ start_accepted(Transport, Conn, StreamId, Headers, Handler, HandlerOpts, Opts, R
         max_stream_data => maps:get(max_stream_data, Opts, ?DEFAULT_MAX_STREAM_DATA),
         max_streams_bidi => maps:get(max_streams_bidi, Opts, ?DEFAULT_MAX_STREAMS_BIDI),
         max_streams_uni => maps:get(max_streams_uni, Opts, ?DEFAULT_MAX_STREAMS_UNI),
+        max_send_buffer => maps:get(max_send_buffer, Opts, ?DEFAULT_MAX_SEND_BUFFER),
         %% A listener pinned to legacy mode sends no flow-control SETTINGS.
         declared_flow_control =>
             maps:get(compat_mode, Opts, auto) =/= legacy_browser_compat,
@@ -872,6 +874,11 @@ send(Session, Stream, Data) ->
     webtransport_session:send(Session, Stream, Data, false).
 
 %% @doc Send data on a stream with optional FIN flag.
+%%
+%% Bytes beyond the peer's flow-control credit wait in the session. When it
+%% already holds `max_send_buffer' bytes (4 MiB by default), a send that
+%% cannot go out at once returns `{error, send_buffer_full}'; try again once
+%% the peer has read.
 -spec send(session(), stream(), iodata(), fin | nofin) -> ok | {error, term()}.
 send(Session, Stream, Data, fin) ->
     webtransport_session:send(Session, Stream, Data, true);
@@ -1879,6 +1886,7 @@ client_session_opts(Request, Opts) ->
         max_stream_data => maps:get(max_stream_data, Opts, ?DEFAULT_MAX_STREAM_DATA),
         max_streams_bidi => maps:get(max_streams_bidi, Opts, ?DEFAULT_MAX_STREAMS_BIDI),
         max_streams_uni => maps:get(max_streams_uni, Opts, ?DEFAULT_MAX_STREAMS_UNI),
+        max_send_buffer => maps:get(max_send_buffer, Opts, ?DEFAULT_MAX_SEND_BUFFER),
         declared_flow_control => client_declares_flow_control(Opts)
     }.
 

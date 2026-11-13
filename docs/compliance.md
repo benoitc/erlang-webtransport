@@ -20,7 +20,7 @@ Draft-02 and draft-07 (`compat_mode => legacy_browser_compat`) are kept on a
 separate path for Chrome, Firefox, Safari 26 and webtransport-go. They never
 mix with the latest drafts in one handshake.
 
-Audited 2026-11-08 against quic 2.5.0 and h2 0.13.0.
+Audited 2026-11-13 against quic 2.7.0 and h2 0.17.0.
 
 ## What is covered
 
@@ -68,9 +68,9 @@ Audited 2026-11-08 against quic 2.5.0 and h2 0.13.0.
 
 ## Known gaps
 
-| Path | Spec | Gap |
-|---|---|---|
-| h2 | http2-16 §3.4 | WT_ERROR, WT_STREAM_STATE_ERROR and WT_FLOW_CONTROL_ERROR have no HTTP/2 codepoints yet (0xTBD). Session errors use RST_STREAM with PROTOCOL_ERROR or FLOW_CONTROL_ERROR, after a WT_CLOSE_SESSION that carries 0 or the h3 WT_FLOW_CONTROL_ERROR value. Switch when IANA assigns them. |
+| Class | Path | Spec | Gap |
+|---|---|---|---|
+| upstream | h2 | http2-16 §3.4 | WT_ERROR, WT_STREAM_STATE_ERROR and WT_FLOW_CONTROL_ERROR have no HTTP/2 codepoints yet (0xTBD). Session errors use RST_STREAM with PROTOCOL_ERROR or FLOW_CONTROL_ERROR, after a WT_CLOSE_SESSION that carries 0 or the h3 WT_FLOW_CONTROL_ERROR value. Switch when IANA assigns them. |
 
 ## Classes used by the audit
 

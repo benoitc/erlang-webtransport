@@ -13,6 +13,11 @@
   reset their late streams. Before, every ended session was kept until the
   connection closed, so a client opening and closing sessions on one
   connection grew it without limit.
+- Data waiting for the peer's flow-control credit is now capped per session
+  by the new `max_send_buffer` option (4 MiB by default). Once it is full, a
+  send that cannot go out at once returns `{error, send_buffer_full}`.
+  Before, a peer that never granted credit made the queue grow without
+  limit, and each credit update copied the whole queue.
 
 ## 0.5.7 - 2026-11-13
 

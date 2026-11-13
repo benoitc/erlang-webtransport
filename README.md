@@ -301,6 +301,7 @@ handle_stream(Stream, bidi, Data, State) ->
 | `max_stream_data` | no | 262144 (256 KB) | Per-stream data window granted to the peer (HTTP/2 only) |
 | `max_streams_bidi` | no | 100 | Bidirectional streams the peer may have open at once |
 | `max_streams_uni` | no | 100 | Unidirectional streams the peer may have open at once |
+| `max_send_buffer` | no | 4194304 (4 MB) | Bytes a session may hold waiting for the peer's flow-control credit; a send beyond it fails with `{error, send_buffer_full}` |
 | `compat_mode` | no | `auto` | HTTP/3 draft selection (see [Compatibility](#compatibility-mode)) |
 
 ### Managing listeners
@@ -415,7 +416,7 @@ See the [Integration guide](docs/integration.md) for details.
 | `handler_opts` | `#{}` | Map passed to the handler's `init/3` |
 | `protocols` | `[]` | Subprotocols to offer, in preference order (`WT-Available-Protocols`) |
 | `require_protocol` | `false` | Fail with `{error, {alpn_error, _}}` when the server picks none |
-| `max_data`, `max_stream_data`, `max_streams_bidi`, `max_streams_uni` | as for listeners | Limits we grant the server |
+| `max_data`, `max_stream_data`, `max_streams_bidi`, `max_streams_uni`, `max_send_buffer` | as for listeners | Limits we grant the server, and our send queue |
 | `compat_mode` | `latest` | HTTP/3 draft selection (see [Compatibility](#compatibility-mode)) |
 
 ### Connecting with a custom handler

@@ -18,6 +18,7 @@ webtransport:start_listener(Name, Opts).
 | `max_stream_data` | no | 262144 (256 KB) | Per-stream data window granted to the peer (HTTP/2 only) |
 | `max_streams_bidi` | no | 100 | Bidirectional streams the peer may have open at once |
 | `max_streams_uni` | no | 100 | Unidirectional streams the peer may have open at once |
+| `max_send_buffer` | no | 4194304 (4 MB) | Bytes a session may hold waiting for the peer's flow-control credit; a send beyond it fails with `{error, send_buffer_full}` |
 | `ip` | no | wildcard | Bind address (`inet:ip_address()`; IPv4 4-tuple or IPv6 8-tuple) |
 | `family` | no | `inet` | `inet` or `inet6`; forces the family when no `ip` is given (e.g. the IPv6 wildcard) |
 | `socket_opts` | no | `[]` | Extra options for the underlying listener socket (h3 only) |
@@ -92,7 +93,7 @@ webtransport:connect(Host, Port, Path, Opts).
 | `socket_opts` | `[]` | gen_tcp/inet options for the client socket (see below) |
 | `protocols` | `[]` | Subprotocols to offer, in preference order |
 | `require_protocol` | `false` | Fail with `{error, {alpn_error, _}}` when the server picks none |
-| `max_data`, `max_stream_data`, `max_streams_bidi`, `max_streams_uni` | as for listeners | Limits we grant the server |
+| `max_data`, `max_stream_data`, `max_streams_bidi`, `max_streams_uni`, `max_send_buffer` | as for listeners | Limits we grant the server, and our send queue |
 | `compat_mode` | `latest` | HTTP/3 draft selection (see below) |
 
 ### Client socket options

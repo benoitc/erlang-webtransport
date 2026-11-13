@@ -25,7 +25,7 @@
 -export([is_open/1, is_writable/1, is_readable/1]).
 -export([send_window/1, recv_window/1]).
 -export([bytes_sent/1, bytes_received/1]).
--export([send_buffer/1]).
+-export([send_buffer/1, send_queued/1]).
 
 %% State transitions
 -export([send/2, receive_data/2, receive_fin/1]).
@@ -36,7 +36,7 @@
 -export([update_send_window/2, update_recv_window/2]).
 
 %% Buffer management
--export([flush_send_buffer/1]).
+-export([flush_send_buffer/1, take_send/2]).
 -export([buffer_send/2]).
 -export([fin_pending/1, set_fin_pending/1, clear_fin_pending/1]).
 
@@ -55,7 +55,10 @@
     bytes_sent = 0 :: non_neg_integer(),
     bytes_received = 0 :: non_neg_integer(),
     %% Buffers
-    send_buffer = <<>> :: binary(),
+    %% Bytes waiting for flow-control credit, oldest first, and their
+    %% total. A queue, so sending part of it copies only that part.
+    send_queue = queue:new() :: queue:queue(binary()),
+    send_queued = 0 :: non_neg_integer(),
     %% Flags
     local_fin = false :: boolean(),
     %% FIN requested by the application while bytes were still waiting for
@@ -165,7 +168,11 @@ bytes_received(#stream{bytes_received = B}) -> B.
 
 %% @doc Return the pending send buffer contents.
 -spec send_buffer(stream()) -> binary().
-send_buffer(#stream{send_buffer = B}) -> B.
+send_buffer(#stream{send_queue = Q}) -> iolist_to_binary(queue:to_list(Q)).
+
+%% @doc Bytes waiting for flow-control credit.
+-spec send_queued(stream()) -> non_neg_integer().
+send_queued(#stream{send_queued = N}) -> N.
 
 %% ============================================================================
 %% State Transitions
@@ -189,16 +196,9 @@ send(#stream{send_window = Window, bytes_sent = Sent} = Stream, Data) ->
             {ok, Data, Stream#stream{bytes_sent = Sent + DataSize}};
         false when Available > 0 ->
             <<ToSend:Available/binary, Rest/binary>> = Data,
-            NewStream = Stream#stream{
-                bytes_sent = Sent + Available,
-                send_buffer = <<(Stream#stream.send_buffer)/binary, Rest/binary>>
-            },
-            {ok, ToSend, NewStream};
+            {ok, ToSend, buffer_send(Stream#stream{bytes_sent = Sent + Available}, Rest)};
         false ->
-            NewStream = Stream#stream{
-                send_buffer = <<(Stream#stream.send_buffer)/binary, Data/binary>>
-            },
-            {ok, <<>>, NewStream}
+            {ok, <<>>, buffer_send(Stream, Data)}
     end.
 
 %% @doc Count received data against the stream's receive window. The data
@@ -263,7 +263,8 @@ reset(#stream{state = State} = Stream, ErrorCode) ->
     Stream#stream{
         state = close_direction(local, State),
         reset_code = ErrorCode,
-        send_buffer = <<>>,
+        send_queue = queue:new(),
+        send_queued = 0,
         fin_pending = false
     }.
 
@@ -317,8 +318,29 @@ update_recv_window(Stream, NewWindow) ->
 
 %% @doc Return and clear the send buffer.
 -spec flush_send_buffer(stream()) -> {binary(), stream()}.
-flush_send_buffer(#stream{send_buffer = Buffer} = Stream) ->
-    {Buffer, Stream#stream{send_buffer = <<>>}}.
+flush_send_buffer(Stream) ->
+    {send_buffer(Stream), Stream#stream{send_queue = queue:new(), send_queued = 0}}.
+
+%% @doc Take at most `Max' bytes from the front of the send queue. Only the
+%% bytes taken are copied.
+-spec take_send(stream(), non_neg_integer()) -> {binary(), stream()}.
+take_send(#stream{send_queue = Q, send_queued = N} = Stream, Max) ->
+    {Parts, Q1, Taken} = take(Q, Max, [], 0),
+    {iolist_to_binary(Parts), Stream#stream{send_queue = Q1, send_queued = N - Taken}}.
+
+take(Q, Max, Acc, Taken) when Taken >= Max ->
+    {lists:reverse(Acc), Q, Taken};
+take(Q, Max, Acc, Taken) ->
+    case queue:out(Q) of
+        {empty, Q} ->
+            {lists:reverse(Acc), Q, Taken};
+        {{value, Bin}, Q1} when Taken + byte_size(Bin) =< Max ->
+            take(Q1, Max, [Bin | Acc], Taken + byte_size(Bin));
+        {{value, Bin}, Q1} ->
+            Want = Max - Taken,
+            <<Head:Want/binary, Tail/binary>> = Bin,
+            {lists:reverse([Head | Acc]), queue:in_r(Tail, Q1), Max}
+    end.
 
 %% @doc Append data to the send buffer without actually sending.
 -spec fin_pending(stream()) -> boolean().
@@ -333,8 +355,10 @@ set_fin_pending(Stream) -> Stream#stream{fin_pending = true}.
 clear_fin_pending(Stream) -> Stream#stream{fin_pending = false}.
 
 -spec buffer_send(stream(), binary()) -> stream().
-buffer_send(#stream{send_buffer = Buffer} = Stream, Data) ->
-    Stream#stream{send_buffer = <<Buffer/binary, Data/binary>>}.
+buffer_send(Stream, <<>>) ->
+    Stream;
+buffer_send(#stream{send_queue = Q, send_queued = N} = Stream, Data) ->
+    Stream#stream{send_queue = queue:in(Data, Q), send_queued = N + byte_size(Data)}.
 
 %% ============================================================================
 %% Stream ID Helpers
