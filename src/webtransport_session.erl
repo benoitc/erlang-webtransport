@@ -67,6 +67,10 @@
     flow_control = true :: boolean(),
     %% Per-stream receive window we grant on h2 streams.
     local_max_stream_data = 0 :: non_neg_integer(),
+    %% Bytes the session may hold, across its streams, waiting for the
+    %% peer's flow-control credit. A send that would add to a full queue
+    %% fails with send_buffer_full.
+    max_send_buffer = ?DEFAULT_MAX_SEND_BUFFER :: non_neg_integer(),
     %% Per-stream send windows the peer granted on h2, as WebTransport-Init
     %% keys: u (our uni), br (our bidi), bl (its bidi).
     peer_stream_data = #{} :: #{u | bl | br => non_neg_integer()},
@@ -213,9 +217,16 @@ handle_stream_data(Session, StreamId, Data, Fin) ->
     gen_statem:cast(Session, {stream_data, StreamId, Data, Fin}).
 
 %% @doc Deliver an inbound datagram payload to the session.
+%%
+%% The receive buffer is bounded (overview-14 §4.2): when the session
+%% already has ?WT_DATAGRAM_QUEUE_MAX messages waiting, the datagram is
+%% dropped.
 -spec handle_datagram_data(session(), binary()) -> ok.
 handle_datagram_data(Session, Data) ->
-    gen_statem:cast(Session, {datagram_data, Data}).
+    case erlang:process_info(Session, message_queue_len) of
+        {message_queue_len, N} when N >= ?WT_DATAGRAM_QUEUE_MAX -> ok;
+        _ -> gen_statem:cast(Session, {datagram_data, Data})
+    end.
 
 %% @doc Notify the session that a peer-initiated stream was opened.
 -spec handle_stream_opened(session(), stream_ref(), bidi | uni) -> ok.
@@ -328,6 +339,7 @@ init_limits(Transport, TransportState, Opts, Data) ->
         local_max_streams_bidi = MaxBidi,
         local_max_streams_uni = MaxUni,
         local_max_stream_data = maps:get(max_stream_data, Opts, ?DEFAULT_MAX_STREAM_DATA),
+        max_send_buffer = maps:get(max_send_buffer, Opts, ?DEFAULT_MAX_SEND_BUFFER),
         remote_max_data = Remote(max_data),
         remote_max_streams_bidi = Remote(max_streams_bidi),
         remote_max_streams_uni = Remote(max_streams_uni),
@@ -1017,10 +1029,22 @@ do_send(StreamId, Data, Fin, #data{streams = Streams} = StateData) ->
 %% queued on the stream, in order, and go out from flush_streams/1 when the
 %% peer raises a limit. A FIN is held back until the queue drains, so the
 %% peer never sees FIN before the last byte.
+%%
+%% The queue is bounded by `max_send_buffer' across the session's streams:
+%% once it is full, a send that cannot go out at once fails with
+%% send_buffer_full and the caller tries again later.
 send_limited(StreamId, Data, Fin, Stream, #data{streams = Streams} = StateData) ->
-    case webtransport_stream:send_buffer(Stream) of
-        <<>> ->
+    Full = send_queued_total(StateData) >= StateData#data.max_send_buffer,
+    case webtransport_stream:send_queued(Stream) of
+        0 when Full ->
+            case byte_size(Data) =< send_available(Stream, StateData) of
+                true -> push_limited(StreamId, Data, Fin, Stream, StateData);
+                false -> {error, send_buffer_full}
+            end;
+        0 ->
             push_limited(StreamId, Data, Fin, Stream, StateData);
+        _ when Full ->
+            {error, send_buffer_full};
         _ ->
             %% Earlier bytes are still waiting for credit: queue behind them.
             case webtransport_stream:is_writable(Stream) andalso
@@ -1042,7 +1066,7 @@ push_limited(StreamId, Data, Fin, Stream,
     case webtransport_stream:send(Stream, Now) of
         {ok, ToSend, Stream1} ->
             Stream2 = webtransport_stream:buffer_send(Stream1, Later),
-            Drained = webtransport_stream:send_buffer(Stream2) =:= <<>>,
+            Drained = webtransport_stream:send_queued(Stream2) =:= 0,
             FinNow = Fin andalso Drained,
             Stream3 = maybe_set_fin_pending(Fin andalso not Drained, Stream2),
             case ToSend =:= <<>> andalso not FinNow of
@@ -1078,12 +1102,15 @@ push_limited(StreamId, Data, Fin, Stream,
 flush_streams(#data{streams = Streams} = StateData) ->
     maps:fold(fun flush_stream/3, StateData, Streams).
 
+%% Only the bytes the new credit allows are taken from the queue, so a long
+%% queue is not copied on every credit update.
 flush_stream(StreamId, Stream, #data{streams = Streams} = StateData) ->
-    case webtransport_stream:send_buffer(Stream) of
-        <<>> ->
+    case webtransport_stream:send_queued(Stream) of
+        0 ->
             StateData;
-        Buf ->
-            {_, Stream0} = webtransport_stream:flush_send_buffer(Stream),
+        _ ->
+            {Buf, Stream0} = webtransport_stream:take_send(
+                               Stream, send_available(Stream, StateData)),
             Fin = webtransport_stream:fin_pending(Stream0),
             Stream1 = webtransport_stream:clear_fin_pending(Stream0),
             StateData1 = StateData#data{streams = Streams#{StreamId => Stream1}},
@@ -1096,6 +1123,15 @@ flush_stream(StreamId, Stream, #data{streams = Streams} = StateData) ->
                     StateData
             end
     end.
+
+%% Bytes that can go out on `Stream' now: the lower of the session and
+%% stream credit.
+send_available(Stream, #data{remote_max_data = SessMax, bytes_sent = SessSent}) ->
+    StreamAvail = webtransport_stream:send_window(Stream) - webtransport_stream:bytes_sent(Stream),
+    max(min(SessMax - SessSent, StreamAvail), 0).
+
+send_queued_total(#data{streams = Streams}) ->
+    maps:fold(fun(_Id, S, Acc) -> Acc + webtransport_stream:send_queued(S) end, 0, Streams).
 
 maybe_close_local(true, Stream) ->
     {ok, S} = webtransport_stream:close_local(Stream),
@@ -1185,8 +1221,8 @@ streams_blocked(uni, Limit) -> {streams_blocked_uni, Limit}.
 do_close_stream(StreamId, #data{streams = Streams} = StateData) ->
     case maps:find(StreamId, Streams) of
         {ok, Stream} ->
-            case webtransport_stream:send_buffer(Stream) of
-                <<>> -> close_stream_now(StreamId, Stream, StateData);
+            case webtransport_stream:send_queued(Stream) of
+                0 -> close_stream_now(StreamId, Stream, StateData);
                 _ -> close_stream_after_queue(StreamId, Stream, StateData)
             end;
         error ->
@@ -2187,6 +2223,46 @@ connect_oversize_close_test() ->
     Header = <<(h2_varint:encode(?WT_CLOSE_SESSION))/binary, (h2_varint:encode(2000))/binary>>,
     ?assertMatch({stop, {shutdown, {session_error, ?H3_MESSAGE_ERROR}}, _},
                  handle_connect_data(Header, false, Data)).
+
+%% overview-14 §4.2: the datagram receive buffer is bounded and a datagram
+%% that does not fit is dropped. A session that does not keep up does not
+%% collect every datagram in its mailbox.
+datagram_queue_bounded_test() ->
+    Session = spawn(fun() -> receive stop -> ok end end),
+    [handle_datagram_data(Session, <<"d">>) || _ <- lists:seq(1, 10000)],
+    {message_queue_len, N} = erlang:process_info(Session, message_queue_len),
+    ?assert(N =< ?WT_DATAGRAM_QUEUE_MAX),
+    exit(Session, kill).
+
+%% Bytes waiting for the peer's credit are bounded by max_send_buffer: once
+%% the queue is full a send that cannot go out fails, it is not queued.
+send_buffer_full_test() ->
+    %% An h2 connection that accepts every call.
+    Conn = spawn(fun Loop() ->
+                     receive {'$gen_call', From, _} -> gen:reply(From, ok), Loop() end
+                 end),
+    Stream = webtransport_stream:new(0, bidi, 0, 100),
+    Data = (test_data())#data{transport_state = webtransport_h2:new(Conn, 1),
+                              streams = #{0 => Stream}, max_send_buffer = 1000},
+    Chunk = binary:copy(<<1>>, 300),
+    Send = fun Loop(D, N) when N < 100 ->
+                   case do_send(0, Chunk, false, D) of
+                       {ok, D1} -> Loop(D1, N + 1);
+                       {error, send_buffer_full} -> {full, D, N}
+                   end;
+               Loop(D, N) -> {not_full, D, N}
+           end,
+    {full, Full, Accepted} = Send(Data, 0),
+    ?assertEqual(4, Accepted),
+    ?assertEqual(1200, send_queued_total(Full)),
+    %% A send that fits the credit still goes out when the queue is full.
+    Other = webtransport_stream:new(4, bidi, 100, 100),
+    Full1 = Full#data{streams = (Full#data.streams)#{4 => Other},
+                      remote_max_data = 100},
+    ?assertEqual({error, send_buffer_full},
+                 do_send(4, binary:copy(<<1>>, 200), false, Full1)),
+    ?assertMatch({ok, _}, do_send(4, binary:copy(<<1>>, 50), false, Full1)),
+    exit(Conn, kill).
 
 %% Finished streams leave the map; a finished peer stream returns credit.
 retire_stream_test() ->

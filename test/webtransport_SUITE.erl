@@ -76,6 +76,7 @@
     server_drain_reaches_client_test/1,
     stream_credit_replenish_test/1,
     connection_close_ends_session_test/1,
+    h2_caller_not_linked_to_connection_test/1,
     connection_close_stops_router_test/1,
     server_without_wt_enabled_test/1,
     invalid_webtransport_init_test/1,
@@ -174,6 +175,7 @@ groups() ->
               client_socket_opts_tcp_only_ignored_test],
     %% WebTransport-Init is an HTTP/2 header.
     H2Only = [invalid_webtransport_init_test, client_refuses_tls12_server_test,
+              h2_caller_not_linked_to_connection_test,
               h2_embedded_accept_round_trip_test,
               listener_refuses_tls12_client_test, accept_refuses_tls12_test,
               client_socket_opts_h2_test],
@@ -887,6 +889,22 @@ connection_close_ends_session_test(Config) ->
         flush_exits(),
         process_flag(trap_exit, false)
     end.
+
+%% The h2 connection belongs to the session's data loop. When the session
+%% ends the connection stops with {shutdown, {owner_exit, normal}}; the
+%% process that called connect must not be linked to it, or it dies too.
+h2_caller_not_linked_to_connection_test(Config) ->
+    Port = proplists:get_value(port, Config),
+    {ok, Session} = webtransport:connect("localhost", Port, <<"/test">>, #{
+        transport => h2,
+        verify => verify_none
+    }),
+    {_StateName, Data} = sys:get_state(Session),
+    Conn = webtransport_h2:h2_conn(element(3, Data)),
+    {links, Links} = erlang:process_info(self(), links),
+    ?assertNot(lists:member(Conn, Links)),
+    ?assert(lists:member(Session, Links)),
+    webtransport:close_session(Session).
 
 %% The listener's per-connection router stops when the connection closes,
 %% also for a connection that never opened a WebTransport stream.

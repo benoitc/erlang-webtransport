@@ -261,3 +261,20 @@ is_uni_stream_record_test() ->
     Uni = webtransport_stream:new(2, uni, 100),
     ?assertNot(webtransport_stream:is_uni(Bidi)),
     ?assert(webtransport_stream:is_uni(Uni)).
+
+%% The send queue gives bytes back in order, a part at a time, and counts
+%% what is left.
+take_send_test() ->
+    S0 = webtransport_stream:new(4, bidi, 0, 0),
+    S1 = lists:foldl(fun(B, S) -> webtransport_stream:buffer_send(S, B) end,
+                     S0, [<<"abc">>, <<"defg">>, <<>>, <<"hi">>]),
+    ?assertEqual(9, webtransport_stream:send_queued(S1)),
+    {A, S2} = webtransport_stream:take_send(S1, 5),
+    ?assertEqual(<<"abcde">>, A),
+    ?assertEqual(4, webtransport_stream:send_queued(S2)),
+    {B, S3} = webtransport_stream:take_send(S2, 0),
+    ?assertEqual(<<>>, B),
+    {C, S4} = webtransport_stream:take_send(S3, 100),
+    ?assertEqual(<<"fghi">>, C),
+    ?assertEqual(0, webtransport_stream:send_queued(S4)),
+    ?assertEqual(<<>>, webtransport_stream:send_buffer(S4)).

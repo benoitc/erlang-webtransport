@@ -146,6 +146,7 @@
 -define(DEFAULT_MAX_STREAMS_BIDI, 100).
 -define(DEFAULT_MAX_STREAMS_UNI, 100).
 -define(DEFAULT_MAX_SESSIONS, 100).
+-define(DEFAULT_MAX_SEND_BUFFER, 4194304).  %% 4 MiB queued per session
 
 %% ============================================================================
 %% Datagram size ceilings
@@ -176,5 +177,9 @@
 -define(WT_CONTROL_CAPSULE_MAX, 64).
 %% WT_CLOSE_SESSION: a 32-bit code and a reason of at most 1024 bytes.
 -define(WT_CLOSE_CAPSULE_MAX, (4 + ?WT_CLOSE_REASON_MAX)).
+
+%% Messages a session may have waiting before an incoming datagram is
+%% dropped instead of queued (overview-14 §4.2: bounded receive buffer).
+-define(WT_DATAGRAM_QUEUE_MAX, 1024).
 
 -endif.

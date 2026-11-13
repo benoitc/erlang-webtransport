@@ -1,5 +1,24 @@
 # Changelog
 
+## Unreleased
+
+- Over HTTP/2, a client session that ended (for example after a drain)
+  could kill the process that called `connect` with
+  `{shutdown, {owner_exit, normal}}`. That process is no longer linked to
+  the HTTP/2 connection, only to the session.
+- Incoming datagrams are dropped once a session has 1024 messages waiting,
+  instead of queueing without limit when the application falls behind
+  (draft-ietf-webtrans-overview-14 §4.2).
+- Over HTTP/3, a connection now remembers at most 256 ended sessions, to
+  reset their late streams. Before, every ended session was kept until the
+  connection closed, so a client opening and closing sessions on one
+  connection grew it without limit.
+- Data waiting for the peer's flow-control credit is now capped per session
+  by the new `max_send_buffer` option (4 MiB by default). Once it is full, a
+  send that cannot go out at once returns `{error, send_buffer_full}`.
+  Before, a peer that never granted credit made the queue grow without
+  limit, and each credit update copied the whole queue.
+
 ## 0.5.7 - 2026-11-13
 
 - Over HTTP/3, a session now ends when its connection closes, as
