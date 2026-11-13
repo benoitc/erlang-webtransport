@@ -77,6 +77,7 @@
     stream_credit_replenish_test/1,
     connection_close_ends_session_test/1,
     h2_caller_not_linked_to_connection_test/1,
+    unusable_cacertfile_fails_connect_test/1,
     connection_close_stops_router_test/1,
     server_without_wt_enabled_test/1,
     invalid_webtransport_init_test/1,
@@ -132,6 +133,7 @@ groups() ->
         server_drain_reaches_client_test,
         stream_credit_replenish_test,
         connection_close_ends_session_test,
+        unusable_cacertfile_fails_connect_test,
         connect_disconnect_test,
         session_info_test,
         open_bidi_stream_test,
@@ -904,6 +906,24 @@ h2_caller_not_linked_to_connection_test(Config) ->
     {links, Links} = erlang:process_info(self(), links),
     ?assertNot(lists:member(Conn, Links)),
     ?assert(lists:member(Session, Links)),
+    webtransport:close_session(Session).
+
+%% A `cacertfile' that cannot be read fails the connect. It is not skipped,
+%% which would verify the server against the default trust store instead
+%% of the CAs the caller chose. A valid one is loaded as the trust anchors.
+unusable_cacertfile_fails_connect_test(Config) ->
+    Port = proplists:get_value(port, Config),
+    Transport = proplists:get_value(transport, Config),
+    Missing = filename:join(proplists:get_value(priv_dir, Config), "missing-ca.pem"),
+    ?assertMatch({error, {cacertfile, Missing, _}},
+                 webtransport:connect("localhost", Port, <<"/test">>,
+                                      #{transport => Transport,
+                                        cacertfile => Missing})),
+    %% The server's own certificate is a PEM with one certificate: it loads.
+    {ok, Session} = webtransport:connect("localhost", Port, <<"/test">>,
+                                         #{transport => Transport,
+                                           verify => verify_none,
+                                           cacertfile => proplists:get_value(certfile, Config)}),
     webtransport:close_session(Session).
 
 %% The listener's per-connection router stops when the connection closes,
