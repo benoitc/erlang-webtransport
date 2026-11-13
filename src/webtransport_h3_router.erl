@@ -24,6 +24,9 @@
 
 %% Datagrams held for sessions that are not registered yet.
 -define(MAX_PARKED_DATAGRAMS, 64).
+%% Ended or refused sessions remembered per connection; the oldest is
+%% forgotten first.
+-define(MAX_GONE_SESSIONS, 256).
 %% Bytes of stream data held for sessions that are not registered yet.
 -define(MAX_PARKED_BYTES, 1048576).
 %% How long a client waits for the server to close its side of a CONNECT
@@ -57,6 +60,8 @@
     %% WT_SESSION_GONE instead of held. `peer_closed' when the peer sent
     %% WT_CLOSE_SESSION, so later data on the CONNECT stream is an error.
     gone = #{} :: #{non_neg_integer() => ended | peer_closed},
+    %% Ids in `gone', oldest first, so it stays within ?MAX_GONE_SESSIONS.
+    gone_order = queue:new() :: queue:queue(non_neg_integer()),
     %% Client side: sessions that ended, waiting for the server to close the
     %% CONNECT stream before the connection is closed.
     closing = #{} :: #{non_neg_integer() => reference()},
@@ -212,7 +217,7 @@ handle_call({gone, SessionId}, _From, State) ->
 handle_call({ended, SessionId, PeerClosed}, _From, State) ->
     State1 = drop_session(SessionId, State),
     Gone = case PeerClosed of true -> peer_closed; false -> ended end,
-    State2 = State1#state{gone = (State1#state.gone)#{SessionId => Gone}},
+    State2 = mark_gone(SessionId, Gone, State1),
     {reply, ok, start_closing(SessionId, PeerClosed, State2)};
 handle_call({open_uni_stream, SessionId}, _From, State) ->
     do_open_local_uni(SessionId, State);
@@ -414,8 +419,8 @@ others(SessionId, #state{sessions = Sessions, reserved = Reserved}) ->
 
 %% A refused CONNECT: no session will come, so held streams are reset.
 refuse_session(SessionId, #state{parked = Parked} = State) ->
-    State1 = State#state{reserved = maps:remove(SessionId, State#state.reserved),
-                         gone = (State#state.gone)#{SessionId => ended}},
+    State1 = mark_gone(SessionId, ended,
+                       State#state{reserved = maps:remove(SessionId, State#state.reserved)}),
     case maps:take(SessionId, Parked) of
         {Events, Parked1} ->
             [reset_unknown_session_stream(Id, State1) || {opened, Id, _, _, _} <- Events],
@@ -715,10 +720,26 @@ drop_session(SessionId, #state{sessions = Sessions, monitors = Monitors} = State
     Monitors1 = maps:filter(fun(_Ref, Sid) -> Sid =/= SessionId end, Monitors),
     StreamSessions = maps:filter(fun(_S, Sid) -> Sid =/= SessionId end,
                                  State#state.stream_sessions),
-    Gone = State#state.gone,
-    State#state{sessions = Sessions1, monitors = Monitors1,
-                stream_sessions = StreamSessions,
-                gone = Gone#{SessionId => maps:get(SessionId, Gone, ended)}}.
+    State1 = State#state{sessions = Sessions1, monitors = Monitors1,
+                         stream_sessions = StreamSessions},
+    mark_gone(SessionId, maps:get(SessionId, State#state.gone, ended), State1).
+
+%% Remember that a session ended or was refused, so later streams and
+%% datagrams for it are reset or dropped (http3-17 §6) instead of held.
+%% Only the latest ?MAX_GONE_SESSIONS are kept: a stream for an older one
+%% is held like any early stream, within the parking limits.
+mark_gone(SessionId, Kind, #state{gone = Gone} = State) when is_map_key(SessionId, Gone) ->
+    State#state{gone = Gone#{SessionId => Kind}};
+mark_gone(SessionId, Kind, #state{gone = Gone, gone_order = Order} = State) ->
+    Gone1 = Gone#{SessionId => Kind},
+    Order1 = queue:in(SessionId, Order),
+    case map_size(Gone1) > ?MAX_GONE_SESSIONS of
+        true ->
+            {{value, Oldest}, Order2} = queue:out(Order1),
+            State#state{gone = maps:remove(Oldest, Gone1), gone_order = Order2};
+        false ->
+            State#state{gone = Gone1, gone_order = Order1}
+    end.
 
 %% draft-15 §3.3: QUIC error codes inside the reserved WebTransport range
 %% map back to app-level codes. Anything outside stays opaque for the
@@ -730,3 +751,25 @@ map_from_quic(ErrorCode) ->
         {ok, App} -> App;
         error -> undefined
     end.
+
+%% ============================================================================
+%% Eunit
+%% ============================================================================
+
+-ifdef(TEST).
+-include_lib("eunit/include/eunit.hrl").
+
+%% Only the latest ?MAX_GONE_SESSIONS ended sessions are kept.
+mark_gone_keeps_latest_test() ->
+    State = lists:foldl(fun(Id, S) -> mark_gone(Id, ended, S) end,
+                        #state{}, lists:seq(1, ?MAX_GONE_SESSIONS + 44)),
+    ?assertEqual(?MAX_GONE_SESSIONS, map_size(State#state.gone)),
+    ?assertNot(is_map_key(44, State#state.gone)),
+    ?assert(is_map_key(45, State#state.gone)),
+    ?assert(is_map_key(?MAX_GONE_SESSIONS + 44, State#state.gone)),
+    %% Marking a known id again updates it in place.
+    State1 = mark_gone(100, peer_closed, State),
+    ?assertEqual(peer_closed, maps:get(100, State1#state.gone)),
+    ?assertEqual(?MAX_GONE_SESSIONS, map_size(State1#state.gone)).
+
+-endif.

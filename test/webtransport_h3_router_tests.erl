@@ -206,3 +206,19 @@ stops_with_connection_test() ->
     Ref = erlang:monitor(process, Router),
     exit(Conn, kill),
     ?assertMatch({'DOWN', Ref, process, Router, normal}, recv(1000)).
+
+%% Refused or ended sessions are remembered so their late streams are
+%% reset, but not without limit: ending 10,000 more sessions does not grow
+%% the router.
+gone_sessions_bounded_test() ->
+    {ok, Router} = webtransport_h3_router:start_link(),
+    End = fun(From, To) ->
+        [ok = webtransport_h3_router:session_gone(Router, Id * 4)
+         || Id <- lists:seq(From, To)]
+    end,
+    End(0, 9999),
+    Size1 = erts_debug:flat_size(sys:get_state(Router)),
+    End(10000, 19999),
+    Size2 = erts_debug:flat_size(sys:get_state(Router)),
+    ?assert(Size2 =< Size1 + 100),
+    gen_server:stop(Router).

@@ -9,6 +9,10 @@
 - Incoming datagrams are dropped once a session has 1024 messages waiting,
   instead of queueing without limit when the application falls behind
   (draft-ietf-webtrans-overview-14 §4.2).
+- Over HTTP/3, a connection now remembers at most 256 ended sessions, to
+  reset their late streams. Before, every ended session was kept until the
+  connection closed, so a client opening and closing sessions on one
+  connection grew it without limit.
 
 ## 0.5.7 - 2026-11-13
 
