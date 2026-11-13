@@ -1500,6 +1500,11 @@ h2_start_session(TransportState, Path, Authority, RespHeaders, Protocol, Opts, H
             %% The loop owns the connection from here: it gets its close and
             %% SETTINGS-change events instead of the connecting process.
             _ = h2:controlling_process(H2Conn, LoopPid),
+            %% h2:connect linked the connection to us. It stops with
+            %% {shutdown, {owner_exit, _}} when the loop ends with the
+            %% session, which would kill the caller through that link. The
+            %% caller stays linked to the session instead.
+            true = unlink(H2Conn),
             LoopPid ! {prefix, take_h2_stream_events(H2Conn, StreamId, [])},
             ok = webtransport_session:established(Session),
             {ok, Session};

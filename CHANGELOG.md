@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- Over HTTP/2, a client session that ended (for example after a drain)
+  could kill the process that called `connect` with
+  `{shutdown, {owner_exit, normal}}`. That process is no longer linked to
+  the HTTP/2 connection, only to the session.
+
 ## 0.5.7 - 2026-11-13
 
 - Over HTTP/3, a session now ends when its connection closes, as
