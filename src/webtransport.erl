@@ -1597,11 +1597,7 @@ build_h3_connect_opts(Opts) ->
         h3_datagram_enabled => true,
         stream_reset_final_size => true,
         notify_streams_available => true,
-        stream_type_handler => fun
-            (uni,  _, 16#54) -> claim;
-            (bidi, _, 16#41) -> claim;
-            (_, _, _) -> ignore
-        end
+        stream_type_handler => wt_stream_type_handler()
     },
     %% Handle client certificate if provided
     WithCert = case {maps:find(certfile, Opts), maps:find(cert, Opts)} of
@@ -1917,10 +1913,13 @@ make_h3_handler(Handler, HandlerOpts, Opts, Router) ->
                           Handler, HandlerOpts, Opts, Router)
     end.
 
+%% WebTransport streams are claimed with manual receive credit: the peer
+%% gets one stream window past what the session has handled, from the
+%% first byte, however busy the router is (http3-17 §5.4).
 wt_stream_type_handler() ->
     fun
-        (uni,  _StreamId, 16#54) -> claim;
-        (bidi, _StreamId, 16#41) -> claim;
+        (uni,  _StreamId, 16#54) -> {claim, #{flow_control => manual}};
+        (bidi, _StreamId, 16#41) -> {claim, #{flow_control => manual}};
         (_, _, _) -> ignore
     end.
 
