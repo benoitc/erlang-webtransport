@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+- Requires quic 3.0.0 and h2 0.18.0. Over HTTP/3, a peer certificate is now
+  refused when its Extended Key Usage or Key Usage does not allow TLS server
+  or client authentication. The largest datagram a session reports, and
+  accepts, is now what fits the path as confirmed so far, so it can start
+  smaller and grow during the connection; a larger datagram is refused
+  instead of being sent and lost.
+
 ## 0.5.8 - 2026-11-13
 
 - Over HTTP/2, a client session that ended (for example after a drain)
