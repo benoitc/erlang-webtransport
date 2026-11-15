@@ -116,7 +116,7 @@ open_bidi_stream(#state{router = Router, session_id = SessionId} = State) when i
     end;
 open_bidi_stream(#state{h3_conn = H3Conn, quic_conn = QuicConn, session_id = SessionId} = State) ->
     %% No router (e.g., tests): fall back to direct quic_h3 + send.
-    case quic_h3:open_bidi_stream(H3Conn, ?WT_BIDI_SIGNAL) of
+    case quic_h3:open_bidi_stream(H3Conn, ?WT_BIDI_SIGNAL, #{flow_control => manual}) of
         {ok, StreamId} ->
             Header = wt_h3_capsule:encode_bidi_stream_header(SessionId),
             case quic:send_data(QuicConn, StreamId, Header, false) of
@@ -160,7 +160,7 @@ send(#state{quic_conn = QuicConn, h3_conn = H3Conn, session_id = SessionId}, Str
     end.
 
 %% @doc Return QUIC receive credit for `Bytes' of stream data the handler
-%% has taken. The router puts WebTransport streams in manual mode.
+%% has taken. WebTransport streams are claimed with manual credit.
 -spec consume(state(), non_neg_integer(), non_neg_integer()) -> ok.
 consume(_State, _StreamId, 0) ->
     ok;

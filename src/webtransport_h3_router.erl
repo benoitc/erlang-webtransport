@@ -277,9 +277,8 @@ handle_quic_h3({quic_h3, Conn, {stream_type_open, Direction, StreamId, _Type}}, 
                     _ = cancel_stream(Conn, StreamId, ?WT_BUFFERED_STREAM_REJECTED),
                     {noreply, State};
                 false ->
-                    State1 = manual_credit(StreamId, State),
-                    Pending = (State1#state.pending)#{StreamId => {Direction, <<>>}},
-                    {noreply, State1#state{pending = Pending}}
+                    Pending = (State#state.pending)#{StreamId => {Direction, <<>>}},
+                    {noreply, State#state{pending = Pending}}
             end
     end;
 handle_quic_h3({quic_h3, Conn, {stream_type_data, _Direction, StreamId, Data, Fin}}, State0) ->
@@ -418,19 +417,11 @@ keep_header_on_reset(QuicConn, StreamId, HeaderSize) ->
     _ = quic:set_stream_reliable_size(QuicConn, StreamId, HeaderSize),
     ok.
 
-%% Receive credit on a WebTransport stream follows what the session has
-%% handled, not what reached this process: draft-02 has no WebTransport
-%% flow control, so QUIC stream credit is the only bound on a peer
-%% (draft-ietf-webtrans-overview-14 §4.3). The session returns it with
-%% quic:consume/3 once its handler has taken the data.
-manual_credit(_StreamId, #state{quic_conn = undefined} = State) ->
-    State;
-manual_credit(StreamId, #state{quic_conn = QuicConn} = State) ->
-    _ = try quic:set_stream_flow_control(QuicConn, StreamId, manual)
-        catch exit:_ -> ok
-        end,
-    State.
-
+%% WebTransport streams are claimed, and our bidi streams opened, with
+%% manual receive credit, so credit follows what the session has handled:
+%% draft-02 has no WebTransport flow control, and QUIC stream credit is
+%% the only bound on a peer (draft-ietf-webtrans-overview-14 §4.3). The
+%% session returns it with quic:consume/3 once its handler has the data.
 consume(_StreamId, _Bytes, #state{quic_conn = undefined} = State) ->
     State;
 consume(StreamId, Bytes, #state{quic_conn = QuicConn} = State) ->
@@ -438,10 +429,6 @@ consume(StreamId, Bytes, #state{quic_conn = QuicConn} = State) ->
         catch exit:_ -> ok
         end,
     State.
-
-%% Size of the stream type quic_h3 read before handing the stream over.
-stream_type_size(bidi) -> byte_size(h2_varint:encode(?WT_BIDI_SIGNAL));
-stream_type_size(uni) -> byte_size(h2_varint:encode(?WT_UNI_STREAM_TYPE)).
 
 %% Sessions and slots on this connection other than `SessionId'.
 others(SessionId, #state{sessions = Sessions, reserved = Reserved}) ->
@@ -509,15 +496,15 @@ do_open_local_bidi(SessionId, State) ->
                 undefined ->
                     {reply, {error, no_h3_conn}, State};
                 H3Conn ->
-                    case quic_h3:open_bidi_stream(H3Conn, ?WT_BIDI_SIGNAL) of
+                    case quic_h3:open_bidi_stream(H3Conn, ?WT_BIDI_SIGNAL,
+                                                  #{flow_control => manual}) of
                         {ok, StreamId} ->
                             Header = wt_h3_capsule:encode_bidi_stream_header(SessionId),
                             QuicConn = quic_h3:get_quic_conn(H3Conn),
                             _ = quic:send_data(QuicConn, StreamId, Header, false),
                             keep_header_on_reset(QuicConn, StreamId, byte_size(Header)),
                             Local = (State#state.local_streams)#{StreamId => SessionPid},
-                            State1 = manual_credit(
-                                       StreamId, ensure_h3_monitor(H3Conn, State)),
+                            State1 = ensure_h3_monitor(H3Conn, State),
                             {reply, {ok, StreamId},
                              State1#state{local_streams = Local}};
                         {error, _} = Err ->
@@ -548,9 +535,9 @@ route_peer_stream_data(StreamId, Data, Fin, #state{pending = Pending} = State) -
                     close_connection(?H3_ID_ERROR, State),
                     State#state{pending = maps:remove(StreamId, Pending)};
                 {ok, SessionId, Rest} ->
-                    %% The stream type quic_h3 read and the session id are
-                    %% ours to credit; the session credits the rest.
-                    Header = stream_type_size(Direction) + byte_size(Combined) - byte_size(Rest),
+                    %% quic_h3 credits the stream type; the session id is
+                    %% ours to credit, the session credits the rest.
+                    Header = byte_size(Combined) - byte_size(Rest),
                     State1 = consume(StreamId, Header,
                                      State#state{pending = maps:remove(StreamId, Pending)}),
                     deliver_open_and_data(SessionId, StreamId, Direction, Rest, Fin, State1);

@@ -106,7 +106,8 @@
 
     %% A peer stays one stream window ahead of a slow handler
     slow_handler_bounds_peer_test/1,
-    slow_handler_bounds_draft02_peer_test/1
+    slow_handler_bounds_draft02_peer_test/1,
+    busy_router_bounds_draft02_peer_test/1
 ]).
 
 %% ============================================================================
@@ -191,7 +192,8 @@ groups() ->
         {h2_tests, [sequence], Cases ++ H2Only},
         {h3_legacy_tests, [sequence], [legacy_draft02_round_trip_test,
                                        legacy_draft07_round_trip_test,
-                                       slow_handler_bounds_draft02_peer_test]}
+                                       slow_handler_bounds_draft02_peer_test,
+                                       busy_router_bounds_draft02_peer_test]}
     ].
 
 init_per_suite(Config) ->
@@ -1935,7 +1937,15 @@ slow_handler_bounds_peer_test(Config) ->
 slow_handler_bounds_draft02_peer_test(Config) ->
     slow_handler_bound(Config, #{compat_mode => legacy_browser_compat}).
 
+%% The bound also holds while the connection's router is busy and has not
+%% yet heard of the streams: they are claimed with manual credit.
+busy_router_bounds_draft02_peer_test(Config) ->
+    slow_handler_bound(Config, #{compat_mode => legacy_browser_compat}, busy_router).
+
 slow_handler_bound(Config, ConnectOpts) ->
+    slow_handler_bound(Config, ConnectOpts, idle_router).
+
+slow_handler_bound(Config, ConnectOpts, RouterLoad) ->
     process_flag(trap_exit, true),
     Transport = proplists:get_value(transport, Config),
     Port = test_helpers:find_free_port(),
@@ -1954,11 +1964,17 @@ slow_handler_bound(Config, ConnectOpts) ->
                                              ConnectOpts#{transport => Transport,
                                                           verify => verify_none}),
         Server = receive {slow_session, S} -> S after 5000 -> error(no_server_session) end,
+        Router = case RouterLoad of
+            busy_router -> server_router(Server);
+            idle_router -> undefined
+        end,
+        RouterLoad =:= busy_router andalso sys:suspend(Router),
         {ok, Bidi} = webtransport:open_stream(Session, bidi),
         {ok, Uni} = webtransport:open_stream(Session, uni),
         Chunk = binary:copy(<<0>>, 65536),
         Senders = [spawn_link(fun() -> send_chunks(Session, Id, Chunk, 128) end)
                    || Id <- [Bidi, Uni]],
+        RouterLoad =:= busy_router andalso begin timer:sleep(1000), sys:resume(Router) end,
         %% 16 MiB offered; the handler takes about 3 MiB/s of 1 KiB chunks
         %% at most.
         timer:sleep(2000),
@@ -1977,6 +1993,13 @@ slow_handler_bound(Config, ConnectOpts) ->
         flush_exits(),
         process_flag(trap_exit, false)
     end.
+
+%% The router of a server session's connection: it monitors the session.
+server_router(Session) ->
+    {monitored_by, Pids} = process_info(Session, monitored_by),
+    [Router] = [P || P <- Pids, is_pid(P),
+                     proc_lib:initial_call(P) =:= {webtransport_h3_router, init, ['Argument__1']}],
+    Router.
 
 send_chunks(_Session, _StreamId, _Chunk, 0) ->
     ok;
