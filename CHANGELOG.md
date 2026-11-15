@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.5.10 - 2026-11-15
 
 - Over HTTP/3, a peer could send on a stream as fast as the network allowed
   and every byte waited in the session's queue when the handler fell
