@@ -1467,7 +1467,17 @@ handle_incoming_capsule({unknown, Type, _Payload}, StateData) ->
     logger:debug("webtransport: dropping unknown capsule type ~p", [Type]),
     StateData.
 
-handle_incoming_stream_data(StreamId, Data, Fin, #data{streams = Streams} = StateData) ->
+%% Over HTTP/3, the QUIC credit for the bytes goes back once they are
+%% handled, so the peer stays one stream window ahead of the handler.
+handle_incoming_stream_data(StreamId, Data, Fin,
+                            #data{transport = h3, transport_state = H3State} = StateData) ->
+    Result = receive_incoming_stream_data(StreamId, Data, Fin, StateData),
+    ok = webtransport_h3:consume(H3State, StreamId, byte_size(Data)),
+    Result;
+handle_incoming_stream_data(StreamId, Data, Fin, StateData) ->
+    receive_incoming_stream_data(StreamId, Data, Fin, StateData).
+
+receive_incoming_stream_data(StreamId, Data, Fin, #data{streams = Streams} = StateData) ->
     case maps:find(StreamId, Streams) of
         {ok, _Stream} when StateData#data.transport =:= h2 ->
             case has_peer_send_side(StreamId, StateData) of
@@ -1513,8 +1523,8 @@ receive_stream_data(StreamId, Data, Fin,
                         false -> fun() -> Handler:handle_stream(StreamId, Type, Data, HState) end
                     end,
                     StateData1 = StateData#data{bytes_received = SessRecv1},
-                    %% The handler consumes the bytes synchronously, so credit
-                    %% can be returned to the peer right away.
+                    %% The handler runs before the next message is read, so
+                    %% the peer cannot get more than one window ahead of it.
                     {Stream3, StateData2} = grant_credit(StreamId, Stream2, StateData1),
                     {StateData3, Transition} =
                         apply_stream_callback(Callback(), StreamId, Stream3, Streams, StateData2),

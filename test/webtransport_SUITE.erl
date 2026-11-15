@@ -102,7 +102,11 @@
 
     %% Legacy drafts (draft-02, http3-07) against the default listener
     legacy_draft02_round_trip_test/1,
-    legacy_draft07_round_trip_test/1
+    legacy_draft07_round_trip_test/1,
+
+    %% A peer stays one stream window ahead of a slow handler
+    slow_handler_bounds_peer_test/1,
+    slow_handler_bounds_draft02_peer_test/1
 ]).
 
 %% ============================================================================
@@ -167,7 +171,8 @@ groups() ->
         start_listener_invalid_certfile_test,
         start_listener_invalid_keyfile_test,
         start_listener_bad_pem_test,
-        sni_callback_round_trip_test
+        sni_callback_round_trip_test,
+        slow_handler_bounds_peer_test
     ],
     %% Embedding via h3_settings/0 + accept/4 is HTTP/3-only.
     H3Only = [embedded_accept_round_trip_test, quic_stream_limit_credit_test,
@@ -185,7 +190,8 @@ groups() ->
         {h3_tests, [sequence], Cases ++ H3Only},
         {h2_tests, [sequence], Cases ++ H2Only},
         {h3_legacy_tests, [sequence], [legacy_draft02_round_trip_test,
-                                       legacy_draft07_round_trip_test]}
+                                       legacy_draft07_round_trip_test,
+                                       slow_handler_bounds_draft02_peer_test]}
     ].
 
 init_per_suite(Config) ->
@@ -1913,6 +1919,76 @@ legacy_round_trip(Config, Mode, Draft) ->
     Size = byte_size(Payload),
     ?assertEqual(Payload, binary:part(Echoed, byte_size(Echoed) - Size, Size)),
     ok = webtransport:close_session(Session).
+
+%% ============================================================================
+%% Receive credit and a slow handler
+%% ============================================================================
+
+%% overview-14 §4.3: stream data is flow controlled. Whatever the draft, a
+%% peer sending faster than the handler takes the data stays about one
+%% stream window ahead: the session does not hold what the peer sent.
+slow_handler_bounds_peer_test(Config) ->
+    slow_handler_bound(Config, #{}).
+
+%% draft-02 has no WebTransport flow control, so QUIC stream credit is
+%% the only bound.
+slow_handler_bounds_draft02_peer_test(Config) ->
+    slow_handler_bound(Config, #{compat_mode => legacy_browser_compat}).
+
+slow_handler_bound(Config, ConnectOpts) ->
+    process_flag(trap_exit, true),
+    Transport = proplists:get_value(transport, Config),
+    Port = test_helpers:find_free_port(),
+    Name = list_to_atom("slow_listener_" ++ integer_to_list(Port)),
+    {ok, _} = webtransport:start_listener(Name, #{
+        transport => Transport,
+        port => Port,
+        certfile => proplists:get_value(certfile, Config),
+        keyfile => proplists:get_value(keyfile, Config),
+        handler => wt_slow_handler,
+        handler_opts => #{owner => self()}
+    }),
+    try
+        timer:sleep(100),
+        {ok, Session} = webtransport:connect("localhost", Port, <<"/test">>,
+                                             ConnectOpts#{transport => Transport,
+                                                          verify => verify_none}),
+        Server = receive {slow_session, S} -> S after 5000 -> error(no_server_session) end,
+        {ok, Bidi} = webtransport:open_stream(Session, bidi),
+        {ok, Uni} = webtransport:open_stream(Session, uni),
+        Chunk = binary:copy(<<0>>, 65536),
+        Senders = [spawn_link(fun() -> send_chunks(Session, Id, Chunk, 128) end)
+                   || Id <- [Bidi, Uni]],
+        %% 16 MiB offered; the handler takes about 3 MiB/s of 1 KiB chunks
+        %% at most.
+        timer:sleep(2000),
+        {binary, Bins} = process_info(Server, binary),
+        {message_queue_len, Queued} = process_info(Server, message_queue_len),
+        Held = lists:sum([Size || {_, Size, _} <- Bins]),
+        ct:pal("~p ~p: server session holds ~p bytes in ~p messages",
+               [Transport, ConnectOpts, Held, Queued]),
+        [begin unlink(P), exit(P, kill) end || P <- Senders],
+        exit(Server, kill),
+        ?assert(Held < 4 * 1024 * 1024),
+        try webtransport:close_session(Session) catch exit:_ -> ok end
+    after
+        webtransport:stop_listener(Name),
+        timer:sleep(100),
+        flush_exits(),
+        process_flag(trap_exit, false)
+    end.
+
+send_chunks(_Session, _StreamId, _Chunk, 0) ->
+    ok;
+send_chunks(Session, StreamId, Chunk, N) ->
+    try webtransport:send(Session, StreamId, Chunk) of
+        ok -> send_chunks(Session, StreamId, Chunk, N - 1);
+        {error, send_buffer_full} ->
+            timer:sleep(5),
+            send_chunks(Session, StreamId, Chunk, N);
+        _ -> ok
+    catch exit:_ -> ok
+    end.
 
 %% ============================================================================
 %% Client socket options

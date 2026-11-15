@@ -546,7 +546,7 @@ The library enforces:
 - **HTTP/3 prohibition** -- `WT_MAX_STREAM_DATA` and `WT_STREAM_DATA_BLOCKED` capsules are session errors on HTTP/3 (per-stream flow control uses native QUIC).
 - **HTTP/2 WebTransport-Init** -- the `WebTransport-Init` header ([draft-16 section 4.3.2](https://datatracker.ietf.org/doc/html/draft-ietf-webtrans-http2-16#section-4.3.2)) carries initial per-stream data limits. When both SETTINGS and the header are present, the greater value is used. A header that does not parse is refused with 400.
 - **Large sends** -- `send/4` accepts a payload of any size and returns `ok` once it is queued. Bytes beyond the session window (both transports) or the stream window (HTTP/2) wait in order on the stream, FIN is held until they are out, and the queue drains as the peer raises its limits. `WT_DATA_BLOCKED` tells the peer we are waiting.
-- **Credit on receive** -- the library sends `WT_MAX_DATA` (both transports) and `WT_MAX_STREAM_DATA` (HTTP/2) once half of a window has been consumed, so a peer that honours our windows is never left waiting.
+- **Credit on receive** -- the library sends `WT_MAX_DATA` (both transports) and `WT_MAX_STREAM_DATA` (HTTP/2) once half of a window has been consumed, so a peer that honours our windows is never left waiting. Over HTTP/3 the QUIC stream credit goes back once `handle_stream/4` returns, on every draft, draft-02 included. Credit follows your handler: if it passes data to another process, return only once that process has taken it, and the peer stays one window ahead of it.
 
 ## Datagram limits
 

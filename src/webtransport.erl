@@ -203,7 +203,7 @@ h3_settings(Opts) ->
     Settings = h3_server_settings(Opts),
     Claim = wt_stream_type_handler(),
     ConnectionHandler = fun(QuicConnPid) ->
-        {ok, Router} = webtransport_h3_router:start(undefined),
+        {ok, Router} = webtransport_h3_router:start(undefined, QuicConnPid),
         ensure_router_table(),
         %% Key the router by the QUIC connection pid. accept/4 derives the
         %% same key from its H3 connection via quic_h3:get_quic_conn/1, so
@@ -682,7 +682,7 @@ router_key(H3Conn) ->
     quic_h3:get_quic_conn(H3Conn).
 
 create_and_register_router(Key) ->
-    {ok, Router} = webtransport_h3_router:start(undefined),
+    {ok, Router} = webtransport_h3_router:start(undefined, Key),
     ets:insert(webtransport_routers, {Key, Router}),
     Router.
 
