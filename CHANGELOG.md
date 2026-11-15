@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.5.11 - 2026-11-15
+
+- Requires quic 3.1.0. Over HTTP/3, a stream opened while its
+  connection's router was busy could still let the peer send far more
+  than one stream window before the limit from 0.5.10 took hold. Streams
+  now have that limit from their first byte (draft-ietf-webtrans-http3-17
+  §5.4).
+
 ## 0.5.10 - 2026-11-15
 
 - Over HTTP/3, a peer could send on a stream as fast as the network allowed
