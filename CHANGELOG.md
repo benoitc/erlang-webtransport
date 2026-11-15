@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.5.9 - 2026-11-15
 
 - Requires quic 3.0.0 and h2 0.18.0. Over HTTP/3, a peer certificate is now
   refused when its Extended Key Usage or Key Usage does not allow TLS server
