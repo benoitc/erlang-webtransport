@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+- Over HTTP/3, a peer could send on a stream as fast as the network allowed
+  and every byte waited in the session's queue when the handler fell
+  behind. This hit draft-02 sessions (Chrome, Firefox), which have no
+  WebTransport flow control. The QUIC credit for a stream now goes back
+  once the handler has taken the data, so a peer stays about one stream
+  window ahead of it on every draft (draft-ietf-webtrans-http3-17 §5.4,
+  draft-ietf-webtrans-overview-14 §4.3).
+
 ## 0.5.9 - 2026-11-15
 
 - Requires quic 3.0.0 and h2 0.18.0. Over HTTP/3, a peer certificate is now

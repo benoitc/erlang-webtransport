@@ -279,7 +279,11 @@ and [draft-16](https://datatracker.ietf.org/doc/html/draft-ietf-webtrans-http2-1
   `WT_DATA_BLOCKED` tells the peer we are waiting.
 - **Credit on receive** -- the library sends `WT_MAX_DATA` (both transports)
   and `WT_MAX_STREAM_DATA` (HTTP/2) once half of a window has been consumed,
-  so a peer that honours our windows is never left waiting.
+  so a peer that honours our windows is never left waiting. Over HTTP/3 the
+  QUIC stream credit goes back once `handle_stream/4` returns, on every
+  draft, draft-02 included. Credit follows your handler: if it passes data
+  to another process, return only once that process has taken it, and the
+  peer stays one window ahead of it.
 
 ## Datagram Limits
 

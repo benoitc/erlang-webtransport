@@ -15,7 +15,7 @@
 -export([open_bidi_stream/1, open_uni_stream/1]).
 -export([send/4, send_datagram/2]).
 -export([close_session/3, drain_session/1, send_capsule/2]).
--export([reset_stream/4, stop_sending/3, stream_header_size/2]).
+-export([reset_stream/4, stop_sending/3, stream_header_size/2, consume/3]).
 -export([decode_stream_header/1, decode_datagram/1]).
 
 -record(state, {
@@ -158,6 +158,17 @@ send(#state{quic_conn = QuicConn, h3_conn = H3Conn, session_id = SessionId}, Str
             %% Native WebTransport stream - use QUIC connection directly
             quic:send_data(QuicConn, StreamId, iolist_to_binary(Data), Fin)
     end.
+
+%% @doc Return QUIC receive credit for `Bytes' of stream data the handler
+%% has taken. The router puts WebTransport streams in manual mode.
+-spec consume(state(), non_neg_integer(), non_neg_integer()) -> ok.
+consume(_State, _StreamId, 0) ->
+    ok;
+consume(#state{quic_conn = QuicConn}, StreamId, Bytes) ->
+    _ = try quic:consume(QuicConn, StreamId, Bytes)
+        catch exit:_ -> ok
+        end,
+    ok.
 
 %% ============================================================================
 %% HTTP Datagrams

@@ -45,7 +45,9 @@ Audited 2026-11-13 against quic 2.7.0 and h2 0.17.0.
   connection without it, strictly increasing limits, the 2^60 stream cap,
   overruns as WT_FLOW_CONTROL_ERROR, bytes of a reset stream counted from its
   final size, credit returned with WT_MAX_DATA,
-  WT_MAX_STREAM_DATA and WT_MAX_STREAMS, blocked capsules sent.
+  WT_MAX_STREAM_DATA and WT_MAX_STREAMS, blocked capsules sent. On h3,
+  QUIC stream credit is returned once the handler has taken the data
+  (§5.4), draft-02 included.
 - **Stream state (h2).** Resets, STOP_SENDING, data and flow-control capsules
   on a stream in the wrong state are WT_STREAM_STATE_ERROR session errors;
   STOP_SENDING is answered with WT_RESET_STREAM.

@@ -72,6 +72,8 @@
     expected = #{} :: #{non_neg_integer() => [term()]},
     passthrough :: undefined | pid(),
     h3_conn :: undefined | pid(),
+    %% The QUIC connection under h3_conn, given when the router starts.
+    quic_conn :: undefined | pid(),
     h3_monitor :: undefined | reference(),
     %% Server: monitor on the QUIC connection this router serves. Its end
     %% stops the router.
@@ -189,7 +191,7 @@ init([Passthrough, Conn]) ->
         undefined -> undefined;
         _ -> erlang:monitor(process, Conn)
     end,
-    {ok, #state{passthrough = Passthrough, conn_monitor = ConnMonitor}}.
+    {ok, #state{passthrough = Passthrough, conn_monitor = ConnMonitor, quic_conn = Conn}}.
 
 handle_call({register, SessionId, SessionPid}, _From, State) ->
     Ref = erlang:monitor(process, SessionPid),
@@ -229,7 +231,9 @@ handle_call({client_connect, Host, Port, H3Opts}, _From, State) ->
     case quic_h3:connect(Host, Port, H3Opts) of
         {ok, H3Conn} = OK ->
             Ref = erlang:monitor(process, H3Conn),
-            {reply, OK, State#state{h3_conn = H3Conn, h3_monitor = Ref, role = client}};
+            QuicConn = quic_h3:get_quic_conn(H3Conn),
+            {reply, OK, State#state{h3_conn = H3Conn, h3_monitor = Ref, role = client,
+                                    quic_conn = QuicConn}};
         Err ->
             {reply, Err, State}
     end;
@@ -273,8 +277,9 @@ handle_quic_h3({quic_h3, Conn, {stream_type_open, Direction, StreamId, _Type}}, 
                     _ = cancel_stream(Conn, StreamId, ?WT_BUFFERED_STREAM_REJECTED),
                     {noreply, State};
                 false ->
-                    Pending = (State#state.pending)#{StreamId => {Direction, <<>>}},
-                    {noreply, State#state{pending = Pending}}
+                    State1 = manual_credit(StreamId, State),
+                    Pending = (State1#state.pending)#{StreamId => {Direction, <<>>}},
+                    {noreply, State1#state{pending = Pending}}
             end
     end;
 handle_quic_h3({quic_h3, Conn, {stream_type_data, _Direction, StreamId, Data, Fin}}, State0) ->
@@ -413,6 +418,31 @@ keep_header_on_reset(QuicConn, StreamId, HeaderSize) ->
     _ = quic:set_stream_reliable_size(QuicConn, StreamId, HeaderSize),
     ok.
 
+%% Receive credit on a WebTransport stream follows what the session has
+%% handled, not what reached this process: draft-02 has no WebTransport
+%% flow control, so QUIC stream credit is the only bound on a peer
+%% (draft-ietf-webtrans-overview-14 §4.3). The session returns it with
+%% quic:consume/3 once its handler has taken the data.
+manual_credit(_StreamId, #state{quic_conn = undefined} = State) ->
+    State;
+manual_credit(StreamId, #state{quic_conn = QuicConn} = State) ->
+    _ = try quic:set_stream_flow_control(QuicConn, StreamId, manual)
+        catch exit:_ -> ok
+        end,
+    State.
+
+consume(_StreamId, _Bytes, #state{quic_conn = undefined} = State) ->
+    State;
+consume(StreamId, Bytes, #state{quic_conn = QuicConn} = State) ->
+    _ = try quic:consume(QuicConn, StreamId, Bytes)
+        catch exit:_ -> ok
+        end,
+    State.
+
+%% Size of the stream type quic_h3 read before handing the stream over.
+stream_type_size(bidi) -> byte_size(h2_varint:encode(?WT_BIDI_SIGNAL));
+stream_type_size(uni) -> byte_size(h2_varint:encode(?WT_UNI_STREAM_TYPE)).
+
 %% Sessions and slots on this connection other than `SessionId'.
 others(SessionId, #state{sessions = Sessions, reserved = Reserved}) ->
     map_size(maps:remove(SessionId, maps:merge(Sessions, Reserved))).
@@ -486,7 +516,8 @@ do_open_local_bidi(SessionId, State) ->
                             _ = quic:send_data(QuicConn, StreamId, Header, false),
                             keep_header_on_reset(QuicConn, StreamId, byte_size(Header)),
                             Local = (State#state.local_streams)#{StreamId => SessionPid},
-                            State1 = ensure_h3_monitor(H3Conn, State),
+                            State1 = manual_credit(
+                                       StreamId, ensure_h3_monitor(H3Conn, State)),
                             {reply, {ok, StreamId},
                              State1#state{local_streams = Local}};
                         {error, _} = Err ->
@@ -517,7 +548,11 @@ route_peer_stream_data(StreamId, Data, Fin, #state{pending = Pending} = State) -
                     close_connection(?H3_ID_ERROR, State),
                     State#state{pending = maps:remove(StreamId, Pending)};
                 {ok, SessionId, Rest} ->
-                    State1 = State#state{pending = maps:remove(StreamId, Pending)},
+                    %% The stream type quic_h3 read and the session id are
+                    %% ours to credit; the session credits the rest.
+                    Header = stream_type_size(Direction) + byte_size(Combined) - byte_size(Rest),
+                    State1 = consume(StreamId, Header,
+                                     State#state{pending = maps:remove(StreamId, Pending)}),
                     deliver_open_and_data(SessionId, StreamId, Direction, Rest, Fin, State1);
                 {error, incomplete} ->
                     Pending1 = Pending#{StreamId => {Direction, Combined}},
