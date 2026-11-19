@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.5.12 - 2026-11-19
+## 0.5.12 - 2026-11-20
 
 - Requires quic 3.2.0 and uses h2 0.18.3. Over HTTP/3, a small write or a
   FIN made while earlier data of the same stream was still queued could
