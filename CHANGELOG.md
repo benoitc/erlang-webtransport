@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.5.12 - 2026-11-20
+
+- Requires quic 3.2.0 and uses h2 0.18.3. Over HTTP/3, a small write or a
+  FIN made while earlier data of the same stream was still queued could
+  reach the peer ahead of that data; a stream's writes now leave in the
+  order they were made. Sending on many streams of one connection no
+  longer slows down as the send queue grows. A stream whose first frame
+  from the peer raised its flow-control limit could stall on a later
+  write; the limit is now kept (RFC 9000 §3.2).
+
 ## 0.5.11 - 2026-11-15
 
 - Requires quic 3.1.0. Over HTTP/3, a stream opened while its

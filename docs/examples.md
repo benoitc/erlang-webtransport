@@ -18,7 +18,7 @@ openssl req -x509 -newkey rsa:2048 \
 erlc -o examples \
   -pa _build/default/lib/webtransport/ebin \
   -pa _build/default/lib/quic/ebin \
-  -pa _build/default/lib/erlang_h2/ebin \
+  -pa _build/default/lib/h2/ebin \
   -I include \
   examples/echo_server.erl examples/echo_client.erl
 

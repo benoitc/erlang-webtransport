@@ -4,7 +4,7 @@ This page lists the WebTransport spec revisions the library implements and
 the gaps that are known. Read it when you need to know whether a peer on a
 given draft will interoperate, or before you pick up compliance work. To
 re-run the audit, use the `spec-compliance` Claude Code skill in
-`.claude/skills/spec-compliance/`.
+`.agents/skills/spec-compliance/`.
 
 ## Revisions
 
@@ -20,7 +20,9 @@ Draft-02 and draft-07 (`compat_mode => legacy_browser_compat`) are kept on a
 separate path for Chrome, Firefox, Safari 26 and webtransport-go. They never
 mix with the latest drafts in one handshake.
 
-Audited 2026-11-13 against quic 2.7.0 and h2 0.17.0.
+Audited 2026-11-13 against quic 2.7.0 and h2 0.17.0. The library now
+requires quic 3.2.0 and h2 0.18; the [changelog](../CHANGELOG.md) lists what
+changed since the audit.
 
 ## What is covered
 

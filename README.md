@@ -602,11 +602,13 @@ webtransport_session    gen_statem per session (flow control, handler dispatch)
     |     +-- wt_h2_capsule      HTTP/2 capsule encode/decode
     |     +-- wt_h2_init         WebTransport-Init header parse/encode
     |
+    +-- wt_capsule_reader       Reads capsules off the CONNECT stream
     +-- wt_sf                   Structured field parsing (RFC 9651)
     |
     +-- webtransport_stream     Per-stream state (flow control, buffers)
     +-- wt_error                App error code mapping (draft-17 section 4.4)
     +-- webtransport_handler    Behaviour definition
+    +-- webtransport_client_handler   Default client handler (forwards events to the owner)
 ```
 
 ## Examples
@@ -625,7 +627,7 @@ openssl req -x509 -newkey rsa:2048 \
 erlc -o examples \
   -pa _build/default/lib/webtransport/ebin \
   -pa _build/default/lib/quic/ebin \
-  -pa _build/default/lib/erlang_h2/ebin \
+  -pa _build/default/lib/h2/ebin \
   -I include \
   examples/echo_server.erl examples/echo_client.erl
 
@@ -644,10 +646,10 @@ echo_client:test("localhost", 4433).
 ## Testing
 
 ```sh
-# Unit tests (301 tests)
+# Unit tests and properties
 rebar3 eunit
 
-# Integration tests (67 tests, both h2 and h3)
+# Integration tests, over h3 and h2
 rebar3 ct --suite=test/webtransport_SUITE
 
 # IPv6, sockname and 0-RTT integration tests
