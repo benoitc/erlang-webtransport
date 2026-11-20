@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+- Requires quic 3.3.0. Over HTTP/3, `connect` to a server that closed the
+  connection right after the handshake, for example one that requires a
+  client certificate and got none, could crash the calling process or wait
+  until the timeout. It now returns `{error, Reason}` at once, with the
+  reason the server closed with.
+
 ## 0.5.12 - 2026-11-20
 
 - Requires quic 3.2.0 and uses h2 0.18.3. Over HTTP/3, a small write or a
