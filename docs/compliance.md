@@ -21,7 +21,7 @@ separate path for Chrome, Firefox, Safari 26 and webtransport-go. They never
 mix with the latest drafts in one handshake.
 
 Audited 2026-11-13 against quic 2.7.0 and h2 0.17.0. The library now
-requires quic 3.2.0 and h2 0.18; the [changelog](../CHANGELOG.md) lists what
+requires quic 3.3.0 and h2 0.18; the [changelog](../CHANGELOG.md) lists what
 changed since the audit.
 
 ## What is covered
