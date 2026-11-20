@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.5.13 - 2026-11-20
 
 - Requires quic 3.3.0. Over HTTP/3, `connect` to a server that closed the
   connection right after the handshake, for example one that requires a
