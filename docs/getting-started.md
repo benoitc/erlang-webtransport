@@ -2,13 +2,22 @@
 
 ## Requirements
 
-- Erlang/OTP 26.0 or later
+- Erlang/OTP 27.0 or later
 - [rebar3](https://rebar3.org/)
 - OpenSSL (for certificate generation)
 
 ## Installation
 
-Add to your `rebar.config`:
+The library is published on Hex as `webtransport`. Add it to your
+`rebar.config`:
+
+```erlang
+{deps, [
+    {webtransport, "~> 0.5"}
+]}.
+```
+
+To use changes that are not released yet, take it from git instead:
 
 ```erlang
 {deps, [

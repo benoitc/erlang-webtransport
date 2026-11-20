@@ -23,7 +23,16 @@ covers session-ticket capture and connection-level acceptance reporting
 
 ## Installation
 
-Add to your `rebar.config`:
+The library is published on Hex as `webtransport`. Add it to your
+`rebar.config`:
+
+```erlang
+{deps, [
+    {webtransport, "~> 0.5"}
+]}.
+```
+
+To use changes that are not released yet, take it from git instead:
 
 ```erlang
 {deps, [
